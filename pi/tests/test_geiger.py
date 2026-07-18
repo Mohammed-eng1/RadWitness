@@ -3,10 +3,14 @@
 """
 test_geiger.py — اختبار منفرد لعداد جيجر CAJOE (J305) على الراسبري
 ==================================================================
-يعدّ النبضات عبر pigpio (مقاطعة على الحافة الصاعدة، دخل عائم بلا مقاومة
+يعدّ النبضات عبر lgpio (تنبيه على الحافة الصاعدة، دخل عائم بلا مقاومة
 رفع/سحب — أي مقاومة تقتل نبضة VIN الضعيفة عالية الممانعة، مؤكد على
 العتاد في المشروع السابق)، ثم يحسب CPM على نافذة 30 ثانية منزلقة +
 متوسط أسّي سريع، ويحوّلها إلى µSv/h بمعايرة مخبرية مثبتة ضد Cs-137.
+
+لماذا lgpio وليس pigpio؟ الـBRIEF ذكر pigpio، لكنه محذوف من مستودعات
+Debian trixie (راسبري باي أوس الحالي). lgpio هو البديل الرسمي الحديث:
+يوفّر نفس تنبيه الحافة، ولا يحتاج daemon (يصل إلى gpiochip مباشرة).
 
 ⚠ العتاد: لوحة الجيجر تُغذّى 3.3V حصراً (وليس 5V) فتبقى ذروة النبضة
    آمنة على دبوس GPIO الراسبري (يتحمل 3.3V فقط). النبضة على GPIO17
@@ -17,8 +21,7 @@ test_geiger.py — اختبار منفرد لعداد جيجر CAJOE (J305) عل
     τ = 200 µs            زمن ميت مقاس من نفس جلسة المعايرة
     المصدر: legacy/RadiationRover/firmware/esp32_main/{config.h, geiger.h}
 
-التشغيل على الراسبري:
-    sudo systemctl start pigpiod      # لازم لعمل pigpio
+التشغيل على الراسبري (بلا daemon — المستخدم pi ضمن مجموعة gpio):
     python3 pi/tests/test_geiger.py   # Ctrl-C للإيقاف
 """
 import sys
@@ -26,9 +29,9 @@ import time
 from collections import deque
 
 try:
-    import pigpio
+    import lgpio
 except ImportError:
-    sys.exit("خطأ: مكتبة pigpio غير مثبّتة. ثبّتها عبر setup_pi.sh (تعمل على الراسبري).")
+    sys.exit("خطأ: مكتبة lgpio غير مثبّتة. ثبّتها عبر setup_pi.sh (apt: python3-lgpio).")
 
 # ── الثوابت ────────────────────────────────────────────────────────
 GEIGER_GPIO           = 17        # BCM17 (دبوس 11) — جيجر 1 (خلف SINGLE_TUBE_MODE)
@@ -49,30 +52,40 @@ def correct_dead_time(cpm_meas: float) -> float:
     return cpm_meas / d
 
 
+def open_geiger():
+    """يفتح خط الجيجر ويطالب بتنبيه الحافة الصاعدة. يجرّب gpiochip0 (باي 4)
+    ثم gpiochip4 (باي 5). يُعيد (handle, chip). دخل عائم — بلا pull."""
+    last_err = None
+    for chip in (0, 4):
+        try:
+            h = lgpio.gpiochip_open(chip)
+        except Exception as e:               # noqa: BLE001 — الشريحة غير موجودة
+            last_err = e
+            continue
+        try:
+            lgpio.gpio_claim_alert(h, GEIGER_GPIO, lgpio.RISING_EDGE, lgpio.SET_PULL_NONE)
+            return h, chip
+        except Exception as e:               # noqa: BLE001 — الخط مشغول/غير صالح
+            last_err = e
+            lgpio.gpiochip_close(h)
+    sys.exit(f"خطأ: تعذّر فتح خط الجيجر GPIO{GEIGER_GPIO} ({last_err}). "
+             f"تأكد من التوصيل ومن أن المستخدم ضمن مجموعة gpio.")
+
+
 def main() -> None:
-    pi = pigpio.pi()
-    if not pi.connected:
-        sys.exit("خطأ: تعذّر الاتصال بـpigpiod. شغّله: sudo systemctl start pigpiod")
+    handle, chip = open_geiger()
+    # callback بلا دالة = يعدّ تلقائياً في خيط القراءة (نقرأ العدّ عبر tally)
+    cb = lgpio.callback(handle, GEIGER_GPIO, lgpio.RISING_EDGE)
 
-    # دخل عائم تماماً — لا PUD (أي مقاومة رفع/سحب تقتل نبضة VIN)
-    pi.set_mode(GEIGER_GPIO, pigpio.INPUT)
-    pi.set_pull_up_down(GEIGER_GPIO, pigpio.PUD_OFF)
-
-    total = {"count": 0}           # العدّاد التراكمي (يزيده رد النداء في خيط pigpio)
-
-    def on_pulse(gpio, level, tick):
-        total["count"] += 1
-
-    cb = pi.callback(GEIGER_GPIO, pigpio.RISING_EDGE, on_pulse)
-
-    print(f"يعدّ نبضات الجيجر على GPIO{GEIGER_GPIO} (BCM) — نافذة {WINDOW_S}s. Ctrl-C للإيقاف.\n")
+    print(f"يعدّ نبضات الجيجر على GPIO{GEIGER_GPIO} (gpiochip{chip}) — نافذة {WINDOW_S}s. "
+          f"Ctrl-C للإيقاف.\n")
     per_sec = deque(maxlen=WINDOW_S)   # عدّات كل ثانية (نافذة منزلقة)
     ema = 0.0
     last_total = 0
     try:
         while True:
             time.sleep(1.0)
-            now_total = total["count"]
+            now_total = cb.tally()               # إجمالي الحواف منذ البدء
             counts_last_sec = now_total - last_total
             last_total = now_total
             per_sec.append(counts_last_sec)
@@ -95,7 +108,7 @@ def main() -> None:
         print("\nتوقّف.")
     finally:
         cb.cancel()
-        pi.stop()
+        lgpio.gpiochip_close(handle)
 
 
 if __name__ == "__main__":

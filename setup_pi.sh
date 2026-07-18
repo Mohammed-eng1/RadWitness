@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # setup_pi.sh — إعداد راسبري باي 4 كامل وغير تفاعلي لـ RMS Rover v2
 # ═══════════════════════════════════════════════════════════════════
-# يفعل: تحديث النظام، تفعيل UART (للـGPS) وI2C (للـBNO055)، تثبيت وتشغيل
-#        pigpiod (لعدّ نبضات الجيجر)، إنشاء بيئة افتراضية + تثبيت المتطلبات.
+# يفعل: تحديث النظام، تفعيل UART (للـGPS) وI2C (للـBNO055)، تثبيت مكتبة
+#        lgpio (لعدّ نبضات الجيجر — بديل pigpio الحديث على Debian trixie،
+#        بلا daemon)، وإنشاء بيئة افتراضية + تثبيت المتطلبات.
 #
 # التشغيل على الراسبري (من جذر المستودع):
 #     chmod +x setup_pi.sh && ./setup_pi.sh
@@ -20,20 +21,24 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 # ── 1) تحديث النظام وحزم النظام اللازمة ────────────────────────────
-echo "[1/5] تحديث النظام وتثبيت حزم النظام…"
+echo "[1/4] تحديث النظام وتثبيت حزم النظام…"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -y
-# libatlas/libjpeg لـopencv و numpy، i2c-tools لفحص BNO055، pigpio لعدّ الجيجر
+# الأساسية: python3-lgpio لعدّ الجيجر (بلا daemon)، i2c-tools لفحص BNO055
 sudo apt-get install -y \
     python3 python3-venv python3-dev python3-pip \
-    pigpio python3-pigpio \
+    python3-lgpio \
     i2c-tools \
-    libatlas-base-dev libjpeg-dev libopenjp2-7 \
     git
+# مكتبات تشغيل OpenCV (أفضل جهد — أسماؤها تختلف بين إصدارات ديبيان بسبب انتقال
+# t64، فلا نُفشل الإعداد إن تعذّرت؛ الكاميرا تُستخدم في M3):
+sudo apt-get install -y libgl1 libglib2.0-0t64 2>/dev/null || \
+    sudo apt-get install -y libgl1 libglib2.0-0 2>/dev/null || \
+    echo "    ⚠ تعذّر تثبيت مكتبات OpenCV الاختيارية — تُعالَج في M3 عند الحاجة"
 
 # ── 2) تفعيل UART (GPS على GPIO15 RXD) وتحرير المنفذ من كونسول النظام ─
-echo "[2/5] تفعيل UART للـGPS…"
-# تحديد ملف إعداد الإقلاع (Bookworm: /boot/firmware، الأقدم: /boot)
+echo "[2/4] تفعيل UART للـGPS…"
+# تحديد ملف إعداد الإقلاع (Bookworm/trixie: /boot/firmware، الأقدم: /boot)
 if [ -f /boot/firmware/config.txt ]; then
     BOOT_CFG=/boot/firmware/config.txt
 else
@@ -49,18 +54,13 @@ sudo raspi-config nonint do_serial_cons 1 2>/dev/null || \
     echo "    ⚠ عطّل كونسول السيريال يدوياً عبر raspi-config إن لزم"
 
 # ── 3) تفعيل I2C (BNO055 على GPIO2/3) ──────────────────────────────
-echo "[3/5] تفعيل I2C للـBNO055…"
+echo "[3/4] تفعيل I2C للـBNO055…"
 sudo raspi-config nonint do_i2c 0 2>/dev/null || \
     echo "    ⚠ فعّل I2C يدوياً عبر raspi-config إن لزم"
 
-# ── 4) تفعيل وتشغيل pigpiod (لازم لعدّ نبضات الجيجر عبر pigpio) ──────
-echo "[4/5] تفعيل وتشغيل pigpiod…"
-sudo systemctl enable pigpiod
-sudo systemctl start  pigpiod
-
-# ── 5) بيئة افتراضية + متطلبات بايثون ──────────────────────────────
-echo "[5/5] إنشاء بيئة افتراضية وتثبيت المتطلبات…"
-# --system-site-packages: لتظهر حزم النظام (pigpio/opencv) للبيئة عند الحاجة
+# ── 4) بيئة افتراضية + متطلبات بايثون ──────────────────────────────
+echo "[4/4] إنشاء بيئة افتراضية وتثبيت المتطلبات…"
+# --system-site-packages: لتظهر حزم النظام (lgpio/opencv) للبيئة عند الحاجة
 if [ ! -d venv ]; then
     python3 -m venv --system-site-packages venv
 fi
@@ -71,7 +71,7 @@ pip install -r requirements.txt
 deactivate
 
 echo "══════════════════════════════════════════════════════════"
-echo "  اكتمل الإعداد ✅"
+echo "  اكتمل الإعداد ✅  (lgpio لا يحتاج daemon — عدّ الجيجر جاهز مباشرة)"
 echo "──────────────────────────────────────────────────────────"
 echo "  الخطوات التالية:"
 echo "   1) انسخ الأسرار:  cp secrets.example.py secrets.py  ثم املأه"
