@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p pi/tests pi/sensors pi/ai pi/web firmware/controller_display missions logs captures)",
+      "Bash(touch pi/sensors/.gitkeep pi/ai/.gitkeep pi/web/.gitkeep firmware/controller_display/.gitkeep missions/.gitkeep logs/.gitkeep captures/.gitkeep)",
+      "Bash(python -m py_compile pi/tests/test_geiger.py pi/tests/test_gps.py pi/tests/test_bno055.py pi/tests/test_camera.py pi/tests/test_lora.py)",
+      "Bash(bash -n setup_pi.sh)"
+    ]
+  }
+}

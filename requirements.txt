@@ -1,0 +1,14 @@
+# متطلبات طبقة بايثون على الراسبري باي — RMS Rover v2
+# التثبيت: داخل بيئة افتراضية عبر setup_pi.sh (أو: pip install -r requirements.txt)
+# ملاحظة: بعض هذه الحزم تعمل على الراسبري فقط (pigpio, adafruit) — طبيعي أن
+# تفشل على جهاز التطوير المكتبي؛ سكربتات pi/tests/ تُشغَّل على الراسبري.
+
+fastapi
+uvicorn
+websockets
+opencv-python
+pyserial
+pynmea2
+pigpio
+adafruit-circuitpython-bno055
+numpy
