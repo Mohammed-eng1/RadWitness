@@ -17,6 +17,7 @@ source venv/bin/activate
 | `test_bno055.py` | heading + حالة المعايرة | `python3 pi/tests/test_bno055.py` | I2C GPIO2/3، 0x28 |
 | `test_camera.py` | فتح الكاميرا + حفظ لقطة | `python3 pi/tests/test_camera.py` | USB (index 0) |
 | `test_lora.py` | حيّة وصلة HC-14 + RTT | `python3 pi/tests/test_lora.py` | USB-Serial /dev/ttyUSB0 |
+| `test_ultrasonic.py` | مسافة HC-SR04 (اختبار مكتبي) | `python3 pi/tests/test_ultrasonic.py` | TRIG=GPIO23، ECHO=GPIO24 ⚠ **مقسّم جهد** |
 
 ملاحظات:
 - **الجيجر** يستخدم `lgpio` (بلا daemon — بديل pigpio المحذوف من Debian trixie).
