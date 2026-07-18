@@ -1,0 +1,36 @@
+# ═══ أسرار الاعتماد — لا تُرفع أبداً ════════════════════════════
+# القوالب (secrets.example.*) فقط هي التي تُرفع. انسخها للاسم الحقيقي واملأها.
+secrets.py
+secrets.h
+.env
+*.env
+# يلتقط أي secrets.h/secrets.py في legacy/ أو firmware/ أيضاً (git يطابق بأي عمق)
+
+# ═══ مخرجات بايثون ═══════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# ═══ بيانات التشغيل — يبقى المجلد، تُستثنى محتوياته ══════════════
+missions/*.csv
+logs/*
+!logs/.gitkeep
+captures/*.jpg
+captures/*.jpeg
+captures/*.png
+!captures/.gitkeep
+
+# ═══ ملفات النظام والمحرر ════════════════════════════════════════
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.bak
+*~
+.vscode/
+.idea/
