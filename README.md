@@ -51,7 +51,7 @@ RMS-Rover-v2/
 
 ```bash
 git clone <repo> && cd RMS-Rover-v2
-chmod +x setup_pi.sh && ./setup_pi.sh      # تحديث + UART/I2C + pigpiod + venv + المتطلبات
+chmod +x setup_pi.sh && ./setup_pi.sh      # تحديث + UART/I2C + lgpio + venv + المتطلبات
 cp secrets.example.py secrets.py           # واملأه (secrets.py مستثنى من git)
 sudo reboot                                # لتفعيل UART/I2C
 
