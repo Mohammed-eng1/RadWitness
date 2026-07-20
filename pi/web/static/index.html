@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>RMS Rover v2 — لوحة التحكم الحية</title>
+<style>
+  :root{
+    --bg:#0d0f14; --panel:#161a23; --panel2:#1e2430; --line:#2a3140;
+    --txt:#e6e9ef; --muted:#8a93a6; --accent:#ff6a3d; --ok:#22c55e;
+    --bad:#dc2626; --warn:#eab308; --idle:#4b5563;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:system-ui,"Segoe UI",Tahoma,Arial,sans-serif;font-size:15px}
+  .wrap{max-width:1100px;margin:0 auto;padding:12px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    padding:10px 4px;border-bottom:1px solid var(--line);margin-bottom:12px}
+  header h1{font-size:18px;margin:0;letter-spacing:.5px}
+  .badge{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line)}
+  .badge.sim{background:#3b2a1a;color:var(--accent);border-color:#5a3a22}
+  .conn{display:flex;align-items:center;gap:6px;margin-inline-start:auto;font-size:13px;color:var(--muted)}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--idle);display:inline-block}
+  .dot.on{background:var(--ok)} .dot.off{background:var(--bad)} .dot.wk{background:var(--warn)}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}
+  .card h3{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.6px}
+  .big{font-size:34px;font-weight:700;line-height:1.1}
+  .unit{font-size:14px;color:var(--muted);font-weight:400}
+  .sub{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.7}
+  .sub b{color:var(--txt);font-weight:600}
+  .risk-pill{display:inline-block;font-size:13px;font-weight:700;padding:3px 12px;
+    border-radius:999px;color:#0b0d11;margin-top:8px}
+  .cal{display:flex;gap:6px;margin-top:8px}
+  .cal span{flex:1;text-align:center;font-size:11px;padding:4px 0;border-radius:7px;
+    background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+  .cal span b{display:block;font-size:14px;color:var(--txt)}
+  .warnrow{color:var(--warn);font-size:12px;margin-top:6px;min-height:16px}
+  /* الخريطة */
+  #mapCard{position:relative}
+  #map{width:100%;height:300px;background:#0a0c10;border-radius:10px;display:block;
+    border:1px solid var(--line)}
+  .maphint{position:absolute;bottom:18px;inset-inline-start:22px;font-size:11px;
+    color:var(--muted);pointer-events:none}
+  /* القيادة */
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:260px;margin:0 auto}
+  .pad button{padding:16px 0;font-size:18px;background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line);border-radius:12px;cursor:pointer;user-select:none;
+    touch-action:none;transition:background .1s}
+  .pad button:active,.pad button.active{background:var(--accent);color:#0b0d11;border-color:var(--accent)}
+  .pad .sp{visibility:hidden}
+  .estop{grid-column:1/4;background:#3a1414;border-color:#5a1e1e;color:#ff8a7a;font-weight:700}
+  .estop:active{background:var(--bad);color:#fff}
+  .speed{display:flex;align-items:center;gap:10px;margin-top:12px;max-width:260px;margin-inline:auto}
+  .speed input{flex:1}
+  .health{display:flex;gap:14px;flex-wrap:wrap}
+  .health div{display:flex;align-items:center;gap:7px;font-size:13px}
+  .camwrap{text-align:center}
+  .camwrap img{max-width:100%;border-radius:10px;border:1px solid var(--line);margin-top:8px}
+  button.act{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:10px;padding:9px 14px;cursor:pointer;font-size:13px}
+  button.act:active{background:var(--accent);color:#0b0d11}
+  .section-title{font-size:12px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.6px;margin:18px 4px 8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🛰️ RMS Rover v2</h1>
+    <span class="badge sim" id="modeBadge">SIM</span>
+    <span class="conn"><span class="dot" id="connDot"></span><span id="connTxt">يتصل…</span></span>
+  </header>
+
+  <!-- بطاقات القراءات -->
+  <div class="grid">
+    <div class="card">
+      <h3>الجرعة الإشعاعية</h3>
+      <div class="big"><span id="usvh">--</span> <span class="unit">µSv/h</span></div>
+      <div class="risk-pill" id="riskPill" style="background:#22c55e">Safe</div>
+      <div class="sub">CPM خام <b id="cpmRaw">--</b> · مصحَّح <b id="cpm">--</b></div>
+      <div class="warnrow" id="rateWarn"></div>
+    </div>
+
+    <div class="card">
+      <h3>الاتجاه (BNO055)</h3>
+      <div class="big"><span id="heading">--</span><span class="unit">°</span></div>
+      <div class="cal">
+        <span>sys<b id="calS">0</b></span>
+        <span>gyro<b id="calG">0</b></span>
+        <span>accel<b id="calA">0</b></span>
+        <span>mag<b id="calM">0</b></span>
+      </div>
+      <div class="warnrow" id="magWarn"></div>
+    </div>
+
+    <div class="card">
+      <h3>الموقع (GPS)</h3>
+      <div class="sub" style="margin-top:2px">
+        الحالة: <b id="gpsFix">—</b><br>
+        lat <b id="lat">--</b> · lng <b id="lng">--</b><br>
+        أقمار <b id="sats">--</b> · HDOP <b id="hdop">--</b>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>الروفر (sim)</h3>
+      <div class="sub" style="margin-top:2px">
+        الوضع: <b id="rvHeading">--</b>° · السرعة <b id="rvSpeed">--</b> م/ث<br>
+        الأمر الحالي: <b id="rvDir">S</b> · القوة <b id="rvPower">0</b><br>
+        lat <b id="rvLat">--</b> · lng <b id="rvLng">--</b>
+      </div>
+    </div>
+  </div>
+
+  <!-- الخريطة -->
+  <div class="section-title">الخريطة الحية</div>
+  <div class="card" id="mapCard">
+    <canvas id="map"></canvas>
+    <div class="maphint" id="mapHint">خريطة محلية بلا إنترنت — 🔺 الروفر · ⚪ GPS</div>
+  </div>
+
+  <!-- القيادة -->
+  <div class="section-title">قيادة الروفر (محاكاة)</div>
+  <div class="card">
+    <div class="pad">
+      <button class="sp"></button>
+      <button data-dir="F">▲</button>
+      <button class="sp"></button>
+      <button data-dir="L">◀</button>
+      <button data-dir="S">■</button>
+      <button data-dir="R">▶</button>
+      <button class="sp"></button>
+      <button data-dir="B">▼</button>
+      <button class="sp"></button>
+      <button class="estop" id="estop">إيقاف طوارئ</button>
+    </div>
+    <div class="speed">
+      <span style="font-size:12px;color:var(--muted)">السرعة</span>
+      <input type="range" id="power" min="20" max="100" value="70">
+      <span id="powerVal" style="font-size:13px;width:34px;text-align:center">70</span>
+    </div>
+  </div>
+
+  <!-- الصحة + الكاميرا -->
+  <div class="section-title">صحة المكونات</div>
+  <div class="card health" id="health">
+    <div><span class="dot" id="hGeiger"></span> الجيجر</div>
+    <div><span class="dot" id="hGps"></span> GPS</div>
+    <div><span class="dot" id="hImu"></span> IMU</div>
+    <div><span class="dot" id="hCam"></span> الكاميرا</div>
+  </div>
+
+  <div class="section-title">الكاميرا (لقطة عند الطلب)</div>
+  <div class="card camwrap">
+    <button class="act" id="snapBtn">التقاط لقطة</button>
+    <div><img id="snap" alt="" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const M_PER_DEG = 111320.0;
+
+  // ── حالة الخريطة ──────────────────────────────────────────────
+  let origin=null, trail=[], gpsPt=null;
+  let rv={x:0,y:0,heading:0,has:false};
+  function toM(lat,lng){
+    if(!origin) origin={lat,lng};
+    return {
+      x:(lng-origin.lng)*M_PER_DEG*Math.cos(origin.lat*Math.PI/180),
+      y:(lat-origin.lat)*M_PER_DEG
+    };
+  }
+  const canvas=$("map"), ctx=canvas.getContext("2d");
+  function resizeCanvas(){
+    const r=canvas.getBoundingClientRect();
+    canvas.width=r.width*devicePixelRatio; canvas.height=r.height*devicePixelRatio;
+    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    drawMap();
+  }
+  window.addEventListener("resize",resizeCanvas);
+
+  function drawMap(){
+    const w=canvas.width/devicePixelRatio, h=canvas.height/devicePixelRatio;
+    ctx.clearRect(0,0,w,h);
+    const cx=w/2, cy=h/2, scale=6; // 6 بكسل/متر
+    const P=p=>({x:cx+(p.x-rv.x)*scale, y:cy-(p.y-rv.y)*scale});
+    // شبكة كل 5م
+    ctx.strokeStyle="#1b2130"; ctx.lineWidth=1;
+    const step=5*scale;
+    const ox=((cx-(rv.x*scale))%step+step)%step, oy=((cy+(rv.y*scale))%step+step)%step;
+    for(let x=ox;x<w;x+=step){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+    for(let y=oy;y<h;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+    // الأثر
+    if(trail.length>1){
+      ctx.strokeStyle="#ff6a3d"; ctx.lineWidth=2; ctx.beginPath();
+      trail.forEach((p,i)=>{const q=P(p); i?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y);});
+      ctx.stroke();
+    }
+    // نقطة GPS
+    if(gpsPt){const q=P(gpsPt);
+      ctx.fillStyle="#38bdf8"; ctx.beginPath(); ctx.arc(q.x,q.y,5,0,7); ctx.fill();
+      ctx.strokeStyle="#0a0c10"; ctx.lineWidth=1.5; ctx.stroke();
+    }
+    // الروفر (مثلث باتجاه الـheading)
+    if(rv.has){
+      const a=(rv.heading-90)*Math.PI/180; // 0°=شمال=أعلى
+      ctx.save(); ctx.translate(cx,cy); ctx.rotate(a);
+      ctx.fillStyle="#ff6a3d"; ctx.beginPath();
+      ctx.moveTo(11,0); ctx.lineTo(-8,7); ctx.lineTo(-8,-7); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle="#0a0c10"; ctx.lineWidth=1.5; ctx.stroke(); ctx.restore();
+    }
+  }
+
+  // ── تحديث الواجهة من التيليمتري ────────────────────────────────
+  function setDot(el,v){el.className="dot "+(v===true?"on":v===false?"off":"");}
+  function apply(d){
+    if(d.t!=="telemetry") return;
+    $("usvh").textContent=(d.usvh??0).toFixed(3);
+    $("cpm").textContent=(d.cpm??0).toFixed(1);
+    $("cpmRaw").textContent=(d.cpm_raw??0).toFixed(1);
+    const pill=$("riskPill"); pill.textContent=d.risk||"Safe";
+    pill.style.background=d.risk_color||"#22c55e";
+    $("rateWarn").textContent=d.high_rate?"⚠ HIGH_RATE_WARNING — تجاوز 30k CPM":"";
+
+    $("heading").textContent=(d.heading??0).toFixed(0);
+    $("calS").textContent=d.sys_cal; $("calG").textContent=d.gyro_cal;
+    $("calA").textContent=d.accel_cal; $("calM").textContent=d.mag_cal;
+    $("magWarn").textContent=d.mag_warn?"⚠ mag<2 — الاتجاه غير موثوق، عايِر (∞)":"";
+
+    $("gpsFix").textContent=d.fix?"قفل ✅":"لا قفل ⏳";
+    $("lat").textContent=(d.lat??0).toFixed(6); $("lng").textContent=(d.lng??0).toFixed(6);
+    $("sats").textContent=d.sats; $("hdop").textContent=(d.hdop??0).toFixed(1);
+
+    const r=d.rover||{};
+    $("rvHeading").textContent=(r.heading??0).toFixed(0);
+    $("rvSpeed").textContent=(r.speed??0).toFixed(2);
+    $("rvDir").textContent=r.dir||"S"; $("rvPower").textContent=r.power||0;
+    $("rvLat").textContent=(r.lat??0).toFixed(6); $("rvLng").textContent=(r.lng??0).toFixed(6);
+
+    // الصحة
+    const H=d.health||{};
+    setDot($("hGeiger"),H.geiger); setDot($("hImu"),H.imu); setDot($("hCam"),H.camera);
+    $("hGps").className="dot "+(H.gps?"on":H.gps_link?"wk":"off");
+
+    // الخريطة: موضع الروفر + الأثر + GPS
+    if(r.lat&&r.lng){
+      const p=toM(r.lat,r.lng); rv.x=p.x; rv.y=p.y; rv.heading=r.heading||0; rv.has=true;
+      const last=trail[trail.length-1];
+      if(!last||Math.hypot(p.x-last.x,p.y-last.y)>0.2){trail.push(p); if(trail.length>800)trail.shift();}
+    }
+    if(d.fix&&d.lat&&d.lng) gpsPt=toM(d.lat,d.lng);
+    drawMap();
+  }
+
+  // ── WebSocket مع إعادة اتصال ───────────────────────────────────
+  let ws=null;
+  function connect(){
+    ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
+    ws.onopen=()=>{$("connDot").className="dot on";$("connTxt").textContent="متصل";};
+    ws.onclose=()=>{$("connDot").className="dot off";$("connTxt").textContent="منقطع — يعيد…";
+      setTimeout(connect,1000);};
+    ws.onerror=()=>ws.close();
+    ws.onmessage=e=>{try{apply(JSON.parse(e.data));}catch(_){}}
+  }
+  function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
+
+  // ── القيادة ────────────────────────────────────────────────────
+  let holdTimer=null, activeBtn=null;
+  function power(){return parseInt($("power").value,10);}
+  function startDrive(dir,btn){
+    stopDrive();
+    activeBtn=btn; if(btn)btn.classList.add("active");
+    send({c:"drive",dir:dir,power:power()});
+    if(dir!=="S") holdTimer=setInterval(()=>send({c:"drive",dir:dir,power:power()}),300);
+  }
+  function stopDrive(){
+    if(holdTimer){clearInterval(holdTimer);holdTimer=null;}
+    if(activeBtn){activeBtn.classList.remove("active");activeBtn=null;}
+    send({c:"drive",dir:"S",power:0});
+  }
+  document.querySelectorAll(".pad button[data-dir]").forEach(b=>{
+    const dir=b.getAttribute("data-dir");
+    if(dir==="S"){b.addEventListener("pointerdown",e=>{e.preventDefault();stopDrive();});return;}
+    b.addEventListener("pointerdown",e=>{e.preventDefault();startDrive(dir,b);});
+    b.addEventListener("pointerup",e=>{e.preventDefault();stopDrive();});
+    b.addEventListener("pointerleave",()=>{if(activeBtn===b)stopDrive();});
+    b.addEventListener("pointercancel",stopDrive);
+  });
+  $("estop").addEventListener("click",()=>{stopDrive();send({c:"estop"});});
+  $("power").addEventListener("input",()=>{$("powerVal").textContent=power();});
+
+  // لوحة المفاتيح (WASD / الأسهم)
+  const KMAP={KeyW:"F",ArrowUp:"F",KeyS:"B",ArrowDown:"B",KeyA:"L",ArrowLeft:"L",KeyD:"R",ArrowRight:"R"};
+  let keyDir=null;
+  window.addEventListener("keydown",e=>{const d=KMAP[e.code]; if(d&&keyDir!==d){keyDir=d;e.preventDefault();startDrive(d,null);}});
+  window.addEventListener("keyup",e=>{if(KMAP[e.code]){keyDir=null;stopDrive();}});
+
+  // الكاميرا
+  $("snapBtn").addEventListener("click",()=>{
+    const img=$("snap"); img.style.display="block";
+    img.src="/snapshot.jpg?ts="+Date.now();
+  });
+
+  resizeCanvas(); connect();
+})();
+</script>
+</body>
+</html>
