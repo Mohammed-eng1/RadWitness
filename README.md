@@ -63,6 +63,24 @@ python3 pi/tests/test_geiger.py            # التفاصيل في pi/tests/READ
 تفاصيل تشغيل كل سكربت اختبار في [`pi/tests/README.md`](pi/tests/README.md)، والتوصيلات
 في [`docs/wiring.md`](docs/wiring.md).
 
+## تشغيل السيرفر والواجهة الحية (M1)
+
+بعد تأكيد الحساسات، شغّل السيرفر الموحّد (FastAPI + WebSocket على المنفذ 8000):
+
+```bash
+./run_server.sh
+# أو يدوياً:
+source venv/bin/activate
+python -m pi.web.server        # أو: uvicorn pi.web.server:app --host 0.0.0.0 --port 8000
+```
+
+ثم افتح من اللابتوب/الجوال: **`http://therover:8000`** (محلياً أو عبر Tailscale).
+الواجهة تعرض القراءات الثلاث الحية (جيجر/GPS/BNO055) + خريطة محلية + قيادة روفر sim.
+
+- بنية الوحدات: `pi/config.py` (كل الثوابت)، `pi/sensors/{geiger,gps,imu,camera}.py`،
+  `pi/rover/bridge.py` (جسر real/sim)، `pi/ai/risk.py`، `pi/web/server.py` + `static/`.
+- طبقة الذكاء الكاملة (كشف الشذوذ، التسجيل، المهمة) والخريطة على Leaflet تأتي في M2.
+
 ## رفع فيرموير الشاشة (M4)
 
 فيرموير بوابة الشاشة الميدانية في `firmware/controller_display/` (اللوحة الافتراضية

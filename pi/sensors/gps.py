@@ -1,0 +1,92 @@
+# -*- coding: utf-8 -*-
+"""
+gps.py — قارئ GPS (منقول من pi/tests/test_gps.py المثبت)
+=========================================================
+pyserial + pynmea2 على /dev/serial0. القراءة في خيط خلفي (readline حاجب)
+يحدّث حالة مشتركة؛ state() لقطة غير حاجبة لحلقة السيرفر.
+"""
+import threading
+import time
+
+from pi.config import GPS_PORT, GPS_BAUD
+
+try:
+    import serial
+    import pynmea2
+    _GPS_LIBS_OK = True
+except Exception:                     # noqa: BLE001
+    _GPS_LIBS_OK = False
+
+
+class GPSReader:
+    def __init__(self, port: str = GPS_PORT, baud: int = GPS_BAUD):
+        self.ok = False
+        self.error = None
+        self._lock = threading.Lock()
+        self._fix = False
+        self._lat = 0.0
+        self._lng = 0.0
+        self._sats = 0
+        self._hdop = 0.0
+        self._last_fix_ts = 0.0
+        self._ser = None
+        self._stop = False
+
+        if not _GPS_LIBS_OK:
+            self.error = "pyserial/pynmea2 غير مثبّت"
+            return
+        try:
+            self._ser = serial.Serial(port, baud, timeout=1.0)
+            self.ok = True
+        except Exception as e:            # noqa: BLE001
+            self.error = str(e)
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop:
+            try:
+                raw = self._ser.readline().decode("ascii", errors="replace").strip()
+            except Exception:             # noqa: BLE001
+                time.sleep(0.5)
+                continue
+            if not raw.startswith("$"):
+                continue
+            try:
+                msg = pynmea2.parse(raw)
+            except Exception:             # noqa: BLE001
+                continue
+            with self._lock:
+                if isinstance(msg, pynmea2.types.talker.GGA):
+                    self._sats = int(msg.num_sats) if msg.num_sats else 0
+                    self._hdop = float(msg.horizontal_dil) if msg.horizontal_dil else 0.0
+                    self._fix = msg.gps_qual not in (None, 0, "0")
+                    if self._fix and msg.latitude and msg.longitude:
+                        self._lat, self._lng = msg.latitude, msg.longitude
+                        self._last_fix_ts = time.time()
+                elif isinstance(msg, pynmea2.types.talker.RMC):
+                    if msg.status == "A" and msg.latitude and msg.longitude:
+                        self._fix = True
+                        self._lat, self._lng = msg.latitude, msg.longitude
+                        self._last_fix_ts = time.time()
+
+    def state(self) -> dict:
+        with self._lock:
+            fresh = self._fix and (time.time() - self._last_fix_ts) < 5.0
+            return {
+                "ok": self.ok,
+                "fix": fresh,
+                "lat": round(self._lat, 6),
+                "lng": round(self._lng, 6),
+                "sats": self._sats,
+                "hdop": round(self._hdop, 1),
+            }
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            if self._ser:
+                self._ser.close()
+        except Exception:                 # noqa: BLE001
+            pass
