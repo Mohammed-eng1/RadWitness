@@ -5,6 +5,10 @@ config.py — كل الثوابت والمنافذ والعتبات في مكا�
 القيم أدناه **مثبتة تجريبياً على العتاد في M0** — لا تُخمّن ولا تُغيّر بلا سبب
 موثّق. أي انحراف عنها يكسر القراءة.
 """
+import os as _os
+
+# جذر المستودع (للوصول إلى captures/ و logs/ و missions/)
+_REPO_ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
 
 # ═══ المنصة ══════════════════════════════════════════════════════
 # كل تعامل GPIO عبر lgpio حصراً (pigpio محذوف في Debian trixie).
@@ -30,6 +34,9 @@ BNO055_ADDR = 0x29                # مثبت على العتاد (وليس 0x28 
 CAMERA_INDEX = 0                  # /dev/video0 — مثبت
 CAMERA_W = 640
 CAMERA_H = 480
+CAMERA_STREAM_FPS = 12            # إطارات البث الحي MJPEG
+# ⚠ اللقطات لا تُكتب على القرص إلا بطلب صريح (زر «حفظ») أو لقطة شذوذ في M2.
+CAPTURES_DIR = _os.path.join(_REPO_ROOT, "captures")
 
 # ═══ تصنيف الخطر µSv/h (عتبات BRIEF — ثابتة) ═════════════════════
 RISK_LOW_USVH  = 0.5              # Safe < 0.5 | Low 0.5-2

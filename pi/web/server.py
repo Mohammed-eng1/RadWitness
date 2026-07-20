@@ -19,9 +19,9 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S
+from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
 from pi.sensors.geiger import GeigerReader
 from pi.sensors.gps import GPSReader
 from pi.sensors.imu import IMUReader
@@ -134,11 +134,31 @@ async def index() -> HTMLResponse:
 
 @app.get("/snapshot.jpg")
 def snapshot() -> Response:
-    """لقطة كاميرا واحدة (sync → FastAPI يشغّلها في threadpool)."""
+    """لقطة واحدة تُرسل للمتصفح — **لا تُحفظ على القرص**."""
     data = camera.snapshot_jpeg()
     if data is None:
         return Response(status_code=503, content="camera unavailable")
     return Response(content=data, media_type="image/jpeg")
+
+
+@app.get("/stream.mjpg")
+def stream() -> Response:
+    """بث فيديو حي MJPEG — **لا يُحفظ على القرص** (يتوقف بإغلاق الصفحة)."""
+    if not camera.state()["available"]:
+        return Response(status_code=503, content="camera unavailable")
+    return StreamingResponse(
+        camera.mjpeg_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.post("/api/snapshot/save")
+def save_snapshot() -> JSONResponse:
+    """حفظ لقطة في captures/ — **بطلب صريح من المستخدم فقط**."""
+    name = camera.save_snapshot(CAPTURES_DIR)
+    if not name:
+        return JSONResponse({"ok": False, "error": "camera unavailable"}, status_code=503)
+    return JSONResponse({"ok": True, "file": name})
 
 
 @app.get("/api/status")

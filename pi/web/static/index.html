@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>RMS Rover v2 — لوحة التحكم الحية</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛰️</text></svg>">
 <style>
   :root{
     --bg:#0d0f14; --panel:#161a23; --panel2:#1e2430; --line:#2a3140;
@@ -58,6 +59,10 @@
   .health div{display:flex;align-items:center;gap:7px;font-size:13px}
   .camwrap{text-align:center}
   .camwrap img{max-width:100%;border-radius:10px;border:1px solid var(--line);margin-top:8px}
+  .cambtns{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+  .privacy{font-size:11px;color:var(--muted);margin-top:10px}
+  .savemsg{font-size:12px;color:var(--ok);margin-top:6px;min-height:16px}
+  button.act.live{background:var(--bad);color:#fff;border-color:var(--bad)}
   button.act{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
     border-radius:10px;padding:9px 14px;cursor:pointer;font-size:13px}
   button.act:active{background:var(--accent);color:#0b0d11}
@@ -152,9 +157,15 @@
     <div><span class="dot" id="hCam"></span> الكاميرا</div>
   </div>
 
-  <div class="section-title">الكاميرا (لقطة عند الطلب)</div>
+  <div class="section-title">الكاميرا</div>
   <div class="card camwrap">
-    <button class="act" id="snapBtn">التقاط لقطة</button>
+    <div class="cambtns">
+      <button class="act" id="snapBtn">📷 لقطة</button>
+      <button class="act" id="streamBtn">🎥 بث مباشر</button>
+      <button class="act" id="saveBtn">💾 حفظ في الجهاز</button>
+    </div>
+    <div class="privacy">🔒 اللقطة والبث يُعرضان فقط — لا يُحفظ شيء على الراسبري إلا بزر «حفظ».</div>
+    <div id="saveMsg" class="savemsg"></div>
     <div><img id="snap" alt="" style="display:none"></div>
   </div>
 </div>
@@ -300,10 +311,37 @@
   window.addEventListener("keydown",e=>{const d=KMAP[e.code]; if(d&&keyDir!==d){keyDir=d;e.preventDefault();startDrive(d,null);}});
   window.addEventListener("keyup",e=>{if(KMAP[e.code]){keyDir=null;stopDrive();}});
 
-  // الكاميرا
+  // ── الكاميرا: لقطة / بث حي / حفظ صريح ─────────────────────────
+  let streaming=false;
+  function stopStream(){
+    streaming=false;
+    $("streamBtn").classList.remove("live");
+    $("streamBtn").textContent="🎥 بث مباشر";
+    $("snap").src="";                     // يقطع اتصال MJPEG
+    $("snap").style.display="none";
+  }
   $("snapBtn").addEventListener("click",()=>{
+    stopStream();
     const img=$("snap"); img.style.display="block";
-    img.src="/snapshot.jpg?ts="+Date.now();
+    img.src="/snapshot.jpg?ts="+Date.now();   // عرض فقط — بلا حفظ
+  });
+  $("streamBtn").addEventListener("click",()=>{
+    if(streaming){stopStream();return;}
+    streaming=true;
+    $("streamBtn").classList.add("live");
+    $("streamBtn").textContent="⏹ إيقاف البث";
+    const img=$("snap"); img.style.display="block";
+    img.src="/stream.mjpg?ts="+Date.now();    // بث حي — بلا حفظ
+  });
+  $("saveBtn").addEventListener("click",async()=>{
+    const msg=$("saveMsg"); msg.style.color="var(--muted)"; msg.textContent="يحفظ…";
+    try{
+      const r=await fetch("/api/snapshot/save",{method:"POST"});
+      const j=await r.json();
+      if(j.ok){msg.style.color="var(--ok)";msg.textContent="✅ حُفظت في captures/"+j.file;}
+      else{msg.style.color="var(--bad)";msg.textContent="⚠ تعذّر الحفظ: "+(j.error||"");}
+    }catch(_){msg.style.color="var(--bad)";msg.textContent="⚠ تعذّر الاتصال بالسيرفر";}
+    setTimeout(()=>{msg.textContent="";},6000);
   });
 
   resizeCanvas(); connect();
