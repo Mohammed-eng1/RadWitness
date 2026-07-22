@@ -18,6 +18,7 @@ source venv/bin/activate
 | `test_camera.py` | فتح الكاميرا + حفظ لقطة | `python3 pi/tests/test_camera.py` | USB (index 0) |
 | `test_lora.py` | حيّة وصلة HC-14 + RTT | `python3 pi/tests/test_lora.py` | USB-Serial /dev/ttyUSB0 |
 | `test_ultrasonic.py` | مسافة HC-SR04 (اختبار مكتبي) | `python3 pi/tests/test_ultrasonic.py` | TRIG=GPIO23، ECHO=GPIO24 ⚠ **مقسّم جهد** |
+| `test_ir.py` | حساس عائق IR (اختبار مكتبي) | `python3 pi/tests/test_ir.py` | OUT=GPIO25 ⚠ **تغذية 3.3V** |
 
 ملاحظات:
 - **الجيجر** يستخدم `lgpio` (بلا daemon — بديل pigpio المحذوف من Debian trixie).
