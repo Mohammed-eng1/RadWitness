@@ -24,6 +24,9 @@ captures/*.jpg
 captures/*.jpeg
 captures/*.png
 !captures/.gitkeep
+# ملفات المعايرة خاصة بكل جهاز/أرضية (لا تُرفع) — يبقى المجلد
+profiles/calibration/*.json
+!profiles/calibration/.gitkeep
 
 # ═══ ملفات النظام والمحرر ════════════════════════════════════════
 .DS_Store
