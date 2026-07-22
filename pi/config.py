@@ -55,3 +55,33 @@ SIM_HOME_LNG = 46.6753
 WEB_HOST = "0.0.0.0"              # يُفتح محلياً وعبر Tailscale (http://therover:8000)
 WEB_PORT = 8000
 BROADCAST_S = 1.0                 # بث WebSocket كل ثانية
+
+# ═══ الملاحة الذاتية الداخلية (BRIEF_AUTONOMY_INDOOR / BATCH1) ════
+# دائرة عدم اليقين — نموذج نمو **تقديري** يُضبط تجريبياً لاحقاً (لا أرقام سحرية):
+DRIFT_PER_METER         = 0.05    # م شك مضاف لكل متر مقطوع (تقديري)
+DRIFT_PER_TURN          = 0.08    # م شك مضاف لكل 90° دوران (تقديري — الدوران أخطر)
+UNCERTAINTY_INITIAL     = 0.10    # الشك الابتدائي بالمتر
+UNCERTAINTY_RESET_FLOOR = 0.10    # أدنى شك بعد تصحيح جدار (يصغر ولا يصفر)
+WALL_CORRECTION_SHRINK  = 0.30    # الشك × هذا عند تصحيح ناجح
+
+# تصحيح الجدران — **شرطا أمان إلزاميان** (منع تفسير صندوق وسط الغرفة كجدار):
+WALL_ALIGN_TOL_DEG          = 15.0  # تسامح المحاذاة حول محاور الجدران (0/90/180/270)
+WALL_CORRECTION_MAX_DELTA_M = 0.5   # أقصى فرق مسافة يُقبل كتصحيح (أكبر = عائق لا جدار)
+
+# المسح الشبكي:
+CELL_DWELL_S      = 3.0           # توقّف عند كل خلية لتجميع عد كافٍ إحصائياً
+NAV_ANOMALY_SIGMA = 3.0          # قراءة > μ+3σ = شذوذ (Welford)
+NAV_ANOMALY_MIN_SAMPLES = 5      # أقل عدد قراءات قبل اعتماد كشف الشذوذ
+
+# إعادة التخطيط حول العوائق:
+MAX_REPLANS_PER_TARGET = 3       # بعده الهدف unreachable (منع الحلقات اللانهائية)
+
+# السلامة التفاعلية (البند 3) — **معطّلة الآن** (تلمس عتاداً، تُختبر بدفعة منفصلة):
+REACTIVE_SAFETY_ENABLED = False
+ULTRASONIC_STOP_CM   = 25.0      # عائق أمامي أقرب = توقف فوري
+REACTIVE_LOOP_HZ     = 10        # حلقة السلامة ≥10Hz
+ESCAPE_MAX_ATTEMPTS  = 3         # محاولات التحرر قبل تعليم الخلية unreachable
+# مهلة heartbeat = ROVER_SAFETY_TIMEOUT_S (1.5ث، معرّفة أعلاه)
+
+# ملفات المعايرة (أرضيات مختلفة): profiles/calibration/*.json
+CALIBRATION_DIR = _os.path.join(_REPO_ROOT, "profiles", "calibration")

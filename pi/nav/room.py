@@ -30,13 +30,14 @@ CORNERS = ("back_left", "back_right", "front_left", "front_right")
 
 @dataclass
 class Cell:
-    """خلية إشغال واحدة — الحقول كما نصّ البند 1 حرفياً."""
+    """خلية إشغال واحدة — الحقول كما نصّ البند 1 + unreachable (الدفعة 1)."""
     visited: bool = False
     max_usvh: float = 0.0
     max_cpm: float = 0.0
     blocked: bool = False
     priority: int = 0
     timestamp: float = 0.0             # لحظة آخر تحديث (time.time())
+    unreachable: bool = False          # محاصرة بعوائق — تُستثنى من مقام التغطية
 
 
 @dataclass
@@ -150,6 +151,31 @@ class OccupancyGrid:
             c.blocked = True
             c.timestamp = time.time()
 
+    def mark_unreachable(self, row: int, col: int) -> None:
+        if self.in_bounds(row, col):
+            c = self.cells[row][col]
+            c.unreachable = True
+            c.timestamp = time.time()
+
+    def passable(self, row: int, col: int) -> bool:
+        """خلية يمكن دخولها (داخل الحدود وغير محجوبة/غير قابلة للوصول)."""
+        return self.in_bounds(row, col) and not (
+            self.cells[row][col].blocked or self.cells[row][col].unreachable
+        )
+
+    def neighbors4(self, row: int, col: int):
+        """الجيران الأربعة (شمال/جنوب/شرق/غرب) داخل الحدود."""
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            if self.in_bounds(row + dr, col + dc):
+                yield row + dr, col + dc
+
+    def neighbors8(self, row: int, col: int):
+        """الجيران الثمانية داخل الحدود (لتكثيف المسح حول الشذوذ)."""
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dr or dc) and self.in_bounds(row + dr, col + dc):
+                    yield row + dr, col + dc
+
     def set_priority(self, row: int, col: int, priority: int) -> None:
         if self.in_bounds(row, col):
             c = self.cells[row][col]
@@ -159,22 +185,31 @@ class OccupancyGrid:
     # ── التغطية ───────────────────────────────────────────────────
     def counts(self) -> dict:
         total = self.rows * self.cols
-        visited = blocked = 0
+        visited = blocked = unreachable = 0
         for r in range(self.rows):
             for c in range(self.cols):
                 cell = self.cells[r][c]
                 if cell.blocked:
                     blocked += 1
+                elif cell.unreachable:
+                    unreachable += 1
                 elif cell.visited:
                     visited += 1
-        reachable = total - blocked
+        reachable = total - blocked - unreachable   # المقام يستثني المحجوب وغير القابل للوصول
         return {"total": total, "visited": visited, "blocked": blocked,
-                "reachable": reachable}
+                "unreachable": unreachable, "reachable": reachable}
 
     def coverage_pct(self) -> float:
-        """نسبة الخلايا المزارة من القابلة للوصول (المحجوبة تُستبعَد)."""
+        """نسبة الخلايا المزارة من القابلة للوصول (المحجوبة/غير القابلة تُستبعَد)."""
         c = self.counts()
         return 100.0 * c["visited"] / c["reachable"] if c["reachable"] > 0 else 100.0
+
+    def coverage_text(self) -> str:
+        """نص شفّاف يعرض الرقمين معاً (كما نصّ البند ب)."""
+        c = self.counts()
+        return (f"التغطية {self.coverage_pct():.0f}% "
+                f"({c['visited']} من {c['reachable']} قابلة للوصول، "
+                f"{c['blocked']} محجوبة، {c['unreachable']} غير قابلة)")
 
     # ── الحفظ/التحميل (للاستئناف بعد الانقطاع وللخريطة) ────────────
     def to_dict(self) -> dict:
@@ -202,7 +237,7 @@ class OccupancyGrid:
                 out.append({
                     "row": r, "col": c, "x": round(x, 2), "y": round(y, 2),
                     "visited": cell.visited, "blocked": cell.blocked,
-                    "priority": cell.priority,
+                    "unreachable": cell.unreachable, "priority": cell.priority,
                     "max_usvh": round(cell.max_usvh, 3), "max_cpm": round(cell.max_cpm, 1),
                 })
         return out
