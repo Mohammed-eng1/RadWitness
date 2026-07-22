@@ -87,6 +87,8 @@ class GeigerReader:
     def state(self) -> dict:
         return {
             "ok": self.ok,
+            "error": self.error,          # يُعرض في الواجهة عند فشل حجز الخط
+            "samples": len(self._per_sec),  # ثوانٍ مُجمّعة (النافذة تمتلئ عند 30)
             "cpm_raw": round(self._cpm_raw, 1),
             "cpm": round(self._cpm, 1),
             "usvh": round(self._usvh, 3),

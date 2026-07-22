@@ -20,8 +20,14 @@ test_lora.py — اختبار منفرد لوصلة اللورا HC-14 على ا
      docs/protocol.md ضمن M4؛ هنا نثبّت التأطير ونختبر الوصلة فقط.)
 
 التشغيل على الراسبري:
-    python3 pi/tests/test_lora.py                 # المنفذ الافتراضي /dev/ttyUSB0
+    python3 pi/tests/test_lora.py                 # حلقة PING (تحتاج طرفاً ثانياً يردّ)
     python3 pi/tests/test_lora.py /dev/ttyUSB1    # لتحديد منفذ آخر
+    python3 pi/tests/test_lora.py at              # ★ فحص وحدة واحدة عبر أوامر AT
+
+★ فحص الوحدة الواحدة (at): بوحدة HC-14 واحدة لا يمكن اختبار الإرسال اللاسلكي
+   (يلزم طرف ثانٍ في M4). لكن أوامر AT تؤكد أن الوحدة حيّة والتوصيل (TX/RX)
+   سليم: **اربط دبوس SET بـGND** (وضع الأوامر)، ثم شغّل `... at` → يجب أن
+   تردّ الوحدة `OK` على `AT`. أعد SET حراً بعدها للوضع الشفاف.
 """
 import sys
 import time
@@ -63,6 +69,32 @@ def parse_frame(line: str):
     except ValueError:
         return None
     return body
+
+
+def at_diagnostics(port: str) -> None:
+    """فحص وحدة HC-14 واحدة عبر أوامر AT (يتطلب SET→GND)."""
+    try:
+        ser = serial.Serial(port, BAUD, timeout=0.5)
+    except serial.SerialException as e:
+        sys.exit(f"خطأ: تعذّر فتح {port} ({e}). تحقق من محول USB-Serial (ls /dev/ttyUSB*).")
+
+    print(f"وضع AT على {port} @ {BAUD}.")
+    print("⚠ تأكد أن دبوس SET موصول بـGND (وإلا الوحدة في الوضع الشفاف ولن تردّ).\n")
+    any_reply = False
+    for cmd in ("AT", "AT+V", "AT+RX"):            # حيّة / إصدار / الإعدادات
+        ser.reset_input_buffer()
+        ser.write(cmd.encode("ascii"))
+        time.sleep(0.6)
+        n = ser.in_waiting
+        resp = ser.read(n).decode("ascii", errors="replace").strip() if n else ""
+        print(f"→ {cmd:8s}  ←  {resp!r}")
+        if resp:
+            any_reply = True
+    ser.close()
+    if any_reply:
+        print("\n✅ الوحدة تردّ — السيريال والتوصيل (TX/RX) سليمان. أعد SET حراً للوضع الشفاف.")
+    else:
+        print("\n⚠ لا ردّ. تحقّق بالترتيب: SET→GND، TX↔RX غير معكوسين، التغذية 3.3-5V، الباود 9600.")
 
 
 def main() -> None:
@@ -111,4 +143,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "at":
+        at_diagnostics(sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyUSB0")
+    else:
+        main()

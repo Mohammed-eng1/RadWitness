@@ -54,6 +54,7 @@ def build_telemetry() -> dict:
         # الجيجر + الخطر
         "cpm_raw": g["cpm_raw"], "cpm": g["cpm"], "usvh": g["usvh"],
         "high_rate": g["high_rate"], "total": g["total"],
+        "geiger_err": g.get("error"), "geiger_samples": g.get("samples", 0),
         "risk": risk["risk"], "lvl": risk["lvl"], "risk_color": risk["color"],
         # GPS
         "fix": p["fix"], "lat": p["lat"], "lng": p["lng"],

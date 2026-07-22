@@ -84,7 +84,9 @@
       <h3>الجرعة الإشعاعية</h3>
       <div class="big"><span id="usvh">--</span> <span class="unit">µSv/h</span></div>
       <div class="risk-pill" id="riskPill" style="background:#22c55e">Safe</div>
-      <div class="sub">CPM خام <b id="cpmRaw">--</b> · مصحَّح <b id="cpm">--</b></div>
+      <div class="sub">CPM خام <b id="cpmRaw">--</b> · مصحَّح <b id="cpm">--</b>
+        · نبضات <b id="gTotal">0</b></div>
+      <div class="warnrow" id="geigerWarn"></div>
       <div class="warnrow" id="rateWarn"></div>
     </div>
 
@@ -237,6 +239,15 @@
     const pill=$("riskPill"); pill.textContent=d.risk||"Safe";
     pill.style.background=d.risk_color||"#22c55e";
     $("rateWarn").textContent=d.high_rate?"⚠ HIGH_RATE_WARNING — تجاوز 30k CPM":"";
+    $("gTotal").textContent=d.total??0;
+    const gw=$("geigerWarn");
+    if(d.health&&d.health.geiger===false){
+      gw.style.color="var(--bad)";
+      gw.textContent="⚠ الجيجر غير مُهيّأ"+(d.geiger_err?": "+d.geiger_err:" (خط GPIO محجوز؟)");
+    }else if((d.geiger_samples||0)<5){
+      gw.style.color="var(--muted)";
+      gw.textContent="⏳ يجمّع النافذة… ("+(d.geiger_samples||0)+"/30 ث)";
+    }else gw.textContent="";
 
     $("heading").textContent=(d.heading??0).toFixed(0);
     $("calS").textContent=d.sys_cal; $("calG").textContent=d.gyro_cal;
