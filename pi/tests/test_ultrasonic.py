@@ -64,32 +64,42 @@ def main() -> None:
 
     cb = lgpio.callback(h, ECHO_GPIO, lgpio.BOTH_EDGES, cb_echo)
 
+    def measure_once():
+        """قياس مفرد: يُعيد المسافة (سم) أو None عند لا صدى/قراءة غير منطقية."""
+        st["rise"] = 0
+        st["width"] = None
+        lgpio.gpio_write(h, TRIG_GPIO, 1)          # نبضة تحفيز 10µs
+        time.sleep(0.00001)
+        lgpio.gpio_write(h, TRIG_GPIO, 0)
+        t0 = time.time()
+        while st["width"] is None and (time.time() - t0) < TIMEOUT_S:
+            time.sleep(0.0005)
+        if st["width"] is None:
+            return None
+        dist_cm = (st["width"] / 1000.0) * SPEED_CM_PER_US / 2.0   # ns→µs→سم
+        if dist_cm <= 0 or dist_cm > MAX_PLAUSIBLE_CM:
+            return None                            # قراءة شاذّة تُرفض
+        return dist_cm
+
     print(f"HC-SR04: TRIG=GPIO{TRIG_GPIO}، ECHO=GPIO{ECHO_GPIO} (gpiochip{chip}). "
-          f"Ctrl-C للإيقاف.\n")
+          f"وسيط 5 قياسات لكبح الضجيج. Ctrl-C للإيقاف.\n")
     try:
         while True:
-            st["rise"] = 0
-            st["width"] = None
-            # نبضة تحفيز 10µs
-            lgpio.gpio_write(h, TRIG_GPIO, 1)
-            time.sleep(0.00001)
-            lgpio.gpio_write(h, TRIG_GPIO, 0)
-
-            # انتظر اكتمال الصدى أو المهلة
-            t0 = time.time()
-            while st["width"] is None and (time.time() - t0) < TIMEOUT_S:
-                time.sleep(0.001)
-
-            if st["width"] is None:
-                print("لا صدى ⏳  (خارج المدى، أو تحقّق من التوصيل/المقسّم)")
+            # 5 قياسات متتابعة (فاصل 60ms — يحتاجه HC-SR04 لتفادي تداخل الصدى)،
+            # ثم الوسيط (median) — يلغي القفزات الشاذّة تماماً.
+            samples = []
+            for _ in range(5):
+                d = measure_once()
+                if d is not None:
+                    samples.append(d)
+                time.sleep(0.06)
+            if len(samples) >= 3:
+                samples.sort()
+                median = samples[len(samples) // 2]
+                print(f"المسافة = {median:6.1f} سم   (من {len(samples)}/5 قياسات صالحة)")
             else:
-                width_us = st["width"] / 1000.0          # ns → µs
-                dist_cm = width_us * SPEED_CM_PER_US / 2.0
-                if dist_cm > MAX_PLAUSIBLE_CM:
-                    print(f"خارج المدى (> {MAX_PLAUSIBLE_CM:.0f} سم)")
-                else:
-                    print(f"المسافة = {dist_cm:6.1f} سم")
-            time.sleep(0.2)
+                print(f"قياس ضعيف ⏳ ({len(samples)}/5 صالحة) — تحقّق المقسّم/التوصيل أو السطح عاكس رديء")
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("\nتوقّف.")
     finally:
