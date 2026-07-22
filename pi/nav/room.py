@@ -157,6 +157,13 @@ class OccupancyGrid:
             c.unreachable = True
             c.timestamp = time.time()
 
+    def set_blocked(self, row: int, col: int, value: bool = True) -> None:
+        """يضع/يزيل حجب خلية (لأداة العوائق الوهمية في الواجهة)."""
+        if self.in_bounds(row, col):
+            c = self.cells[row][col]
+            c.blocked = bool(value)
+            c.timestamp = time.time()
+
     def passable(self, row: int, col: int) -> bool:
         """خلية يمكن دخولها (داخل الحدود وغير محجوبة/غير قابلة للوصول)."""
         return self.in_bounds(row, col) and not (
