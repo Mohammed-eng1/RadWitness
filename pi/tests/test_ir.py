@@ -43,7 +43,8 @@ def open_chip():
 
 def main() -> None:
     h, chip = open_chip()
-    # دخل رقمي بلا مقاومة (خرج المقارن مدفوع). لو تذبذبت القراءة جرّب SET_PULL_UP.
+    # دخل رقمي بلا مقاومة (خرج المقارن مدفوع — مؤكد على العتاد). لو تذبذبت
+    # القراءة بلا سبب (بلا يد أمامه) جرّب SET_PULL_UP كوسيط ثالث.
     lgpio.gpio_claim_input(h, IR_GPIO)
 
     print(f"حساس IR على GPIO{IR_GPIO} (gpiochip{chip}). لوّح يدك أمامه. Ctrl-C للإيقاف.\n")
