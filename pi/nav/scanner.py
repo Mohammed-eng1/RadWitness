@@ -22,6 +22,19 @@ from pi.nav.planner import find_path
 ANOMALY_NEIGHBOR_PRIORITY = 5     # أولوية الجيران الثمانية عند الشذوذ (تكثيف المسح)
 
 
+def boustrophedon_order(grid):
+    """مسار التمشيط (ثعباني) من ركن الانطلاق — قائمة (row,col) تغطّي كل الخلايا."""
+    sr, sc = grid.start_cell()
+    rows_order = (range(grid.rows) if sr == 0 else range(grid.rows - 1, -1, -1))
+    left_to_right = (sc == 0)
+    order = []
+    for r in rows_order:
+        cols = (range(grid.cols) if left_to_right else range(grid.cols - 1, -1, -1))
+        order.extend((r, c) for c in cols)
+        left_to_right = not left_to_right
+    return order
+
+
 class Welford:
     """إحصاء تدفّقي للمتوسط والانحراف المعياري (Welford) — لكشف الشذوذ."""
 
@@ -63,19 +76,8 @@ class Scanner:
         self.log = []
         self.mission_time_s = 0.0
 
-    # ── توليد مسار التمشيط من ركن الانطلاق ────────────────────────
     def _boustrophedon_order(self):
-        sr, sc = self.grid.start_cell()
-        rows_order = (range(self.grid.rows) if sr == 0
-                      else range(self.grid.rows - 1, -1, -1))
-        left_to_right = (sc == 0)
-        order = []
-        for r in rows_order:
-            cols = (range(self.grid.cols) if left_to_right
-                    else range(self.grid.cols - 1, -1, -1))
-            order.extend((r, c) for c in cols)
-            left_to_right = not left_to_right
-        return order
+        return boustrophedon_order(self.grid)
 
     def _remaining(self):
         return [rc for rc in self.base_order
