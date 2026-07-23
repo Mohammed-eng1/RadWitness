@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import time
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from pi.nav.deadreckoning import DeadReckoning
 from pi.nav.calibration import CalibrationProfile
 from pi.nav.sim_world import SimWorld
 from pi.ai.risk import classify
+from pi.rover.bridge import WaveRoverBridge
+from pi.rover import battery as batt
 
 BASE_TICK_S = 0.25              # زمن خطوة الخلية عند مضاعف ×1
 DEFAULT_POWER = 75
@@ -39,12 +42,16 @@ IDLE, RUNNING, PAUSED, DONE, RETURNING, ESTOP = (
     "idle", "running", "paused", "done", "returning", "estop")
 
 
-def default_sim_profile() -> CalibrationProfile:
-    """ملف معايرة افتراضي لوضع المحاكاة (موسوم «محاكاة»)."""
+def default_sim_profile(battery_v: float = 0.0) -> CalibrationProfile:
+    """
+    ملف معايرة افتراضي للمحاكاة (موسوم «محاكاة»). يسجّل **جهد البطارية وقت
+    المعايرة** — مؤشر صلاحيتها (أ-5). القيم مبنية على المقاس على العتاد:
+    0.3→0.333 م/ث و0.5→0.600 م/ث (سيراميك، بطارية منخفضة → تُعاد بعد الشحن).
+    """
     return CalibrationProfile(
-        name="محاكاة", speeds={"50": 0.30, "75": 0.45, "100": 0.60},
+        name="محاكاة", speeds={"30": 0.333, "50": 0.600, "75": 0.45, "100": 0.60},
         turn_rate_dps=70.0, date=time.strftime("%Y-%m-%d %H:%M"),
-        note="قيم افتراضية — محاكاة")
+        note="قيم افتراضية — محاكاة", battery_v=float(battery_v or 0.0))
 
 
 def _heading_between(a, b) -> float:
@@ -66,6 +73,8 @@ def _ang_signed(frm: float, to: float) -> float:
 class MissionSim:
     def __init__(self):
         self.profile = None
+        # جسر الروفر (محاكاة على ويندوز؛ يُبدَّل إلى real على الراسبري بعلم واحد)
+        self.rover = WaveRoverBridge(mode="sim")
         self._reset_full()
 
     # ── تهيئة ────────────────────────────────────────────────────
@@ -89,6 +98,8 @@ class MissionSim:
         self.mission_time_s = 0.0
         self.last_reading = {"cpm": 0.0, "usvh": 0.0, "risk": "Safe", "color": "#22c55e"}
         self._returning = False
+        self._batt_level = None
+        self._rth_triggered = False
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -183,7 +194,57 @@ class MissionSim:
         return {"ok": True}
 
     # ── الخطوة الواحدة ───────────────────────────────────────────
+    def poll_battery(self):
+        """
+        يُستدعى دورياً من حلقة السيرفر **مهما كانت حالة المهمة** — الجهد يجب
+        أن يظهر في الواجهة دائماً (أ-3)، لا أثناء المسح فقط.
+        """
+        return self._check_battery()
+
+    def _check_battery(self):
+        """يطبّق عتبات الجهد الإلزامية (أ-3) على مسار المهمة."""
+        self.rover.sim_set_moving(self.state == RUNNING)
+        info = self.rover.check_battery()
+        if info["action"] == batt.ACTION_STOP:
+            if self.state == RUNNING:
+                self._log("battery", f"⚠ جهد حرج {info['v']}V — إيقاف المحركات فوراً")
+                self.estop()
+        elif info["action"] == batt.ACTION_RTH:
+            if self.state == RUNNING and not self._rth_triggered:
+                self._rth_triggered = True
+                self._log("battery", f"⚠ جهد منخفض {info['v']}V — عودة إجبارية")
+                self.return_home()
+        elif info["level"] == "good" and self._batt_level != "good":
+            self._log("battery", f"تنبيه: جهد {info['v']}V (جيد)")
+        self._batt_level = info["level"]
+        return info
+
+    def sensors(self) -> dict:
+        """قراءات القرب الوهمية للواجهة: ألترا سونيك أمامي + IR الركنين."""
+        if self.grid is None or self.dr is None:
+            return {"ultrasonic_cm": None, "ir_left": 1, "ir_right": 1,
+                    "cpm": self.last_reading["cpm"]}
+        front_cm = self.world.front_distance_cm(self.dr.x, self.dr.y, self.heading)
+        # اتجاه الأمام واليسار بالخلايا (dx=عمود، dy=صف)
+        th = math.radians(self.heading)
+        fx, fy = round(math.sin(th)), round(math.cos(th))
+        lx, ly = round(-math.cos(th)), round(math.sin(th))
+        r, c = self.current
+
+        def occupied(rr, cc):
+            # خارج الغرفة = جدار = عائق (0)، أو خلية عائق حقيقية
+            if not self.grid.in_bounds(rr, cc):
+                return 0
+            return 0 if self.world.is_obstacle(rr, cc) else 1
+
+        ir_left = occupied(r + fy + ly, c + fx + lx)
+        ir_right = occupied(r + fy - ly, c + fx - lx)
+        return {"ultrasonic_cm": round(front_cm, 1),
+                "ir_left": ir_left, "ir_right": ir_right,
+                "cpm": self.last_reading["cpm"]}
+
     def tick(self):
+        self._check_battery()
         if self.state != RUNNING or self.grid is None:
             return
         target = self._current_start() if self._returning else self._next_target()
@@ -362,6 +423,13 @@ class MissionSim:
             "speed_mult": self.speed_mult,
             "events": self.events[-40:],
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
+            "battery": batt.classify(self.rover.voltage()),
+            "sensors": self.sensors(),
+            "rover": {"mode": self.rover.mode, "error": self.rover.error,
+                      "gyro_bias": round(self.rover.gyro_bias, 4),
+                      "bias_calibrated": self.rover.bias_calibrated},
+            "calib_warning": batt.calibration_voltage_warning(
+                self.profile.battery_v if self.profile else 0.0, self.rover.voltage()),
         }
         if include_full_grid:
             msg["grid"] = self.grid_meta()

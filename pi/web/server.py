@@ -25,7 +25,7 @@ from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
 from pi.nav.mission import MissionSim, default_sim_profile
-from pi.nav.calibration import CalibrationStore
+from pi.nav.calibration import CalibrationStore, compute_speed_mps
 
 # الحساسات الحقيقية (استيرادها آمن على ويندوز — كل مكتبات العتاد محمية داخلها)
 from pi.sensors.geiger import GeigerReader
@@ -65,6 +65,7 @@ async def _sim_loop() -> None:
                 last_tick = now
             if (now - last_bcast) >= 0.2:
                 last_bcast = now
+                mission.poll_battery()     # الجهد يُعرض دائماً لا أثناء المسح فقط
                 if _sim_clients:
                     msg = json.dumps(mission.state_dict(include_full_grid=False))
                     for ws in list(_sim_clients):
@@ -174,11 +175,52 @@ async def api_calib_list():
 
 @app.post("/api/calibration/new_sim")
 async def api_calib_new_sim():
-    prof = default_sim_profile()
+    # يسجّل جهد البطارية وقت المعايرة (مؤشر صلاحيتها — أ-5)
+    prof = default_sim_profile(battery_v=mission.rover.voltage() or 0.0)
     calib_store.save(prof)
     mission.set_calibration(prof)
     _active_calib["name"] = prof.name
-    return {"ok": True, "name": prof.name}
+    return {"ok": True, "name": prof.name, "battery_v": prof.battery_v}
+
+
+@app.post("/api/calibration/speed")
+async def api_calib_speed(req: Request):
+    """
+    معايرة سرعة حقيقية: الروبوت سار `duration_s` عند `power`، والمستخدم قاس
+    `distance_m` بشريط قياس → م/ث تُحفظ في الملف النشط مع جهد البطارية.
+    """
+    d = await req.json()
+    if mission.profile is None:
+        return JSONResponse({"ok": False, "error": "اختر ملف معايرة أولاً"}, status_code=400)
+    try:
+        power = float(d["power"])
+        speed = compute_speed_mps(float(d["distance_m"]), float(d["duration_s"]))
+    except (KeyError, ValueError, ZeroDivisionError) as e:
+        return JSONResponse({"ok": False, "error": f"مدخلات غير صالحة: {e}"}, status_code=400)
+    key = str(int(power * 100)) if power <= 1 else str(int(power))
+    mission.profile.speeds[key] = round(speed, 3)
+    mission.profile.battery_v = mission.rover.voltage() or mission.profile.battery_v
+    mission.profile.date = time.strftime("%Y-%m-%d %H:%M")
+    calib_store.save(mission.profile)
+    return {"ok": True, "power_key": key, "speed_mps": round(speed, 3),
+            "battery_v": mission.profile.battery_v}
+
+
+@app.post("/api/rover/calibrate_gyro")
+def api_calib_gyro():
+    """قياس انحياز الجايرو والروبوت ساكن (لا يُثبَّت في الكود — أ-2)."""
+    bias = mission.rover.calibrate_gyro_bias()
+    mission._log("gyro_bias", f"معايرة انحياز الجايرو: {bias:.3f}")
+    return {"ok": True, "gyro_bias": round(bias, 4)}
+
+
+@app.post("/api/sim/battery")
+async def api_sim_battery(req: Request):
+    """أداة اختبار: ضبط جهد البطارية الوهمي لتجربة العتبات (RTH/إيقاف)."""
+    d = await req.json()
+    mission.rover.sim_set_voltage(float(d["v"]))
+    mission._rth_triggered = False
+    return {"ok": True, "battery": mission.rover.state()["battery"]}
 
 
 @app.post("/api/calibration/select")

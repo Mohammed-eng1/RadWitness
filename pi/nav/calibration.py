@@ -42,6 +42,9 @@ class CalibrationProfile:
     turn_rate_dps: float = 0.0
     date: str = ""
     note: str = ""
+    # جهد البطارية وقت المعايرة — مؤشر صلاحيتها (البند أ-5): السرعة تتأثر
+    # بالجهد، وفارق > 1V عن لحظة التشغيل يستدعي تحذيراً في الواجهة.
+    battery_v: float = 0.0
 
     def speed_for_power(self, power: int) -> float:
         """السرعة المعايرة لمستوى قوة — أقرب مستوى مُعاير إن لم يوجد المطابق تماماً."""
@@ -61,7 +64,8 @@ class CalibrationProfile:
     def from_dict(cls, d: dict) -> "CalibrationProfile":
         return cls(name=d["name"], speeds=d.get("speeds", {}),
                    turn_rate_dps=d.get("turn_rate_dps", 0.0),
-                   date=d.get("date", ""), note=d.get("note", ""))
+                   date=d.get("date", ""), note=d.get("note", ""),
+                   battery_v=d.get("battery_v", 0.0))
 
 
 _SAFE_NAME = re.compile(r"[^\w؀-ۿ \-]")   # يسمح عربي/إنجليزي/أرقام/مسافة/شرطة

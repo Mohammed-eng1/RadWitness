@@ -1,39 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-bridge.py — جسر Wave Rover (واجهة تجريد real/sim)
-==================================================
-sim (الافتراضي الآن — الروبوت لم يصل): يحاكي استجابة حركة واقعية، heading
-يتبع أوامر اللف، الموقع يتكامل من السرعة. يُهيّأ موقعه من أول قفل GPS حقيقي.
-real (M6): بروتوكول Waveshare JSON عبر UART — لاحقاً.
+bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / `real`
+==========================================================
+- `RoverBridge`      : محاكاة قيادة خارجية بإحداثيات lat/lng (تخدم واجهة M1).
+- `WaveRoverBridge`  : **جسر Wave Rover الحقيقي** ببروتوكول Waveshare المكتشف
+                       تجريبياً، مع بديل محاكاة كامل ليعمل على ويندوز بلا عتاد.
 
-أوامر الحركة: F/B/L/R/S بقوة 0-100 (نظير البروتوكول النصي في legacy).
-مزلاج أمان: بعد ROVER_SAFETY_TIMEOUT_S بلا أمر → توقف (نظير مهلة الروفر).
+بروتوكول Waveshare (JSON سطري + \\n على /dev/serial0 @115200):
+    إرسال:  {"T":1,"L":<-1..1>,"R":<-1..1>}   حركة (تُضرب في MOTOR_INVERT)
+            {"T":126}                          طلب IMU كامل
+            {"T":130}                          طلب حالة مختصرة
+    استقبال: {"T":1002, r,p,y, ax..az, gx..gz, mx..mz, temp}   ردّ 126
+            {"T":1001, L,R, r,p,y, temp, v}                    ردّ 130
+
+⚠ ملاحظات مثبتة على العتاد:
+  - الفيرموير **يردّد الأمر المُرسل صدىً** قبل الرد الفعلي → تجاهل أي سطر
+    يحمل نفس T المُرسل، وانتظر 1002/1001.
+  - `y` (yaw) **للعرض فقط لا للملاحة** — الملاحة من `gz` (انظر CLAUDE.md).
+  - `T=131`, `T=4`, `T=71` بلا رد — لا تعتمد عليها.
+  - **الأمر المرتد لا يعني التنفيذ** — تحقق من الحركة عبر gz/التسارع.
 """
+from __future__ import annotations
+
+import json
 import math
+import random
 import time
 
 from pi.config import (
     DRIVE_SPEED_MPS, TURN_RATE_DPS, ROVER_SAFETY_TIMEOUT_S,
     SIM_HOME_LAT, SIM_HOME_LNG,
+    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, GYRO_SCALE, TURN_POWER,
+    DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
 )
+from pi.rover import battery as batt
 
-_M_PER_DEG = 111320.0                  # تقريب مستوٍ كافٍ للمسافات القصيرة
+# استيراد العتاد محميّ — غيابه (ويندوز) لا يكسر شيئاً
+try:
+    import serial
+    _SERIAL_OK = True
+except Exception:                     # noqa: BLE001
+    _SERIAL_OK = False
+
+_M_PER_DEG = 111320.0
 
 
+# ═══════════════════════════════════════════════════════════════
+#  1) جسر المحاكاة الخارجية (lat/lng) — يخدم واجهة M1
+# ═══════════════════════════════════════════════════════════════
 class RoverBridge:
     def __init__(self, mode: str = "sim"):
         self.mode = mode
         self.lat = SIM_HOME_LAT
         self.lng = SIM_HOME_LNG
-        self.heading = 0.0             # درجة، 0 = شمال، مع عقارب الساعة
-        self.speed = 0.0               # m/s فعلية (موجب أمام)
+        self.heading = 0.0
+        self.speed = 0.0
         self._dir = "S"
         self._power = 0
         self._last_cmd_ts = 0.0
         self._from_gps = False
 
     def set_home_from_gps(self, lat: float, lng: float) -> None:
-        """تهيئة موقع الروفر من أول قفل GPS حقيقي (مرة واحدة)."""
         if not self._from_gps and lat and lng:
             self.lat, self.lng = lat, lng
             self._from_gps = True
@@ -50,12 +77,8 @@ class RoverBridge:
         self._last_cmd_ts = time.time()
 
     def update(self, dt: float) -> None:
-        """يتكامل الحركة عبر dt ثانية (تُستدعى من حلقة السيرفر)."""
-        if self.mode != "sim":
-            return                     # real: يُملأ من تيليمتري UART في M6
-        if dt <= 0 or dt > 2.0:
+        if self.mode != "sim" or dt <= 0 or dt > 2.0:
             return
-        # مزلاج الأمان: بلا أمر حديث → توقف
         if time.time() - self._last_cmd_ts > ROVER_SAFETY_TIMEOUT_S:
             self._dir = "S"
         p = self._power / 70.0
@@ -80,12 +103,248 @@ class RoverBridge:
         self.lng += (dist_m * math.sin(hd)) / (_M_PER_DEG * math.cos(math.radians(self.lat)))
 
     def state(self) -> dict:
+        return {"mode": self.mode, "lat": round(self.lat, 6), "lng": round(self.lng, 6),
+                "heading": round(self.heading, 1), "speed": round(self.speed, 2),
+                "dir": self._dir, "power": self._power}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  2) جسر Wave Rover الحقيقي (+ محاكاة كاملة)
+# ═══════════════════════════════════════════════════════════════
+class WaveRoverBridge:
+    """
+    وضعان: `real` (سيريال حقيقي) و`sim` (محاكاة كاملة تعمل على ويندوز).
+    التبديل بعلم واحد؛ عند طلب `real` وغياب pyserial/المنفذ يسقط تلقائياً
+    إلى `sim` مع تسجيل السبب (لا فشل صامت).
+    """
+
+    def __init__(self, mode: str = "sim", port: str = ROVER_PORT, baud: int = ROVER_BAUD):
+        self.requested_mode = mode
+        self.mode = "sim"
+        self.error = None
+        self.port, self.baud = port, baud
+        self._ser = None
+        self.gyro_bias = 0.0
+        self.bias_calibrated = False
+        self.heading = 0.0              # درجة — من تكامل الجايرو (لا البوصلة)
+        self._last_cmd_ts = 0.0
+        self._moving = False
+        self._cmd_lr = (0.0, 0.0)
+        self.rth_requested = False
+        self.battery_alarm = False
+        self.last_status = {}
+        # محاكاة
+        self._sim_v = 12.40
+        self._sim_turn_rate = 0.0
+        self._sim_bias = -0.28
+        self._last_sim_ts = time.time()
+
+        if mode == "real":
+            if not _SERIAL_OK:
+                self.error = "pyserial غير مثبّت — وضع المحاكاة"
+            else:
+                try:
+                    self._ser = serial.Serial(port, baud, timeout=0.3)
+                    self.mode = "real"
+                except Exception as e:      # noqa: BLE001
+                    self.error = f"تعذّر فتح {port}: {e} — وضع المحاكاة"
+
+    # ── الإرسال/الاستقبال ────────────────────────────────────────
+    def _send(self, obj: dict) -> None:
+        if self.mode != "real":
+            return
+        self._ser.write((json.dumps(obj) + "\n").encode("ascii"))
+
+    def _read_until(self, expect_t: int, request_t: int, timeout: float = 1.0):
+        """
+        يقرأ أسطراً حتى يجد T == expect_t. **يتجاهل صدى الأمر المُرسل**
+        (أي سطر T == request_t) وأي سطر غير صالح.
+        """
+        if self.mode != "real":
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                line = self._ser.readline().decode("ascii", errors="replace").strip()
+            except Exception:               # noqa: BLE001
+                break
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue                    # سطر غير JSON — تجاهل
+            t = d.get("T")
+            if t == request_t:
+                continue                    # صدى الأمر — تجاهل
+            if t == expect_t:
+                return d
+        return None
+
+    # ── الحركة (⚠ MOTOR_INVERT) ─────────────────────────────────
+    def _drive(self, l: float, r: float) -> None:
+        # النية (قبل العكس) تمثّل الحركة **الفيزيائية** المطلوبة؛ القيم على
+        # السلك تُضرب في MOTOR_INVERT لأن العتاد معكوس.
+        li = max(-1.0, min(1.0, float(l)))
+        ri = max(-1.0, min(1.0, float(r)))
+        l, r = li * MOTOR_INVERT, ri * MOTOR_INVERT
+        self._cmd_lr = (l, r)
+        self._moving = not (l == 0.0 and r == 0.0)
+        self._last_cmd_ts = time.time()
+        self._send({"T": 1, "L": round(l, 3), "R": round(r, 3)})
+        if self.mode == "sim":
+            # معدل الدوران الوهمي من **النية** لا من قيم السلك (وإلا انعكست الإشارة)
+            self._sim_turn_rate = (li - ri) * TURN_RATE_DPS
+
+    def forward(self, power: float = DRIVE_POWER_DEFAULT) -> None:
+        self._drive(power, power)
+
+    def backward(self, power: float = DRIVE_POWER_DEFAULT) -> None:
+        self._drive(-power, -power)
+
+    def turn(self, direction: str, power: float = TURN_POWER) -> None:
+        """دوران بالمكان: 'R' يمين، 'L' يسار."""
+        if direction.upper() == "R":
+            self._drive(power, -power)
+        else:
+            self._drive(-power, power)
+
+    def stop(self) -> None:
+        self._drive(0.0, 0.0)
+        self._moving = False
+        if self.mode == "sim":
+            self._sim_turn_rate = 0.0
+
+    # ── القراءات ────────────────────────────────────────────────
+    def read_imu(self) -> dict:
+        """T=126 → T:1002. في المحاكاة يولّد gz متسقاً مع أمر الدوران."""
+        if self.mode == "real":
+            self._send({"T": 126})
+            d = self._read_until(1002, 126)
+            return d or {}
+        now = time.time()
+        self._last_sim_ts = now
+        gz = self._sim_turn_rate + self._sim_bias + random.uniform(-0.4, 0.4)
+        return {"T": 1002, "r": 0.0, "p": 0.0, "y": self.heading,
+                "ax": 0.0, "ay": 0.0, "az": 9.8,
+                "gx": 0.0, "gy": 0.0, "gz": round(gz, 3),
+                "mx": 0.0, "my": 0.0, "mz": 0.0, "temp": 31.0}
+
+    def read_status(self) -> dict:
+        """T=130 → T:1001 (يتضمّن جهد البطارية v)."""
+        if self.mode == "real":
+            self._send({"T": 130})
+            d = self._read_until(1001, 130) or {}
+        else:
+            if self._moving:                # استهلاك وهمي بسيط
+                self._sim_v = max(9.5, self._sim_v - 0.0004)
+            d = {"T": 1001, "L": self._cmd_lr[0], "R": self._cmd_lr[1],
+                 "r": 0.0, "p": 0.0, "y": self.heading, "temp": 31.0,
+                 "v": round(self._sim_v, 2)}
+        if d:
+            self.last_status = d
+        return d
+
+    def voltage(self):
+        return self.last_status.get("v")
+
+    # ── أدوات المحاكاة (لاختبار العتبات في الواجهة) ─────────────
+    def sim_set_voltage(self, v: float) -> None:
+        self._sim_v = float(v)
+        self.battery_alarm = False
+        self.rth_requested = False
+
+    def sim_set_moving(self, moving: bool) -> None:
+        """يجعل الاستهلاك الوهمي يعكس كون المهمة جارية."""
+        self._moving = bool(moving)
+
+    # ── معايرة انحياز الجايرو (تلقائياً عند بدء كل مهمة) ─────────
+    def calibrate_gyro_bias(self, seconds: float = GYRO_BIAS_CALIB_S) -> float:
+        """
+        يقيس انحياز gz والروبوت **ساكن**. ⚠ لا يُثبَّت في الكود — يتغيّر
+        بين التجارب، فيُقاس عند بدء كل مهمة (CLAUDE.md).
+        """
+        self.stop()
+        samples, deadline = [], time.time() + seconds
+        while time.time() < deadline:
+            d = self.read_imu()
+            if "gz" in d:
+                samples.append(float(d["gz"]))
+            time.sleep(0.05)
+        self.gyro_bias = (sum(samples) / len(samples)) if samples else 0.0
+        self.bias_calibrated = True
+        return self.gyro_bias
+
+    # ── الدوران بزاوية عبر تكامل الجايرو (مهلة أمان) ────────────
+    def turn_by_angle(self, degrees: float,
+                      timeout: float = ROVER_TURN_TIMEOUT_S,
+                      power: float = TURN_POWER) -> dict:
+        """
+        heading += (gz - bias) * dt * GYRO_SCALE — حتى بلوغ الزاوية أو المهلة.
+        يوقف المحركات دائماً في `finally` مهما حدث.
+        """
+        if not self.bias_calibrated:
+            self.calibrate_gyro_bias()
+        turned = 0.0
+        timed_out = False
+        try:
+            self.turn("R" if degrees >= 0 else "L", power)
+            last = time.time()
+            start = last
+            while abs(turned) < abs(degrees):
+                if time.time() - start > timeout:
+                    timed_out = True
+                    break
+                d = self.read_imu()
+                now = time.time()
+                dt = now - last
+                last = now
+                gz = float(d.get("gz", 0.0))
+                turned += (gz - self.gyro_bias) * dt * GYRO_SCALE
+                time.sleep(0.02)
+        finally:
+            self.stop()                      # ⚠ إيقاف مضمون
+        self.heading = (self.heading + turned) % 360.0
+        return {"requested_deg": degrees, "turned_deg": round(turned, 1),
+                "timed_out": timed_out, "heading": round(self.heading, 1)}
+
+    # ── السلامة: heartbeat + البطارية ───────────────────────────
+    def check_heartbeat(self) -> bool:
+        """بلا أوامر > 1.5ث والمحركات تعمل → إيقاف فوري. True إن أوقف."""
+        if self._moving and (time.time() - self._last_cmd_ts) > ROVER_SAFETY_TIMEOUT_S:
+            self.stop()
+            return True
+        return False
+
+    def check_battery(self) -> dict:
+        """يقرأ الجهد ويطبّق عتبات أ-3 الإلزامية."""
+        self.read_status()
+        info = batt.classify(self.voltage())
+        if info["action"] == batt.ACTION_STOP:
+            self.stop()
+            self.battery_alarm = True
+        elif info["action"] == batt.ACTION_RTH:
+            self.rth_requested = True
+        return info
+
+    def state(self) -> dict:
         return {
-            "mode": self.mode,
-            "lat": round(self.lat, 6),
-            "lng": round(self.lng, 6),
-            "heading": round(self.heading, 1),
-            "speed": round(self.speed, 2),
-            "dir": self._dir,
-            "power": self._power,
+            "mode": self.mode, "requested_mode": self.requested_mode,
+            "error": self.error, "heading": round(self.heading, 1),
+            "gyro_bias": round(self.gyro_bias, 4),
+            "bias_calibrated": self.bias_calibrated,
+            "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
+            "battery": batt.classify(self.voltage()),
+            "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
         }
+
+    def close(self) -> None:
+        try:
+            self.stop()
+        except Exception:                    # noqa: BLE001
+            pass
+        try:
+            if self._ser:
+                self._ser.close()
+        except Exception:                    # noqa: BLE001
+            pass

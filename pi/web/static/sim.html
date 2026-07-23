@@ -138,7 +138,37 @@
         <div class="stat"><span>التصحيحات</span><b id="stCorr">0</b></div>
         <div class="stat"><span>الشذوذات</span><b id="stAnom">0</b></div>
         <div class="stat"><span>القراءة</span><b id="stRead">—</b></div>
+        <div class="stat"><span>🔋 البطارية</span><b id="stBatt">—</b></div>
         <div class="stat"><span>زمن المهمة</span><b id="stTime">—</b></div>
+        <div class="hint" id="calibWarn" style="color:var(--warn)"></div>
+      </div>
+
+      <div class="card">
+        <h3>لوحة الحساسات</h3>
+        <div class="stat"><span>ألترا سونيك أمامي</span><b id="snUs">—</b></div>
+        <div class="stat"><span>IR أمام-يسار</span><b id="snIrL">—</b></div>
+        <div class="stat"><span>IR أمام-يمين</span><b id="snIrR">—</b></div>
+        <div class="stat"><span>CPM</span><b id="snCpm">—</b></div>
+      </div>
+
+      <div class="card">
+        <h3>المعايرة والعتاد</h3>
+        <div class="stat"><span>وضع الروفر</span><b id="rvMode">—</b></div>
+        <div class="stat"><span>انحياز الجايرو</span><b id="rvBias">—</b></div>
+        <button class="btn" id="btnGyro">🧭 معايرة انحياز الجايرو</button>
+        <label style="margin-top:10px">معايرة السرعة (قِس المسافة بشريط قياس)</label>
+        <div class="row">
+          <div><label>القوة</label><input id="calPower" type="number" value="0.5" step="0.1" min="0.1" max="1"></div>
+          <div><label>المدة (ث)</label><input id="calDur" type="number" value="3" step="0.5" min="0.5"></div>
+          <div><label>المسافة (م)</label><input id="calDist" type="number" value="1.8" step="0.1" min="0.1"></div>
+        </div>
+        <button class="btn" id="btnSpeedCal">📏 احسب واحفظ السرعة</button>
+        <div class="hint" id="calMsg"></div>
+        <label style="margin-top:10px">اختبار عتبات البطارية (محاكاة)</label>
+        <div class="row">
+          <input id="battV" type="number" value="12.4" step="0.1" min="8" max="13">
+          <button class="btn" id="btnBatt" style="margin-top:0">ضبط</button>
+        </div>
       </div>
 
       <div class="card">
@@ -279,6 +309,17 @@
       $("stRead").innerHTML=rd.usvh+" µSv/h <span class='pill' style='background:"+rd.color+"'>"+rd.risk+"</span>";
       cpmHist.push(rd.cpm); if(cpmHist.length>120)cpmHist.shift(); drawCpm();}
     if(d.mission_time_s!==undefined)$("stTime").textContent=d.mission_time_s+" ث";
+    if(d.battery){const b=d.battery;
+      $("stBatt").innerHTML=(b.v!==null?b.v+"V ":"—")+
+        "<span class='pill' style='background:"+b.color+"'>"+b.text+" "+b.percent+"%</span>";}
+    $("calibWarn").textContent=d.calib_warning||"";
+    if(d.sensors){const s=d.sensors;
+      $("snUs").textContent=(s.ultrasonic_cm!==null?s.ultrasonic_cm+" سم":"—");
+      const irTxt=v=>v===0?"🚧 عائق":"✅ خالٍ";
+      $("snIrL").textContent=irTxt(s.ir_left); $("snIrR").textContent=irTxt(s.ir_right);
+      $("snCpm").textContent=s.cpm;}
+    if(d.rover){$("rvMode").textContent=d.rover.mode+(d.rover.error?" ⚠":"");
+      $("rvBias").textContent=d.rover.bias_calibrated?d.rover.gyro_bias:"لم تُعاير";}
     if(d.events) renderEvents(d.events);
     draw();
   }
@@ -351,6 +392,20 @@
   }
   $("calibSel").onchange=async()=>{if($("calibSel").value)await api("/api/calibration/select",{name:$("calibSel").value});updateButtons();};
   $("btnNewCalib").onclick=async()=>{await api("/api/calibration/new_sim");await loadCalib();};
+  $("btnGyro").onclick=async()=>{
+    $("rvBias").textContent="يقيس…";
+    const r=await api("/api/rover/calibrate_gyro");
+    $("rvBias").textContent=r.gyro_bias;
+  };
+  $("btnSpeedCal").onclick=async()=>{
+    const r=await api("/api/calibration/speed",{power:+$("calPower").value,
+      duration_s:+$("calDur").value, distance_m:+$("calDist").value});
+    const m=$("calMsg");
+    if(r.ok){m.style.color="var(--ok)";
+      m.textContent="✅ "+r.speed_mps+" م/ث عند قوة "+r.power_key+" (جهد المعايرة "+r.battery_v+"V)";}
+    else{m.style.color="var(--bad)";m.textContent="⚠ "+r.error;}
+  };
+  $("btnBatt").onclick=()=>api("/api/sim/battery",{v:+$("battV").value});
   $("btnStart").onclick=()=>api("/api/mission/start").then(r=>{if(!r.ok)alert(r.error);});
   $("btnPause").onclick=()=>api("/api/mission/pause");
   $("btnResume").onclick=()=>api("/api/mission/resume");
