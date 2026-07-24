@@ -149,6 +149,8 @@
         <div class="stat"><span>IR أمام-يسار</span><b id="snIrL">—</b></div>
         <div class="stat"><span>IR أمام-يمين</span><b id="snIrR">—</b></div>
         <div class="stat"><span>CPM</span><b id="snCpm">—</b></div>
+        <div class="stat"><span>🛡️ قرار السلامة</span><b id="snReact">—</b></div>
+        <div class="hint" id="snReason"></div>
       </div>
 
       <div class="card">
@@ -318,6 +320,11 @@
       const irTxt=v=>v===0?"🚧 عائق":"✅ خالٍ";
       $("snIrL").textContent=irTxt(s.ir_left); $("snIrR").textContent=irTxt(s.ir_right);
       $("snCpm").textContent=s.cpm;}
+    if(d.reactive){const rc=d.reactive;
+      const col=rc.speed===0?"var(--bad)":(rc.speed<=0.3?"var(--warn)":"var(--ok)");
+      $("snReact").innerHTML="<span style='color:"+col+"'>"+
+        (rc.action==="go"?("قوة "+rc.speed):rc.action)+" · "+rc.rung+"</span>";
+      $("snReason").textContent=rc.reason||"";}
     if(d.rover){$("rvMode").textContent=d.rover.mode+(d.rover.error?" ⚠":"");
       $("rvBias").textContent=d.rover.bias_calibrated?d.rover.gyro_bias:"لم تُعاير";}
     if(d.events) renderEvents(d.events);
@@ -341,7 +348,9 @@
       "<div><span class='k'>"+({mission_start:"بدء",mission_end:"انتهاء",pause:"إيقاف",
       resume:"استئناف",estop:"طوارئ",obstacle_detected:"عائق",obstacle_placed:"عائق يدوي",
       obstacle_removed:"إزالة عائق",unreachable:"غير قابل",wall_correction:"تصحيح جدار",
-      anomaly:"شذوذ",return_home:"عودة",home:"وصل",room_configured:"غرفة"}[e.kind]||e.kind)
+      anomaly:"شذوذ",return_home:"عودة",home:"وصل",room_configured:"غرفة",
+      battery:"بطارية",speed:"سرعة",power_clamp:"قصّ قوة",turn_segmented:"تجزئة لفّ",
+      gyro_bias:"انحياز جايرو",gyro_bias_rejected:"رفض معايرة",heartbeat:"heartbeat"}[e.kind]||e.kind)
       +"</span> — "+e.msg+"</div>").join("");
   }
 

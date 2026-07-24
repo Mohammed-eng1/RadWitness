@@ -126,7 +126,8 @@ def main() -> int:
 
     # (11) السلامة التفاعلية: العلم معطّل + منطق القرار سليم
     print("\nو) السلامة التفاعلية (معطّلة، منطق فقط):")
-    check("REACTIVE_SAFETY_ENABLED = False (كما نصّ البريف)", REACTIVE_SAFETY_ENABLED is False)
+    check("REACTIVE_SAFETY_ENABLED = True (فُعّلت — البند 6)",
+          REACTIVE_SAFETY_ENABLED is True)
     rs = ReactiveSafety(enabled=False)
     check("عائق أمامي < 30سم (STOP_CM) → توقف", rs.decide(20.0, 1, 1)["action"] == "stop")
     check("IR يسار عائق (0) → انعطاف يمين", rs.decide(100.0, 0, 1)["action"] == "turn_right")
@@ -268,6 +269,40 @@ def main() -> int:
     check("تحذير قصّ القوة يظهر في سجل الأحداث",
           any(e["kind"] == "power_clamp" for e in ms.events),
           [e["msg"] for e in ms.events if e["kind"] == "power_clamp"][0][:46])
+
+    # ═══ باتش ما قبل التشغيل: الجايرو + التجزئة + التفعيل ═════════
+    print("\nط) معامل الجايرو وتجزئة اللفّ:")
+    from pi.config import GYRO_SCALE, MAX_TURN_SEGMENT_DEG
+    from pi.rover.bridge import robust_bias
+
+    check("GYRO_SCALE محدّث إلى 0.9275", GYRO_SCALE == 0.9275)
+
+    # الانحياز بالوسيط: عينتان شاذتان من 320 لا تُفسدانه
+    clean = [-0.28 + (i % 7 - 3) * 0.1 for i in range(318)]
+    info = robust_bias(clean + [31.5, -29.8])
+    check("الانحياز بالوسيط يستبعد الشواذ ولا يفشل",
+          info["ok"] and info["rejected"] == 2 and abs(info["bias"] + 0.28) < 0.25,
+          f"bias={info['bias']:.3f} σ={info['std']:.2f} استُبعد={info['rejected']}")
+    noisy = robust_bias([i * 3.0 for i in range(-20, 21)])
+    check("تشتت مفرط بعد التنقية → تُرفض المعايرة",
+          not noisy["ok"] and noisy["reason"], noisy["reason"])
+
+    # تجزئة اللفّة الطويلة
+    br2 = WaveRoverBridge(mode="sim")
+    br2.calibrate_gyro_bias(seconds=0.3)
+    r360 = br2.turn_by_angle(360)
+    check("turn_by_angle(360) يُنفَّذ على 3 مراحل",
+          r360["segments"] == 3 and not r360["timed_out"],
+          f"مراحل={r360['segments']} · دار {r360['turned_deg']}°")
+    check("الزاوية التراكمية عبر المراحل صحيحة",
+          abs(abs(r360["turned_deg"]) - 360) < 30, f"{r360['turned_deg']}°")
+    check("حدث التجزئة يظهر في السجل",
+          any(e["kind"] == "turn_segmented" for e in br2.events),
+          [e["msg"] for e in br2.events if e["kind"] == "turn_segmented"][0])
+    r90 = br2.turn_by_angle(90)
+    check("لفّة 90° تبقى مرحلة واحدة (لا تجزئة)", r90["segments"] == 1)
+    check("المهلة لكل مرحلة لا للفّة كاملة",
+          br2.turn_by_angle(100000, timeout=1.0)["timed_out"] and not br2._moving)
 
     # الخلاصة
     passed = sum(_results)
