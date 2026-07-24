@@ -32,7 +32,7 @@ from pi.sensors.geiger import GeigerReader
 from pi.sensors.gps import GPSReader
 from pi.sensors.imu import IMUReader
 from pi.sensors.camera import CameraReader
-from pi.rover.bridge import RoverBridge
+from pi.rover.bridge import RoverBridge, WaveRoverBridge
 
 _STATIC = Path(__file__).parent / "static"
 
@@ -221,6 +221,59 @@ def api_calib_gyro():
     bias = mission.rover.calibrate_gyro_bias()
     mission._log("gyro_bias", f"معايرة انحياز الجايرو: {bias:.3f}")
     return {"ok": True, "gyro_bias": round(bias, 4)}
+
+
+@app.post("/api/rover/mode")
+async def api_rover_mode(req: Request):
+    """
+    تبديل جسر الروفر بين `sim` و`real` وقت التشغيل (العلم الواحد).
+    عند تعذّر فتح المنفذ يسقط إلى sim ويُعيد سبب الفشل — لا فشل صامت.
+    """
+    d = await req.json()
+    mode = str(d.get("mode", "sim")).lower()
+    if mode not in ("sim", "real"):
+        return JSONResponse({"ok": False, "error": "الوضع يجب أن يكون sim أو real"},
+                            status_code=400)
+    try:
+        mission.rover.close()
+    except Exception:                          # noqa: BLE001
+        pass
+    mission.rover = WaveRoverBridge(mode=mode)
+    mission._log("rover_mode",
+                 f"وضع الروفر: {mission.rover.mode}"
+                 + (f" ⚠ {mission.rover.error}" if mission.rover.error else ""))
+    return {"ok": True, "mode": mission.rover.mode, "error": mission.rover.error}
+
+
+@app.post("/api/rover/test")
+def api_rover_test(payload: dict):
+    """
+    اختبارات حركة **يدوية قصيرة** (بنود القائمة 8-9) — للتحقق من اتجاه
+    الحركة ودقة اللفّ على الأرض. كل اختبار قصير ويُنهى بـstop().
+    ⚠ يحرّك المحركات فعلياً في وضع real — أبقِ يدك على إيقاف الطوارئ.
+    """
+    action = str(payload.get("action", "stop"))
+    rv = mission.rover
+    try:
+        if action == "stop":
+            rv.stop()
+            return {"ok": True, "action": "stop"}
+        if action == "forward":
+            rv.forward()                        # DRIVE_POWER_DEFAULT (0.40)
+            sent = rv._cmd_lr                   # القيم المُرسلة فعلاً (قبل الإيقاف)
+            time.sleep(float(payload.get("seconds", 1.0)))
+            rv.stop()
+            return {"ok": True, "action": "forward", "cmd": list(sent)}
+        if action == "turn90":
+            res = rv.turn_by_angle(float(payload.get("degrees", 90)))
+            return {"ok": True, "action": "turn90", **res}
+        if action == "calibrate_gyro":
+            bias = rv.calibrate_gyro_bias()
+            return {"ok": True, "gyro_bias": round(bias, 4), "info": rv.bias_info}
+        return JSONResponse({"ok": False, "error": "أمر غير معروف"}, status_code=400)
+    except Exception as e:                      # noqa: BLE001
+        rv.stop()                               # ⚠ أي استثناء → إيقاف
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/api/sim/battery")
