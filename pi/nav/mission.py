@@ -319,8 +319,10 @@ class MissionSim:
         if (real_us is not None and real_us.ok) or (real_ir is not None and real_ir.ok):
             us = real_us.distance_cm if (real_us and real_us.ok) else None
             l, r = real_ir.read() if (real_ir and real_ir.ok) else (1, 1)
+            q = getattr(real_us, "quality", None) if (real_us and real_us.ok) else None
             return {"ultrasonic_cm": us, "ir_left": l, "ir_right": r,
-                    "cpm": self.last_reading["cpm"], "source": "real"}
+                    "cpm": self.last_reading["cpm"], "source": "real",
+                    "quality": q}
         if self.grid is None or self.dr is None:
             return {"ultrasonic_cm": None, "ir_left": 1, "ir_right": 1,
                     "cpm": self.last_reading["cpm"]}
