@@ -67,6 +67,17 @@ class DeadReckoning:
         self.heading = (self.heading + degrees) % 360.0
         self.uncertainty += DRIFT_PER_TURN * (abs(degrees) / 90.0)
 
+    def advance(self, dist_m: float) -> None:
+        """
+        يقدّم الموقع بمسافة **مقطوعة فعلياً** (من التنفيذ الحقيقي على المحركات)
+        بدل اشتقاقها من زمن×سرعة مفترضة، وينمّي الشك بنفس النموذج.
+        """
+        hd = math.radians(self.heading)
+        self.x += dist_m * math.sin(hd)
+        self.y += dist_m * math.cos(hd)
+        self.distance_total += abs(dist_m)
+        self.uncertainty += DRIFT_PER_METER * abs(dist_m)
+
     def set_pose(self, x: float, y: float, heading: float) -> None:
         self.x, self.y, self.heading = float(x), float(y), heading % 360.0
 

@@ -16,13 +16,14 @@ from __future__ import annotations
 import csv
 import io
 import math
+import threading
 import time
 from pathlib import Path
 
 from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
-    ROVER_MODE,
+    ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
@@ -31,6 +32,7 @@ from pi.nav.deadreckoning import DeadReckoning
 from pi.nav.calibration import CalibrationProfile
 from pi.nav.sim_world import SimWorld
 from pi.nav.reactive import ReactiveSafety
+from pi.nav.executor import DriveExecutor
 from pi.ai.risk import classify
 from pi.rover.bridge import WaveRoverBridge
 from pi.rover import battery as batt
@@ -119,6 +121,12 @@ class MissionSim:
         self._clamp_seen = 0
         self._last_rung = None
         self.last_reactive = None
+        self.drive_motors = False
+        self.executor = None
+        self._worker = None
+        self.ultrasonic = None
+        self.ir = None
+        self.geiger = None
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -170,12 +178,19 @@ class MissionSim:
         self._returning = False
         self.state = RUNNING
         self._visit(self.current)
-        self._log("mission_start", "بدء المسح الذاتي")
+        self._log("mission_start",
+                  "بدء المسح الذاتي" + (" — قيادة محركات ⚠" if self.drive_motors else " (منطقي)"))
+        if self.drive_motors:
+            self.executor = DriveExecutor(self.rover, self.reactive,
+                                          self.sensors, self.profile)
+            self._worker = threading.Thread(target=self._motor_worker, daemon=True)
+            self._worker.start()
         return {"ok": True}
 
     def pause(self):
         if self.state == RUNNING:
             self.state = PAUSED
+            self.rover.stop()
             self._log("pause", "إيقاف مؤقت")
 
     def resume(self):
@@ -185,6 +200,7 @@ class MissionSim:
 
     def estop(self):
         self.state = ESTOP
+        self.rover.stop()          # ⚠ إيقاف محركات فوري
         self.planned_path = []
         self._log("estop", "إيقاف طوارئ")
 
@@ -263,32 +279,155 @@ class MissionSim:
         self._batt_level = info["level"]
         return info
 
+    # ── مصادر حقيقية (تُحقن من السيرفر على الراسبري) ──────────────
+    def set_proximity(self, ultrasonic=None, ir=None):
+        self.ultrasonic, self.ir = ultrasonic, ir
+
+    def set_geiger(self, geiger=None):
+        self.geiger = geiger
+
+    def set_drive_motors(self, enabled: bool) -> dict:
+        """
+        يبدّل بين المسح **المنطقي** (محاكاة على الشبكة) و**تشغيل المحركات**.
+        لا يُسمح بتشغيل المحركات بلا ملف معايرة (المسافة تُشتق من السرعة).
+        """
+        enabled = bool(enabled)
+        if enabled and self.profile is None:
+            return {"ok": False, "error": "لا يوجد ملف معايرة — عايِر أولاً"}
+        if enabled and self.state == RUNNING:
+            return {"ok": False, "error": "أوقف المهمة قبل تبديل وضع القيادة"}
+        self.drive_motors = enabled
+        self._log("drive_mode",
+                  "قيادة المحركات مفعّلة ⚠" if enabled else "مسح منطقي (بلا محركات)")
+        return {"ok": True, "drive_motors": self.drive_motors}
+
     def sensors(self) -> dict:
-        """قراءات القرب الوهمية للواجهة: ألترا سونيك أمامي + IR الركنين."""
+        """
+        قراءات القرب. تُفضّل **الحساسات الحقيقية** متى توفّرت (على الراسبري)،
+        وإلا تسقط إلى نموذج SimWorld (على ويندوز/بلا عتاد).
+        """
+        real_us = getattr(self, "ultrasonic", None)
+        real_ir = getattr(self, "ir", None)
+        if (real_us is not None and real_us.ok) or (real_ir is not None and real_ir.ok):
+            us = real_us.distance_cm if (real_us and real_us.ok) else None
+            l, r = real_ir.read() if (real_ir and real_ir.ok) else (1, 1)
+            return {"ultrasonic_cm": us, "ir_left": l, "ir_right": r,
+                    "cpm": self.last_reading["cpm"], "source": "real"}
         if self.grid is None or self.dr is None:
             return {"ultrasonic_cm": None, "ir_left": 1, "ir_right": 1,
                     "cpm": self.last_reading["cpm"]}
         front_cm = self.world.front_distance_cm(self.dr.x, self.dr.y, self.heading)
-        # اتجاه الأمام واليسار بالخلايا (dx=عمود، dy=صف)
-        th = math.radians(self.heading)
-        fx, fy = round(math.sin(th)), round(math.cos(th))
-        lx, ly = round(-math.cos(th)), round(math.sin(th))
-        r, c = self.current
+        # نموذج IR واقعي: الحسّاسان مداهما 2-30سم، فلا يُطلقان إلا إذا كان
+        # هناك شيء **قريب فعلاً أمامنا**. (النموذج القديم كان يقرأ الخلية
+        # القطرية فيعتبر جدار الغرفة عائقاً دائماً كلما سار الروبوت بمحاذاته.)
+        ir_left = ir_right = 1
+        if front_cm is not None and front_cm <= IR_RANGE_CM:
+            th = math.radians(self.heading)
+            fx, fy = round(math.sin(th)), round(math.cos(th))
+            lx, ly = round(-math.cos(th)), round(math.sin(th))
+            r, c = self.current
 
-        def occupied(rr, cc):
-            # خارج الغرفة = جدار = عائق (0)، أو خلية عائق حقيقية
-            if not self.grid.in_bounds(rr, cc):
-                return 0
-            return 0 if self.world.is_obstacle(rr, cc) else 1
+            def obstacle_at(rr, cc):
+                return self.grid.in_bounds(rr, cc) and self.world.is_obstacle(rr, cc)
 
-        ir_left = occupied(r + fy + ly, c + fx + lx)
-        ir_right = occupied(r + fy - ly, c + fx - lx)
+            left_hit = obstacle_at(r + fy + ly, c + fx + lx)
+            right_hit = obstacle_at(r + fy - ly, c + fx - lx)
+            if left_hit or right_hit:
+                ir_left = 0 if left_hit else 1
+                ir_right = 0 if right_hit else 1
+            else:
+                ir_left = ir_right = 0      # عائق/جدار أمامي مركزي
         return {"ultrasonic_cm": round(front_cm, 1),
                 "ir_left": ir_left, "ir_right": ir_right,
                 "cpm": self.last_reading["cpm"]}
 
+    # ══ المرحلة 2: تنفيذ حقيقي على المحركات (خيط منفصل) ══════════
+    def _motor_worker(self):
+        """
+        ينفّذ المسح على المحركات فعلياً. يعمل في خيط مستقل لأن كل خطوة
+        تستغرق ثوانٍ (لفّ + تقدّم + توقّف قياس)، بينما تبقى حلقة البثّ حيّة.
+        ⚠ ينتهي دائماً بـstop() مهما حدث.
+        """
+        try:
+            while self.state in (RUNNING, PAUSED):
+                if self.state == PAUSED:
+                    self.rover.stop()
+                    time.sleep(0.2)
+                    continue
+                target = self._current_start() if self._returning else self._next_target()
+                if target is None:
+                    self._finish()
+                    break
+                path = find_path(self.grid, self.current, target)
+                if path is None or len(path) < 2:
+                    if self._returning:
+                        self._finish()
+                        break
+                    self.grid.mark_unreachable(*target)
+                    self.dirty.add(target)
+                    self._log("unreachable", f"هدف غير قابل للوصول ({target[0]},{target[1]})")
+                    continue
+                self.planned_path = path
+                nxt = path[1]
+                target_heading = _heading_between(self.current, nxt)
+
+                # ⚠ اللفّ أولاً ثم **تحديث الاتجاه فوراً** قبل التقدّم: قراءة
+                # الحساسات تعتمد self.heading، فلو بقي قديماً لقاس الروبوت
+                # المسافة في الاتجاه الخاطئ وأجهض الخطوة بعائق وهمي.
+                t = self.executor.turn_to(self.heading, target_heading)
+                turned = t.get("turned_deg", 0.0)
+                if self.dr and turned:
+                    self.dr.turn(turned)
+                    self.heading = self.dr.heading
+                if not t["ok"]:
+                    self._log("turn_timeout", f"انتهت مهلة اللفّ نحو {target_heading:.0f}°")
+                    continue
+
+                # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
+                tx, ty = self.grid.cell_center(*nxt)
+                exp_wall = self._wall_distance_from(tx, ty, self.heading)
+                fwd = self.executor.forward_cell(CELL_SIZE_M, expected_wall_end_m=exp_wall)
+                covered = fwd.get("covered_m", 0.0)
+                if self.dr and covered:
+                    self.dr.advance(covered)
+                res = {"ok": fwd["ok"], "turn": t, "forward": fwd,
+                       "reason": fwd.get("reason")}
+
+                if not res["ok"]:
+                    # أُجهضت الخطوة: عائق حقيقي أمامنا → علّمه وأعد التخطيط
+                    self.grid.mark_blocked(*nxt)
+                    self.dirty.add(nxt)
+                    self._log("obstacle_detected",
+                              f"عائق حقيقي ({nxt[0]},{nxt[1]}) — {res.get('reason') or fwd.get('aborted')}")
+                    self.replans[target] = self.replans.get(target, 0) + 1
+                    if self.replans[target] > MAX_REPLANS_PER_TARGET:
+                        self.grid.mark_unreachable(*target)
+                        self.dirty.add(target)
+                        self._log("unreachable", f"هدف محاصر ({target[0]},{target[1]})")
+                    continue
+
+                self.current = nxt
+                self.trail.append(self.current)
+                self.mission_time_s += CELL_DWELL_S
+                time.sleep(CELL_DWELL_S)        # توقّف لتجميع عدّ إحصائي كافٍ
+                self._visit(self.current)
+                s = self.sensors()
+                self.executor.maybe_wall_correct(self.dr, self.heading,
+                                                 s.get("ultrasonic_cm"))
+                self._check_battery()
+                if self._returning and self.current == self.grid.start_cell():
+                    self._finish()
+                    break
+        except Exception as e:                  # noqa: BLE001
+            self._log("error", f"⚠ خطأ في التنفيذ: {e}")
+            self.estop()
+        finally:
+            self.rover.stop()                   # ⚠ إيقاف مضمون
+
     def tick(self):
         self._check_battery()
+        if self.drive_motors:
+            return                              # الخيط العامل يقود بدلاً منه
         if self.state != RUNNING or self.grid is None:
             return
         target = self._current_start() if self._returning else self._next_target()
@@ -354,12 +493,40 @@ class MissionSim:
             return max(prioritized, key=lambda rc: self.grid.get(*rc).priority)
         return rem[0]
 
+    def _wall_distance_from(self, x: float, y: float, heading: float):
+        """مسافة جدار الغرفة أمام نقطة باتجاه معيّن (من الخريطة لا الحساس)."""
+        # الاتجاه الفعلي بعد تكامل الجايرو نادراً ما يكون 90.0 بالضبط (قد يكون
+        # 88.6)، فنثبّته على أقرب محور ضمن التسامح بدل رفضه.
+        h = heading % 360.0
+        axis = min((0.0, 90.0, 180.0, 270.0),
+                   key=lambda a: abs((h - a + 180.0) % 360.0 - 180.0))
+        if abs((h - axis + 180.0) % 360.0 - 180.0) > WALL_ALIGN_TOL_DEG:
+            return None
+        if axis == 0.0:
+            return max(0.0, self.room.length_m - y)
+        if axis == 180.0:
+            return max(0.0, y)
+        if axis == 90.0:
+            return max(0.0, self.room.width_m - x)
+        return max(0.0, x)
+
+    def _read_radiation(self, x: float, y: float):
+        """
+        قراءة الإشعاع: **العدّاد الحقيقي** متى توفّر (مسح حقيقي)، وإلا نموذج
+        SimWorld. الإشعاع لا يُحاكى أبداً حين يكون العتاد متصلاً.
+        """
+        g = getattr(self, "geiger", None)
+        if g is not None and getattr(g, "ok", False):
+            st = g.state()
+            return st["cpm"], st["usvh"]
+        return self.world.reading_at(x, y)
+
     def _visit(self, cell):
         r, c = cell
         gc = self.grid.get(r, c)
         already = gc.visited
         x, y = self.grid.cell_center(r, c)
-        cpm, usvh = self.world.reading_at(x, y)
+        cpm, usvh = self._read_radiation(x, y)
         anomaly = (not already) and self.stats.is_anomaly(cpm)
         if not already:
             self.stats.add(cpm)
@@ -471,6 +638,7 @@ class MissionSim:
             "sensors": self.sensors(),
             "reactive": self.last_reactive,
             "reactive_enabled": self.reactive.enabled,
+            "drive_motors": self.drive_motors,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),
                       "bias_calibrated": self.rover.bias_calibrated},

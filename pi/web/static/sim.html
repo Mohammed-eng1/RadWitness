@@ -96,6 +96,12 @@
           <button class="btn estop" id="btnEstop" disabled>⏹ إيقاف طوارئ</button>
           <a class="btn" id="btnCsv" href="/api/mission/csv" style="text-align:center;text-decoration:none">⬇ CSV</a>
         </div>
+        <label style="margin-top:10px">وضع القيادة</label>
+        <div class="row">
+          <button class="btn" id="btnDriveLogical" style="margin-top:0">🧪 مسح منطقي</button>
+          <button class="btn" id="btnDriveMotors" style="margin-top:0">⚙️ قيادة محركات</button>
+        </div>
+        <div class="hint" id="driveMsg"></div>
         <label style="margin-top:10px">مضاعف السرعة</label>
         <div class="speedbtns">
           <button data-mult="1" class="sel">×1</button>
@@ -444,6 +450,15 @@
       msg.textContent="الوضع الحالي: "+r.mode+(r.error?("  ⚠ "+r.error):"");
     }else{msg.style.color="var(--bad)";msg.textContent="⚠ "+r.error;}
   }
+  async function setDrive(motors){
+    const m=$("driveMsg"); m.style.color="var(--muted)"; m.textContent="يبدّل…";
+    const r=await api("/api/mission/drive_mode",{motors});
+    if(r.ok){m.style.color=motors?"var(--warn)":"var(--muted)";
+      m.textContent=motors?"⚠ قيادة المحركات مفعّلة — الروبوت سيتحرك فعلياً":"مسح منطقي (بلا محركات)";}
+    else{m.style.color="var(--bad)";m.textContent="⚠ "+r.error;}
+  }
+  $("btnDriveLogical").onclick=()=>setDrive(false);
+  $("btnDriveMotors").onclick=()=>setDrive(true);
   $("btnModeSim").onclick=()=>setMode("sim");
   $("btnModeReal").onclick=()=>setMode("real");
   async function hw(action,extra){
