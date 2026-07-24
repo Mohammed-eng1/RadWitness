@@ -295,6 +295,12 @@ def api_rover_test(body: RoverTestReq):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+@app.get("/api/sensors/check")
+def api_sensors_check():
+    """فحص حسّاسات القرب (يكشف حسّاساً غير موصول قبل تشغيل المحركات)."""
+    return mission.preflight_check()
+
+
 @app.post("/api/mission/drive_mode")
 async def api_drive_mode(req: Request):
     """تبديل بين المسح المنطقي وقيادة المحركات فعلياً (المرحلة 2)."""
