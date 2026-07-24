@@ -170,6 +170,14 @@ class MissionSim:
             return {"ok": False, "error": "عرّف الغرفة أولاً"}
         if self.profile is None:
             return {"ok": False, "error": "لا يوجد ملف معايرة — عايِر أولاً"}
+        if self.drive_motors:
+            # ⚠ لا تبدأ قيادة محركات بحسّاس قرب معطوب — يُجهض كل خطوة ويلوّث الخريطة
+            pf = self.preflight_check()
+            if not pf["ok"]:
+                for p in pf["problems"]:
+                    self._log("preflight", "⚠ " + p)
+                return {"ok": False, "error": " · ".join(pf["problems"]),
+                        "preflight": pf}
         self.current = self.grid.start_cell()
         cx, cy = self.grid.cell_center(*self.current)
         self.dr = DeadReckoning(self.room, self.profile, cx, cy, 0.0)
@@ -394,11 +402,23 @@ class MissionSim:
                        "reason": fwd.get("reason")}
 
                 if not res["ok"]:
-                    # أُجهضت الخطوة: عائق حقيقي أمامنا → علّمه وأعد التخطيط
+                    # أُجهضت الخطوة. إن كان السبب IR بينما الألترا سونيك يرى
+                    # الطريق خالياً، فالأرجح حسّاس معطوب لا عائق — نقولها صراحة
+                    # بدل اتهام خلية سليمة (وتلويث الخريطة).
+                    s_now = self.sensors()
+                    us_now = s_now.get("ultrasonic_cm")
+                    ir_fired = (s_now.get("ir_left") == 0 or s_now.get("ir_right") == 0)
+                    if ir_fired and (us_now is None or us_now > IR_RANGE_CM * 2):
+                        self._log("sensor_fault",
+                                  f"⚠ IR يقول «عائق» والألترا سونيك يرى {us_now}سم — "
+                                  f"تحقّق من توصيل IR (BCM25/BCM16) ومقاومة المدى")
+                    if covered < 0.05:
+                        self._log("no_motion",
+                                  f"لم يتحرك الروبوت ({covered:.2f}م) — أُجهضت الخطوة فوراً")
                     self.grid.mark_blocked(*nxt)
                     self.dirty.add(nxt)
                     self._log("obstacle_detected",
-                              f"عائق حقيقي ({nxt[0]},{nxt[1]}) — {res.get('reason') or fwd.get('aborted')}")
+                              f"عائق ({nxt[0]},{nxt[1]}) — {res.get('reason') or fwd.get('aborted')}")
                     self.replans[target] = self.replans.get(target, 0) + 1
                     if self.replans[target] > MAX_REPLANS_PER_TARGET:
                         self.grid.mark_unreachable(*target)
@@ -509,6 +529,43 @@ class MissionSim:
         if axis == 90.0:
             return max(0.0, self.room.width_m - x)
         return max(0.0, x)
+
+    def preflight_check(self, samples: int = 8, gap: float = 0.15) -> dict:
+        """
+        فحص ما قبل القيادة بالمحركات — يكشف حسّاس قرب **غير موصول أو مضبوطاً
+        خطأً** قبل أن يُفسد المهمة كلها.
+
+        المنطق: مدى IR هو 2-30سم فقط. فإن ظلّ يقول «عائق» في كل العيّنات
+        بينما الألترا سونيك يرى مسافة بعيدة (أو لا يقرأ)، فالأرجح أن دخله
+        **عائم (غير موصول)** أو مقاومة المدى مضبوطة خطأً. عندها نرفض البدء
+        برسالة صريحة — أفضل بكثير من إجهاض كل خطوة وتلويث الخريطة بخلايا
+        محجوبة كاذبة (فشل صامت).
+        """
+        left_hits = right_hits = far_us = 0
+        last = {}
+        for _ in range(max(1, samples)):
+            s = self.sensors()
+            last = s
+            if s.get("ir_left") == 0:
+                left_hits += 1
+            if s.get("ir_right") == 0:
+                right_hits += 1
+            us = s.get("ultrasonic_cm")
+            if us is None or us > IR_RANGE_CM * 2:
+                far_us += 1
+            time.sleep(gap)
+
+        problems = []
+        if far_us == samples:
+            if left_hits == samples:
+                problems.append("حسّاس IR أمام-يسار يقرأ «عائق» دائماً والمسار أمامه خالٍ "
+                                "— تحقّق من توصيله (BCM25) ومن مقاومة المدى")
+            if right_hits == samples:
+                problems.append("حسّاس IR أمام-يمين يقرأ «عائق» دائماً والمسار أمامه خالٍ "
+                                "— تحقّق من توصيله (BCM16) ومن مقاومة المدى")
+        return {"ok": not problems, "problems": problems, "sensors": last,
+                "ir_left_hits": left_hits, "ir_right_hits": right_hits,
+                "samples": samples}
 
     def _read_radiation(self, x: float, y: float):
         """
