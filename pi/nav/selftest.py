@@ -11,7 +11,8 @@ import json
 import sys
 import tempfile
 
-from pi.config import REACTIVE_SAFETY_ENABLED
+from pi.config import REACTIVE_SAFETY_ENABLED, REACTIVE_LOOP_S, SPEED_NO_READING
+from pi.nav.reactive import speed_for_distance, median, JumpFilter
 from pi.nav.room import Room, OccupancyGrid
 from pi.nav.calibration import (
     CalibrationStore, CalibrationProfile, compute_speed_mps, compute_turn_rate_dps,
@@ -127,12 +128,85 @@ def main() -> int:
     print("\nو) السلامة التفاعلية (معطّلة، منطق فقط):")
     check("REACTIVE_SAFETY_ENABLED = False (كما نصّ البريف)", REACTIVE_SAFETY_ENABLED is False)
     rs = ReactiveSafety(enabled=False)
-    check("عائق أمامي < 25سم → توقف", rs.decide(20.0, 1, 1)["action"] == "stop")
+    check("عائق أمامي < 30سم (STOP_CM) → توقف", rs.decide(20.0, 1, 1)["action"] == "stop")
     check("IR يسار عائق (0) → انعطاف يمين", rs.decide(100.0, 0, 1)["action"] == "turn_right")
     check("المسار خالٍ → مواصلة", rs.decide(100.0, 1, 1)["action"] == "go")
     esc = EscapeSequence(max_attempts=3)
     maneuvers = [esc.next_maneuver()["maneuver"] for _ in range(12)]
     check("تسلسل التحرر ينتهي بالاستسلام (3 محاولات)", "give_up" in maneuvers)
+
+    # ═══ ترقية السلامة: البنود 1-5 ═══════════════════════════════
+    print("\nز) ترقية التفادي (البنود 1-5):")
+
+    # (2) السرعة المتدرّجة — التنازل عبر درجات السلّم
+    ladder = [(200, 0.50), (100, 0.40), (60, 0.30), (35, 0.20), (20, 0.0)]
+    got = [speed_for_distance(cm)["speed"] for cm, _ in ladder]
+    check("السرعة تتنازل مع الاقتراب (سلّم متدرّج)",
+          got == [s for _, s in ladder], " → ".join(str(s) for s in got))
+    check("فشل القراءة → احترس ولا تقف",
+          speed_for_distance(None)["speed"] == SPEED_NO_READING
+          and speed_for_distance(None)["rung"] == "no_reading")
+
+    # (5) الوسيط + تصفية القفزات
+    check("وسيط 3 قراءات يلغي الشاذّة", median([10, 500, 12]) == 12,
+          "median([10,500,12])=12")
+    jf = JumpFilter(max_jump_cm=100.0)
+    seq = [jf.feed(100), jf.feed(300), jf.feed(300)]
+    check("القفزة تُتجاهل حتى تتكرر مرتين", seq == [100, 100, 300], str(seq))
+    check("زمن الحلقة 0.08s (بدل 0.15)", REACTIVE_LOOP_S == 0.08)
+
+    # (4) جدول اختيار الجهة (IR في الركنين، 0=عائق)
+    rs2 = ReactiveSafety(enabled=False)
+    check("IR أيسر فقط → لفّ يميناً", rs2.decide(200, 0, 1)["action"] == "turn_right")
+    check("IR أيمن فقط → لفّ يساراً", rs2.decide(200, 1, 0)["action"] == "turn_left")
+    check("IR الجهتان → رجوع + لفّ 90°",
+          rs2.decide(200, 0, 0)["action"] == "backup_turn"
+          and rs2.decide(200, 0, 0)["turn_deg"] == 90.0)
+    d_us = rs2.decide(20, 1, 1)
+    check("ألترا سونيك فقط → توقف ثم مسح دوراني",
+          d_us["action"] == "stop" and d_us["next"] == "smart_avoid")
+    check("أولوية IR على الألترا سونيك (بلا مسح)",
+          rs2.decide(10, 0, 1)["priority"] == "ir")
+
+    # (3) المسح الدوراني: اتجه نحو الأبعد
+    class FakeRover:
+        def __init__(self):
+            self.heading = 0.0
+            self.stops = 0
+        def stop(self):        self.stops += 1
+        def backward(self, p=None): pass
+        def forward(self, p=None):  pass
+        def turn(self, d, p=None):  pass
+        def turn_by_angle(self, deg, **kw):
+            self.heading = (self.heading + deg) % 360.0
+            return {"turned_deg": deg}
+
+    def sampler_for(rover, right_cm, left_cm):
+        def s():
+            h = round(rover.heading) % 360
+            return right_cm if h == 30 else (left_cm if h == 330 else 100)
+        return s
+
+    rv = FakeRover()
+    res = ReactiveSafety(enabled=False).smart_avoid(rv, sampler_for(rv, 200, 50))
+    check("مسح دوراني → اليمين أبعد → لفّ يميناً",
+          res["decision"] == "turn_right" and res["right_cm"] == 200 and res["left_cm"] == 50,
+          f"يمين={res['right_cm']} يسار={res['left_cm']}")
+    rv2 = FakeRover()
+    res2 = ReactiveSafety(enabled=False).smart_avoid(rv2, sampler_for(rv2, 45, 220))
+    check("المسح يختار اليسار حين يكون الأبعد", res2["decision"] == "turn_left")
+    rv3 = FakeRover()
+    res3 = ReactiveSafety(enabled=False).smart_avoid(rv3, sampler_for(rv3, 20, 25))
+    check("الجهتان مسدودتان → لفّ 180° + إعادة تخطيط",
+          res3["decision"] == "replan_180", res3["reason"][:40])
+
+    # سقوط تلقائي للمنطق البسيط عند تعطيل المسح الذكي
+    rv4 = FakeRover()
+    rs_simple = ReactiveSafety(enabled=False, smart_avoid=False)
+    res4 = rs_simple.smart_avoid(rv4, sampler_for(rv4, 200, 50))
+    check("SMART_AVOID_ENABLED=False → منطق بسيط بلا أخطاء",
+          res4["decision"] == "simple_stop" and rs_simple.decide(20, 1, 1)["next"] == "simple")
+    check("إيقاف مضمون بعد كل مناورة (finally)", rv.stops > 0 and rv4.stops > 0)
 
     # الخلاصة
     passed = sum(_results)
