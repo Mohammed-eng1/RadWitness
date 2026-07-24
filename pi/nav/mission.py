@@ -22,6 +22,7 @@ from pathlib import Path
 from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
+    ROVER_MODE,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
@@ -88,7 +89,7 @@ class MissionSim:
     def __init__(self):
         self.profile = None
         # جسر الروفر (محاكاة على ويندوز؛ يُبدَّل إلى real على الراسبري بعلم واحد)
-        self.rover = WaveRoverBridge(mode="sim")
+        self.rover = WaveRoverBridge(mode=ROVER_MODE)
         self.reactive = ReactiveSafety()   # أولوية مطلقة (البند 6 مفعّل)
         self._reset_full()
 
