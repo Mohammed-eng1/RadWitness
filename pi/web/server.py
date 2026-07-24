@@ -22,13 +22,6 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-
-class RoverTestReq(BaseModel):
-    """جسم اختبار العتاد — نموذج صريح ليعمل على كل إصدارات FastAPI."""
-    action: str = "stop"
-    seconds: float = 1.0
-    degrees: float = 90.0
-
 from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
@@ -40,7 +33,15 @@ from pi.sensors.geiger import GeigerReader
 from pi.sensors.gps import GPSReader
 from pi.sensors.imu import IMUReader
 from pi.sensors.camera import CameraReader
+from pi.sensors.proximity import UltrasonicReader, IRReader
 from pi.rover.bridge import RoverBridge, WaveRoverBridge
+
+class RoverTestReq(BaseModel):
+    """جسم اختبار العتاد — نموذج صريح ليعمل على كل إصدارات FastAPI."""
+    action: str = "stop"
+    seconds: float = 1.0
+    degrees: float = 90.0
+
 
 _STATIC = Path(__file__).parent / "static"
 
@@ -56,6 +57,11 @@ gps = GPSReader()
 imu = IMUReader()
 camera = CameraReader()
 rover = RoverBridge(mode="sim")
+# حساسات القرب الحقيقية + مصدر الإشعاع → محرّك المهمة (المرحلة 2)
+ultrasonic = UltrasonicReader()
+ir_sensors = IRReader()
+mission.set_proximity(ultrasonic, ir_sensors)
+mission.set_geiger(geiger)
 _sensor_clients: set[WebSocket] = set()
 _last_sensor_loop = time.time()
 
@@ -136,6 +142,7 @@ async def lifespan(_app: FastAPI):
     yield
     t1.cancel(); t2.cancel()
     geiger.close(); gps.close(); camera.close()
+    ultrasonic.close(); ir_sensors.close()
 
 
 app = FastAPI(title="RMS Rover v2", lifespan=lifespan)
@@ -286,6 +293,13 @@ def api_rover_test(body: RoverTestReq):
     except Exception as e:                      # noqa: BLE001
         rv.stop()                               # ⚠ أي استثناء → إيقاف
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/mission/drive_mode")
+async def api_drive_mode(req: Request):
+    """تبديل بين المسح المنطقي وقيادة المحركات فعلياً (المرحلة 2)."""
+    d = await req.json()
+    return mission.set_drive_motors(bool(d.get("motors", False)))
 
 
 @app.post("/api/sim/battery")
