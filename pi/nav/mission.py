@@ -556,7 +556,9 @@ class MissionSim:
             time.sleep(gap)
 
         problems = []
-        if far_us == samples:
+        # يُشترط أن يكون **كل** العيّنات متفقة (حسّاس عالق فعلاً) وأن يكون
+        # الألترا سونيك يرى بعيداً في كلها — وإلا فقد يكون عائقاً حقيقياً.
+        if far_us == samples and samples >= 3:
             if left_hits == samples:
                 problems.append("حسّاس IR أمام-يسار يقرأ «عائق» دائماً والمسار أمامه خالٍ "
                                 "— تحقّق من توصيله (BCM25) ومن مقاومة المدى")
