@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
-from pi.nav.mission import MissionSim, default_sim_profile
+from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
 from pi.nav.calibration import CalibrationStore, compute_speed_mps
 
 # الحساسات الحقيقية (استيرادها آمن على ويندوز — كل مكتبات العتاد محمية داخلها)
@@ -66,6 +66,7 @@ async def _sim_loop() -> None:
             if (now - last_bcast) >= 0.2:
                 last_bcast = now
                 mission.poll_battery()     # الجهد يُعرض دائماً لا أثناء المسح فقط
+                mission.poll_power_clamp() # تحذيرات قصّ القوة → سجل الأحداث
                 if _sim_clients:
                     msg = json.dumps(mission.state_dict(include_full_grid=False))
                     for ws in list(_sim_clients):
@@ -175,12 +176,19 @@ async def api_calib_list():
 
 @app.post("/api/calibration/new_sim")
 async def api_calib_new_sim():
-    # يسجّل جهد البطارية وقت المعايرة (مؤشر صلاحيتها — أ-5)
+    """
+    ينشئ ملف المعايرة الحالي (**بطارية ممتلئة**) ويجعله النشط، ويحفظ بجانبه
+    الملف القديم **موسوماً بجهده المنخفض** ليظهر الفارق في القائمة.
+    """
+    legacy = legacy_low_battery_profile()
+    if legacy.name not in calib_store.list_names():
+        calib_store.save(legacy)
     prof = default_sim_profile(battery_v=mission.rover.voltage() or 0.0)
     calib_store.save(prof)
     mission.set_calibration(prof)
     _active_calib["name"] = prof.name
-    return {"ok": True, "name": prof.name, "battery_v": prof.battery_v}
+    return {"ok": True, "name": prof.name, "battery_v": prof.battery_v,
+            "legacy": legacy.name, "legacy_battery_v": legacy.battery_v}
 
 
 @app.post("/api/calibration/speed")

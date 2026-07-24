@@ -208,6 +208,67 @@ def main() -> int:
           res4["decision"] == "simple_stop" and rs_simple.decide(20, 1, 1)["next"] == "simple")
     check("إيقاف مضمون بعد كل مناورة (finally)", rv.stops > 0 and rv4.stops > 0)
 
+    # ═══ باتش حدّ القوة (التفاف فيرموير Wave Rover فوق 0.5) ═══════
+    print("\nح) حدّ القوة الصارم:")
+    from pi.rover.bridge import WaveRoverBridge
+    from pi.config import MAX_MOTOR_POWER, MOTOR_INVERT, SPEED_LADDER, DRIVE_POWER_DEFAULT
+    from pi.nav.mission import default_sim_profile, legacy_low_battery_profile
+
+    br = WaveRoverBridge(mode="sim")
+    res_hi = br.motors(0.8, 0.8)
+    check("motors(0.8,0.8) يُرسل 0.5 فعلياً (قصّ) + تحذير",
+          abs(res_hi["L"]) == MAX_MOTOR_POWER and abs(res_hi["R"]) == MAX_MOTOR_POWER
+          and res_hi["clamped"] and br.clamp_count == 1,
+          f"L={res_hi['L']} R={res_hi['R']}")
+    res_lo = br.motors(-0.9, -0.9)
+    check("motors(-0.9,-0.9) يُرسل ∓0.5 مع حفظ الإشارة",
+          abs(res_lo["L"]) == MAX_MOTOR_POWER
+          and res_lo["L"] == -res_hi["L"], f"L={res_lo['L']} (عكس اتجاه الأول)")
+    ok_range = br.motors(0.4, 0.4)
+    check("قيمة ضمن النطاق تمرّ بلا قصّ",
+          not ok_range["clamped"] and abs(ok_range["L"]) == 0.4)
+    check("لا مسار إرسال يتجاوز الحد (تقدّم/رجوع/لفّ)",
+          all(abs(v) <= MAX_MOTOR_POWER
+              for f in (lambda: br.forward(1.0), lambda: br.backward(1.0),
+                        lambda: br.turn("R", 1.0))
+              for v in (f() or br._cmd_lr)))
+    check("سلّم السرعة لا يُنتج قيمة > 0.5 أبداً",
+          all(p <= MAX_MOTOR_POWER for _, p in SPEED_LADDER)
+          and DRIVE_POWER_DEFAULT <= MAX_MOTOR_POWER,
+          f"أعلى درجة={max(p for _, p in SPEED_LADDER)}")
+
+    # المعايرة الجديدة + الاستيفاء الخطي + وسم القديمة
+    newp = default_sim_profile(battery_v=12.4)
+    check("المعايرة الجديدة (بطارية ممتلئة) تُحمَّل وتُستخدم",
+          newp.speed_for_power(0.4) == 0.590 and newp.speed_for_power(50) == 0.750,
+          f"0.4→{newp.speed_for_power(0.4)} م/ث")
+    check("استيفاء خطي بين النقاط المقاسة",
+          abs(newp.speed_for_power(30) - 0.420) < 1e-6,
+          f"30% → {newp.speed_for_power(30):.3f} م/ث (بين 0.250 و0.590)")
+    check("لا استقراء خارج النطاق (تثبيت على الطرف)",
+          newp.speed_for_power(90) == 0.750 and newp.speed_for_power(5) == 0.250)
+    oldp = legacy_low_battery_profile()
+    check("المعايرة القديمة موسومة بجهدها المنخفض",
+          oldp.battery_v == 10.1 and "متقادمة" in oldp.note, f"{oldp.battery_v}V")
+
+    # الاسم يجب أن يبقى كما هو بعد الحفظ/السرد (لا تشوّهه تنقية اسم الملف)
+    with tempfile.TemporaryDirectory() as d2:
+        st = CalibrationStore(directory=d2)
+        st.save(newp); st.save(oldp)
+        names = st.list_names()
+        check("أسماء ملفات المعايرة تدور كما هي (حفظ→سرد→تحميل)",
+              newp.name in names and oldp.name in names
+              and st.load(newp.name).speeds == newp.speeds, " · ".join(names))
+
+    # تحذير القصّ يصل إلى سجل أحداث الواجهة
+    from pi.nav.mission import MissionSim
+    ms = MissionSim()
+    ms.rover.motors(0.9, 0.9)
+    ms.poll_power_clamp()
+    check("تحذير قصّ القوة يظهر في سجل الأحداث",
+          any(e["kind"] == "power_clamp" for e in ms.events),
+          [e["msg"] for e in ms.events if e["kind"] == "power_clamp"][0][:46])
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)

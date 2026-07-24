@@ -21,6 +21,7 @@ from pathlib import Path
 
 from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
+    DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
@@ -33,7 +34,7 @@ from pi.rover.bridge import WaveRoverBridge
 from pi.rover import battery as batt
 
 BASE_TICK_S = 0.25              # زمن خطوة الخلية عند مضاعف ×1
-DEFAULT_POWER = 75
+DEFAULT_POWER = DRIVE_POWER_DEFAULT   # 0.40 — ضمن الحد الآمن (لا التفاف فيرموير)
 WALL_CORRECTION_RANGE_M = 0.8   # لا يُحاول تصحيح إلا قرب جدار (لإظهار نمو/تصغّر الشك)
 MEASURE_NOISE_M = 0.03          # ضجيج قياس الألترا سونيك الوهمي
 
@@ -44,14 +45,26 @@ IDLE, RUNNING, PAUSED, DONE, RETURNING, ESTOP = (
 
 def default_sim_profile(battery_v: float = 0.0) -> CalibrationProfile:
     """
-    ملف معايرة افتراضي للمحاكاة (موسوم «محاكاة»). يسجّل **جهد البطارية وقت
-    المعايرة** — مؤشر صلاحيتها (أ-5). القيم مبنية على المقاس على العتاد:
-    0.3→0.333 م/ث و0.5→0.600 م/ث (سيراميك، بطارية منخفضة → تُعاد بعد الشحن).
+    ملف المعايرة الافتراضي: **القيم المقاسة ببطارية ممتلئة على السيراميك**
+    (0.2→0.250، 0.4→0.590، 0.5→0.750 م/ث). يسجّل جهد البطارية وقت المعايرة.
     """
     return CalibrationProfile(
-        name="محاكاة", speeds={"30": 0.333, "50": 0.600, "75": 0.45, "100": 0.60},
+        name="سيراميك - بطارية ممتلئة", speeds=dict(MEASURED_SPEEDS),
         turn_rate_dps=70.0, date=time.strftime("%Y-%m-%d %H:%M"),
-        note="قيم افتراضية — محاكاة", battery_v=float(battery_v or 0.0))
+        note="مقاسة على العتاد ببطارية ممتلئة (السرعة ≈ 1.5 × القوة، صالحة 0.1–0.5)",
+        battery_v=float(battery_v or 0.0))
+
+
+def legacy_low_battery_profile() -> CalibrationProfile:
+    """
+    المعايرة القديمة **متقادمة** — أُخذت ببطارية منخفضة (~10.1V) وفارقها ~25%
+    عند نفس القوة. تُحفظ موسومة بجهدها المنخفض ليحذّر منها فارقُ الجهد.
+    """
+    return CalibrationProfile(
+        name="سيراميك - بطارية منخفضة متقادمة",
+        speeds=dict(MEASURED_SPEEDS_LOW_BATT), turn_rate_dps=70.0,
+        date="2026-07-22", note="⚠ متقادمة — قيست ببطارية منخفضة، فارق ~25%",
+        battery_v=LOW_BATT_CALIB_V)
 
 
 def _heading_between(a, b) -> float:
@@ -100,6 +113,7 @@ class MissionSim:
         self._returning = False
         self._batt_level = None
         self._rth_triggered = False
+        self._clamp_seen = 0
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -194,6 +208,12 @@ class MissionSim:
         return {"ok": True}
 
     # ── الخطوة الواحدة ───────────────────────────────────────────
+    def poll_power_clamp(self):
+        """ينقل تحذيرات قصّ القوة من الجسر إلى سجل أحداث الواجهة."""
+        if self.rover.clamp_count > self._clamp_seen:
+            self._clamp_seen = self.rover.clamp_count
+            self._log("power_clamp", self.rover.last_clamp_msg or "قُصّت القوة")
+
     def poll_battery(self):
         """
         يُستدعى دورياً من حلقة السيرفر **مهما كانت حالة المهمة** — الجهد يجب

@@ -23,6 +23,7 @@ bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / 
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import time
@@ -32,7 +33,10 @@ from pi.config import (
     SIM_HOME_LAT, SIM_HOME_LNG,
     ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, GYRO_SCALE, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
+    MAX_MOTOR_POWER,
 )
+
+logger = logging.getLogger(__name__)
 from pi.rover import battery as batt
 
 # استيراد العتاد محميّ — غيابه (ويندوز) لا يكسر شيئاً
@@ -133,6 +137,8 @@ class WaveRoverBridge:
         self.rth_requested = False
         self.battery_alarm = False
         self.last_status = {}
+        self.clamp_count = 0            # مرات قصّ القوة (تُبثّ في سجل الواجهة)
+        self.last_clamp_msg = None
         # محاكاة
         self._sim_v = 12.40
         self._sim_turn_rate = 0.0
@@ -182,19 +188,43 @@ class WaveRoverBridge:
         return None
 
     # ── الحركة (⚠ MOTOR_INVERT) ─────────────────────────────────
-    def _drive(self, l: float, r: float) -> None:
-        # النية (قبل العكس) تمثّل الحركة **الفيزيائية** المطلوبة؛ القيم على
-        # السلك تُضرب في MOTOR_INVERT لأن العتاد معكوس.
+    def motors(self, l: float, r: float) -> dict:
+        """
+        **المسار الوحيد لإرسال أي أمر حركة** (تقدّم/رجوع/لفّ/أوامر الواجهة).
+        يطبّق MOTOR_INVERT ثم **حاجزاً صارماً** عند ±MAX_MOTOR_POWER.
+
+        ⚠ الحاجز إلزامي: فيرموير Wave Rover يلتفّ عددياً فوق 0.5 (يطرح 0.5)،
+        فإرسال 0.8 يُنتج قوة فعّالة 0.3 — زحف صامت يفسد حساب المسافة في
+        deadreckoning بلا أي إنذار. القصّ يحفظ الإشارة ويُسجَّل تحذيراً.
+        """
         li = max(-1.0, min(1.0, float(l)))
         ri = max(-1.0, min(1.0, float(r)))
-        l, r = li * MOTOR_INVERT, ri * MOTOR_INVERT
-        self._cmd_lr = (l, r)
-        self._moving = not (l == 0.0 and r == 0.0)
+        lw, rw = li * MOTOR_INVERT, ri * MOTOR_INVERT      # قيم السلك
+
+        # الحاجز الصارم — **بعد** MOTOR_INVERT، مع الحفاظ على الإشارة
+        lc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, lw))
+        rc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, rw))
+        if lc != lw or rc != rw:
+            self.clamp_count += 1
+            self.last_clamp_msg = (
+                f"⚠ قُصّت القوة إلى ±{MAX_MOTOR_POWER} "
+                f"(طُلب L={lw:.2f} R={rw:.2f} → L={lc:.2f} R={rc:.2f}) — "
+                f"التفاف فيرموير Wave Rover فوق 0.5")
+            logger.warning(self.last_clamp_msg)
+
+        self._cmd_lr = (lc, rc)
+        self._moving = not (lc == 0.0 and rc == 0.0)
         self._last_cmd_ts = time.time()
-        self._send({"T": 1, "L": round(l, 3), "R": round(r, 3)})
+        self._send({"T": 1, "L": round(lc, 3), "R": round(rc, 3)})
         if self.mode == "sim":
-            # معدل الدوران الوهمي من **النية** لا من قيم السلك (وإلا انعكست الإشارة)
-            self._sim_turn_rate = (li - ri) * TURN_RATE_DPS
+            # معدل الدوران من القوة **الفعّالة بعد القصّ**، مُعاداً لإطار النية
+            eff_l, eff_r = lc * MOTOR_INVERT, rc * MOTOR_INVERT
+            self._sim_turn_rate = (eff_l - eff_r) * TURN_RATE_DPS
+        return {"L": lc, "R": rc, "clamped": (lc != lw or rc != rw)}
+
+    # اسم قديم — كل المسارات تمرّ عبر motors()
+    def _drive(self, l: float, r: float) -> None:
+        self.motors(l, r)
 
     def forward(self, power: float = DRIVE_POWER_DEFAULT) -> None:
         self._drive(power, power)
@@ -336,6 +366,8 @@ class WaveRoverBridge:
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
             "battery": batt.classify(self.voltage()),
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
+            "max_motor_power": MAX_MOTOR_POWER,
+            "clamp_count": self.clamp_count, "last_clamp_msg": self.last_clamp_msg,
         }
 
     def close(self) -> None:

@@ -46,16 +46,29 @@ class CalibrationProfile:
     # بالجهد، وفارق > 1V عن لحظة التشغيل يستدعي تحذيراً في الواجهة.
     battery_v: float = 0.0
 
-    def speed_for_power(self, power: int) -> float:
-        """السرعة المعايرة لمستوى قوة — أقرب مستوى مُعاير إن لم يوجد المطابق تماماً."""
+    def speed_for_power(self, power) -> float:
+        """
+        السرعة المعايرة لمستوى قوة، بـ**استيفاء خطي بين النقاط المقاسة**.
+        - يقبل القوة كنسبة مئوية (40) أو كسر (0.4) — يوحّدهما إلى النسبة.
+        - خارج نطاق القياس **لا يستقرئ**، بل يثبّت على أقرب طرف مقاس
+          (الاستقراء خطر: العلاقة خطية داخل 0.1–0.5 فقط).
+        """
         if not self.speeds:
             raise ValueError("لا سرعات في هذا الملف — عايِر أولاً")
-        key = str(int(power))
-        if key in self.speeds:
-            return float(self.speeds[key])
-        # أقرب مستوى مُعاير
-        nearest = min(self.speeds.keys(), key=lambda k: abs(int(k) - power))
-        return float(self.speeds[nearest])
+        p = float(power)
+        if 0.0 < p <= 1.0:                       # كسر (0.4) → نسبة (40)
+            p *= 100.0
+        pts = sorted((float(k), float(v)) for k, v in self.speeds.items())
+        if p <= pts[0][0]:
+            return pts[0][1]                     # تثبيت لا استقراء
+        if p >= pts[-1][0]:
+            return pts[-1][1]                    # تثبيت لا استقراء
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if x0 <= p <= x1:
+                if x1 == x0:
+                    return y0
+                return y0 + (y1 - y0) * (p - x0) / (x1 - x0)
+        return pts[-1][1]
 
     def to_dict(self) -> dict:
         return asdict(self)
