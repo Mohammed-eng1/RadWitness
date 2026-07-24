@@ -254,6 +254,8 @@ async def api_rover_mode(req: Request):
     except Exception:                          # noqa: BLE001
         pass
     mission.rover = WaveRoverBridge(mode=mode)
+    if mission.rover.mode != "real":
+        mission.drive_motors = False   # لا تُبقِ قيادة محركات على جسر sim
     mission._log("rover_mode",
                  f"وضع الروفر: {mission.rover.mode}"
                  + (f" ⚠ {mission.rover.error}" if mission.rover.error else ""))
@@ -305,7 +307,8 @@ def api_sensors_check():
 async def api_drive_mode(req: Request):
     """تبديل بين المسح المنطقي وقيادة المحركات فعلياً (المرحلة 2)."""
     d = await req.json()
-    return mission.set_drive_motors(bool(d.get("motors", False)))
+    return mission.set_drive_motors(bool(d.get("motors", False)),
+                                    allow_sim=bool(d.get("allow_sim", False)))
 
 
 @app.post("/api/sim/battery")
