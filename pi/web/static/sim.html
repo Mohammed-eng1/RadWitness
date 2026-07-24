@@ -154,6 +154,7 @@
       <div class="card">
         <h3>لوحة الحساسات</h3>
         <div class="stat"><span>ألترا سونيك أمامي</span><b id="snUs">—</b></div>
+        <div class="stat"><span>جودة القراءة</span><b id="snQ">—</b></div>
         <div class="stat"><span>IR أمام-يسار</span><b id="snIrL">—</b></div>
         <div class="stat"><span>IR أمام-يمين</span><b id="snIrR">—</b></div>
         <div class="stat"><span>CPM</span><b id="snCpm">—</b></div>
@@ -342,6 +343,10 @@
     $("calibWarn").textContent=d.calib_warning||"";
     if(d.sensors){const s=d.sensors;
       $("snUs").textContent=(s.ultrasonic_cm!==null?s.ultrasonic_cm+" سم":"—");
+      if(s.quality!==undefined&&s.quality!==null){
+        $("snQ").textContent=s.quality+"%";
+        $("snQ").style.color=s.quality>=90?"var(--ok)":(s.quality>=60?"var(--warn)":"var(--bad)");
+      } else $("snQ").textContent="—";
       const irTxt=v=>v===0?"🚧 عائق":"✅ خالٍ";
       $("snIrL").textContent=irTxt(s.ir_left); $("snIrR").textContent=irTxt(s.ir_right);
       $("snCpm").textContent=s.cpm;}
