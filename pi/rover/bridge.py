@@ -230,6 +230,11 @@ class WaveRoverBridge:
                 d = json.loads(line)
             except ValueError:
                 continue                    # سطر غير JSON — تجاهل
+            # ⚠ الفيرموير يرسل أحياناً JSON صالحاً لكنه **ليس كائناً** (رقم
+            # مجرّد مثل 0) → json.loads يعطي int، ومناداة .get عليه تنفجر
+            # بـ'int' object has no attribute 'get' وتُسقط المهمة كلها.
+            if not isinstance(d, dict):
+                continue
             t = d.get("T")
             if t == request_t:
                 continue                    # صدى الأمر — تجاهل
@@ -372,8 +377,9 @@ class WaveRoverBridge:
         """مرحلة لفّ واحدة بتكامل الجايرو، بمهلة أمان خاصة بها."""
         turned = 0.0
         timed_out = False
+        direction = "R" if degrees >= 0 else "L"
         try:
-            self.turn("R" if degrees >= 0 else "L", power)
+            self.turn(direction, power)
             last = start = time.time()
             while abs(turned) < abs(degrees):
                 if time.time() - start > timeout:
@@ -383,8 +389,12 @@ class WaveRoverBridge:
                 now = time.time()
                 dt = now - last
                 last = now
-                gz = float(d.get("gz", 0.0))
+                gz = float(d.get("gz", 0.0)) if isinstance(d, dict) else 0.0
                 turned += (gz - self.gyro_bias) * dt * GYRO_SCALE
+                # ⚠ **جدّد أمر اللفّ** كل دورة: بلا تجديد يمرّ 1.5ث فيعتبره
+                # حارس الـheartbeat انقطاعاً ويوقف المحركات في منتصف اللفّة
+                # (كانت اللفّة تتوقف عند ~24° لهذا السبب).
+                self.turn(direction, power)
                 time.sleep(0.02)
         finally:
             self.stop()                      # ⚠ إيقاف مضمون لكل مرحلة
