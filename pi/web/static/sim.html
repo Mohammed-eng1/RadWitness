@@ -102,6 +102,7 @@
           <button class="btn" id="btnDriveMotors" style="margin-top:0">⚙️ قيادة محركات</button>
         </div>
         <div class="hint" id="driveMsg"></div>
+        <div class="hint" id="driveMode">وضع الجسر: <b id="driveRover">—</b></div>
         <label style="margin-top:10px">مضاعف السرعة</label>
         <div class="speedbtns">
           <button data-mult="1" class="sel">×1</button>
@@ -356,6 +357,10 @@
         (rc.action==="go"?("قوة "+rc.speed):rc.action)+" · "+rc.rung+"</span>";
       $("snReason").textContent=rc.reason||"";}
     if(d.rover){$("rvMode").textContent=d.rover.mode+(d.rover.error?" ⚠":"");
+      const dm=$("driveRover"); dm.textContent=d.rover.mode;
+      dm.style.color=(d.rover.mode==="real")?"var(--ok)":"var(--warn)";
+      if(d.drive_motors&&d.rover.mode!=="real")
+        $("driveMsg").innerHTML="<span style='color:var(--bad)'>⚠ قيادة محركات على جسر sim — لن يتحرك الروبوت!</span>";
       $("rvBias").textContent=d.rover.bias_calibrated?d.rover.gyro_bias:"لم تُعاير";}
     if(d.events) renderEvents(d.events);
     draw();

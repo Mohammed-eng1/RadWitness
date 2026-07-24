@@ -294,14 +294,23 @@ class MissionSim:
     def set_geiger(self, geiger=None):
         self.geiger = geiger
 
-    def set_drive_motors(self, enabled: bool) -> dict:
+    def set_drive_motors(self, enabled: bool, allow_sim: bool = False) -> dict:
         """
         يبدّل بين المسح **المنطقي** (محاكاة على الشبكة) و**تشغيل المحركات**.
         لا يُسمح بتشغيل المحركات بلا ملف معايرة (المسافة تُشتق من السرعة).
+
+        ⚠ ولا يُسمح به والجسر في وضع `sim`: عندها يقود المنفّذ جسراً وهمياً
+        فتتقدّم الخريطة وتُعلن تغطية 100% **بينما لا يتحرك أي محرك** — وهو
+        فشل صامت يوهم بمسح لم يحدث. (`allow_sim=True` للاختبار البرمجي فقط.)
         """
         enabled = bool(enabled)
         if enabled and self.profile is None:
             return {"ok": False, "error": "لا يوجد ملف معايرة — عايِر أولاً"}
+        if enabled and not allow_sim and self.rover.mode != "real":
+            return {"ok": False,
+                    "error": "جسر الروفر في وضع sim — بدّل إلى «وضع real» أولاً، "
+                             "وإلا ستتقدّم الخريطة بلا حركة فعلية للروبوت",
+                    "rover_mode": self.rover.mode}
         if enabled and self.state == RUNNING:
             return {"ok": False, "error": "أوقف المهمة قبل تبديل وضع القيادة"}
         self.drive_motors = enabled
