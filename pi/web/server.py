@@ -66,7 +66,8 @@ async def _sim_loop() -> None:
             if (now - last_bcast) >= 0.2:
                 last_bcast = now
                 mission.poll_battery()     # الجهد يُعرض دائماً لا أثناء المسح فقط
-                mission.poll_power_clamp() # تحذيرات قصّ القوة → سجل الأحداث
+                mission.poll_power_clamp() # أحداث الجسر + heartbeat → السجل
+                mission.poll_reactive()    # بثّ السرعة وسببها (البند 3)
                 if _sim_clients:
                     msg = json.dumps(mission.state_dict(include_full_grid=False))
                     for ws in list(_sim_clients):

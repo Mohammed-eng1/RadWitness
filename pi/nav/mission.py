@@ -29,6 +29,7 @@ from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
 from pi.nav.calibration import CalibrationProfile
 from pi.nav.sim_world import SimWorld
+from pi.nav.reactive import ReactiveSafety
 from pi.ai.risk import classify
 from pi.rover.bridge import WaveRoverBridge
 from pi.rover import battery as batt
@@ -88,6 +89,7 @@ class MissionSim:
         self.profile = None
         # جسر الروفر (محاكاة على ويندوز؛ يُبدَّل إلى real على الراسبري بعلم واحد)
         self.rover = WaveRoverBridge(mode="sim")
+        self.reactive = ReactiveSafety()   # أولوية مطلقة (البند 6 مفعّل)
         self._reset_full()
 
     # ── تهيئة ────────────────────────────────────────────────────
@@ -114,6 +116,8 @@ class MissionSim:
         self._batt_level = None
         self._rth_triggered = False
         self._clamp_seen = 0
+        self._last_rung = None
+        self.last_reactive = None
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -209,10 +213,29 @@ class MissionSim:
 
     # ── الخطوة الواحدة ───────────────────────────────────────────
     def poll_power_clamp(self):
-        """ينقل تحذيرات قصّ القوة من الجسر إلى سجل أحداث الواجهة."""
-        if self.rover.clamp_count > self._clamp_seen:
-            self._clamp_seen = self.rover.clamp_count
-            self._log("power_clamp", self.rover.last_clamp_msg or "قُصّت القوة")
+        """
+        يصرّف أحداث الجسر (قصّ القوة، تجزئة اللفّ، الانحياز) إلى سجل أحداث
+        الواجهة، ويطبّق مهلة heartbeat (فقدان الاتصال > 1.5ث → إيقاف).
+        """
+        for e in self.rover.drain_events():
+            self._log(e["kind"], e["msg"])
+        if self.rover.check_heartbeat():
+            self._log("heartbeat", "⚠ انقطاع أوامر > 1.5ث — أوقفت المحركات")
+
+    def poll_reactive(self):
+        """
+        (البند 3) يبثّ قرار طبقة السلامة: السرعة **وسببها** ودرجة السلّم.
+        يُسجَّل عند تغيّر الدرجة فقط (لا يُغرق السجل).
+        """
+        s = self.sensors()
+        dec = self.reactive.decide(s["ultrasonic_cm"], s["ir_left"], s["ir_right"])
+        self.last_reactive = dec
+        if dec["rung"] != self._last_rung:
+            self._last_rung = dec["rung"]
+            if self.state == RUNNING:
+                self._log("speed",
+                          f"السرعة {dec['speed']} — {dec['reason']} (درجة: {dec['rung']})")
+        return dec
 
     def poll_battery(self):
         """
@@ -445,6 +468,8 @@ class MissionSim:
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
             "battery": batt.classify(self.rover.voltage()),
             "sensors": self.sensors(),
+            "reactive": self.last_reactive,
+            "reactive_enabled": self.reactive.enabled,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),
                       "bias_calibrated": self.rover.bias_calibrated},

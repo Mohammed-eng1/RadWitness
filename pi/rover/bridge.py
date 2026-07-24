@@ -33,10 +33,48 @@ from pi.config import (
     SIM_HOME_LAT, SIM_HOME_LNG,
     ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, GYRO_SCALE, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
-    MAX_MOTOR_POWER,
+    MAX_MOTOR_POWER, GYRO_BIAS_MAX_STD, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ═══ إحصاء متين لانحياز الجايرو (وسيط + استبعاد شواذ) ════════════
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _std(vals, center):
+    if len(vals) < 2:
+        return 0.0
+    return math.sqrt(sum((v - center) ** 2 for v in vals) / len(vals))
+
+
+def robust_bias(samples, max_std: float = GYRO_BIAS_MAX_STD) -> dict:
+    """
+    انحياز الجايرو بـ**الوسيط لا المتوسط**، مع استبعاد الشواذ خارج 3σ ثم
+    إعادة الحساب. السبب المقاس: عينتان شاذتان من 320 رفعتا (max−min) إلى
+    31.69، بينما الوسيط بعد التنقية أعطى انحيازاً 0.011 بانحراف 0.31.
+    تُرفض المعايرة فقط إذا تجاوز الانحراف **بعد التنقية** max_std.
+    """
+    if not samples:
+        return {"ok": False, "bias": 0.0, "std": 0.0, "n": 0,
+                "rejected": 0, "reason": "لا عينات"}
+    med0 = _median(samples)
+    sd0 = _std(samples, med0)
+    kept = [v for v in samples if abs(v - med0) <= 3.0 * sd0] if sd0 > 0 else list(samples)
+    if not kept:
+        kept = list(samples)
+    bias = _median(kept)
+    sd = _std(kept, bias)
+    ok = sd <= max_std
+    return {"ok": ok, "bias": bias, "std": sd, "n": len(kept),
+            "rejected": len(samples) - len(kept), "raw_std": sd0,
+            "reason": None if ok else f"تشتت {sd:.2f} > {max_std}"}
 from pi.rover import battery as batt
 
 # استيراد العتاد محميّ — غيابه (ويندوز) لا يكسر شيئاً
@@ -139,6 +177,8 @@ class WaveRoverBridge:
         self.last_status = {}
         self.clamp_count = 0            # مرات قصّ القوة (تُبثّ في سجل الواجهة)
         self.last_clamp_msg = None
+        self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
+        self.bias_info = {}
         # محاكاة
         self._sim_v = 12.40
         self._sim_turn_rate = 0.0
@@ -154,6 +194,16 @@ class WaveRoverBridge:
                     self.mode = "real"
                 except Exception as e:      # noqa: BLE001
                     self.error = f"تعذّر فتح {port}: {e} — وضع المحاكاة"
+
+    def _event(self, kind: str, msg: str) -> None:
+        """يسجّل حدثاً يُصرَّف إلى سجل أحداث الواجهة (البند 3)."""
+        self.events.append({"kind": kind, "msg": msg})
+        if len(self.events) > 100:
+            self.events = self.events[-100:]
+
+    def drain_events(self) -> list:
+        evs, self.events = self.events, []
+        return evs
 
     # ── الإرسال/الاستقبال ────────────────────────────────────────
     def _send(self, obj: dict) -> None:
@@ -211,6 +261,7 @@ class WaveRoverBridge:
                 f"(طُلب L={lw:.2f} R={rw:.2f} → L={lc:.2f} R={rc:.2f}) — "
                 f"التفاف فيرموير Wave Rover فوق 0.5")
             logger.warning(self.last_clamp_msg)
+            self._event("power_clamp", self.last_clamp_msg)
 
         self._cmd_lr = (lc, rc)
         self._moving = not (lc == 0.0 and rc == 0.0)
@@ -291,8 +342,8 @@ class WaveRoverBridge:
     # ── معايرة انحياز الجايرو (تلقائياً عند بدء كل مهمة) ─────────
     def calibrate_gyro_bias(self, seconds: float = GYRO_BIAS_CALIB_S) -> float:
         """
-        يقيس انحياز gz والروبوت **ساكن**. ⚠ لا يُثبَّت في الكود — يتغيّر
-        بين التجارب، فيُقاس عند بدء كل مهمة (CLAUDE.md).
+        يقيس انحياز gz والروبوت **ساكن**، بالوسيط مع استبعاد الشواذ.
+        ⚠ لا يُثبَّت في الكود — يتغيّر بين التجارب، فيُقاس عند بدء كل مهمة.
         """
         self.stop()
         samples, deadline = [], time.time() + seconds
@@ -301,26 +352,29 @@ class WaveRoverBridge:
             if "gz" in d:
                 samples.append(float(d["gz"]))
             time.sleep(0.05)
-        self.gyro_bias = (sum(samples) / len(samples)) if samples else 0.0
-        self.bias_calibrated = True
+        info = robust_bias(samples)
+        self.bias_info = info
+        if info["ok"]:
+            self.gyro_bias = info["bias"]
+            self.bias_calibrated = True
+            if info["rejected"]:
+                self._event("gyro_bias",
+                            f"انحياز {info['bias']:.3f} (σ={info['std']:.2f})، "
+                            f"استُبعدت {info['rejected']} عينة شاذّة")
+        else:
+            self.bias_calibrated = False
+            self._event("gyro_bias_rejected",
+                        f"⚠ رُفضت معايرة الانحياز — {info['reason']}")
         return self.gyro_bias
 
     # ── الدوران بزاوية عبر تكامل الجايرو (مهلة أمان) ────────────
-    def turn_by_angle(self, degrees: float,
-                      timeout: float = ROVER_TURN_TIMEOUT_S,
-                      power: float = TURN_POWER) -> dict:
-        """
-        heading += (gz - bias) * dt * GYRO_SCALE — حتى بلوغ الزاوية أو المهلة.
-        يوقف المحركات دائماً في `finally` مهما حدث.
-        """
-        if not self.bias_calibrated:
-            self.calibrate_gyro_bias()
+    def _turn_segment(self, degrees: float, timeout: float, power: float) -> dict:
+        """مرحلة لفّ واحدة بتكامل الجايرو، بمهلة أمان خاصة بها."""
         turned = 0.0
         timed_out = False
         try:
             self.turn("R" if degrees >= 0 else "L", power)
-            last = time.time()
-            start = last
+            last = start = time.time()
             while abs(turned) < abs(degrees):
                 if time.time() - start > timeout:
                     timed_out = True
@@ -333,10 +387,48 @@ class WaveRoverBridge:
                 turned += (gz - self.gyro_bias) * dt * GYRO_SCALE
                 time.sleep(0.02)
         finally:
+            self.stop()                      # ⚠ إيقاف مضمون لكل مرحلة
+        return {"turned": turned, "timed_out": timed_out}
+
+    def turn_by_angle(self, degrees: float,
+                      timeout: float = ROVER_TURN_TIMEOUT_S,
+                      power: float = TURN_POWER) -> dict:
+        """
+        heading += (gz - bias) * dt * GYRO_SCALE.
+        ⚠ **اللفّات الطويلة تُجزَّأ** إلى مراحل ≤ MAX_TURN_SEGMENT_DEG مع توقف
+        بينها — لفّة 360° متواصلة تفشل على العتاد (تُنهك البطارية فتتوقف عند
+        ~195°). المهلة (8ث) **لكل مرحلة** لا للفّة كاملة.
+        """
+        if not self.bias_calibrated:
+            self.calibrate_gyro_bias()
+        sign = 1.0 if degrees >= 0 else -1.0
+        remaining = abs(float(degrees))
+        segments = []
+        while remaining > 0:
+            seg = min(MAX_TURN_SEGMENT_DEG, remaining)
+            segments.append(sign * seg)
+            remaining -= seg
+        if len(segments) > 1:
+            self._event("turn_segmented",
+                        f"لفّ {degrees:.0f}° على {len(segments)} مراحل")
+
+        turned_total = 0.0
+        timed_out = False
+        try:
+            for i, seg in enumerate(segments):
+                r = self._turn_segment(seg, timeout, power)
+                turned_total += r["turned"]
+                if r["timed_out"]:
+                    timed_out = True
+                    break
+                if i < len(segments) - 1:
+                    time.sleep(TURN_SEGMENT_PAUSE_S)   # استرداد البطارية والمحركات
+        finally:
             self.stop()                      # ⚠ إيقاف مضمون
-        self.heading = (self.heading + turned) % 360.0
-        return {"requested_deg": degrees, "turned_deg": round(turned, 1),
-                "timed_out": timed_out, "heading": round(self.heading, 1)}
+        self.heading = (self.heading + turned_total) % 360.0
+        return {"requested_deg": degrees, "turned_deg": round(turned_total, 1),
+                "timed_out": timed_out, "heading": round(self.heading, 1),
+                "segments": len(segments)}
 
     # ── السلامة: heartbeat + البطارية ───────────────────────────
     def check_heartbeat(self) -> bool:
