@@ -20,6 +20,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
+
+
+class RoverTestReq(BaseModel):
+    """جسم اختبار العتاد — نموذج صريح ليعمل على كل إصدارات FastAPI."""
+    action: str = "stop"
+    seconds: float = 1.0
+    degrees: float = 90.0
 
 from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
 from pi.platform_detect import banner as platform_banner
@@ -246,13 +254,17 @@ async def api_rover_mode(req: Request):
 
 
 @app.post("/api/rover/test")
-def api_rover_test(payload: dict):
+def api_rover_test(body: RoverTestReq):
     """
     اختبارات حركة **يدوية قصيرة** (بنود القائمة 8-9) — للتحقق من اتجاه
     الحركة ودقة اللفّ على الأرض. كل اختبار قصير ويُنهى بـstop().
     ⚠ يحرّك المحركات فعلياً في وضع real — أبقِ يدك على إيقاف الطوارئ.
+
+    الجسم عبر نموذج Pydantic صريح (لا `dict` — سلوكه يختلف بين إصدارات
+    FastAPI فيصل الوسيط مشوّهاً). و`def` لا `async def` كي تعمل النداءات
+    الحاجبة (sleep/turn) في threadpool بلا تجميد حلقة البثّ.
     """
-    action = str(payload.get("action", "stop"))
+    action = body.action
     rv = mission.rover
     try:
         if action == "stop":
@@ -261,11 +273,11 @@ def api_rover_test(payload: dict):
         if action == "forward":
             rv.forward()                        # DRIVE_POWER_DEFAULT (0.40)
             sent = rv._cmd_lr                   # القيم المُرسلة فعلاً (قبل الإيقاف)
-            time.sleep(float(payload.get("seconds", 1.0)))
+            time.sleep(body.seconds)
             rv.stop()
             return {"ok": True, "action": "forward", "cmd": list(sent)}
         if action == "turn90":
-            res = rv.turn_by_angle(float(payload.get("degrees", 90)))
+            res = rv.turn_by_angle(body.degrees)
             return {"ok": True, "action": "turn90", **res}
         if action == "calibrate_gyro":
             bias = rv.calibrate_gyro_bias()
