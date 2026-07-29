@@ -208,3 +208,7 @@ AVOID_TURN_DEG   = 60.0          # إتمام اللفّ نحو الجهة ال�
 
 # ملفات المعايرة (أرضيات مختلفة): profiles/calibration/*.json
 CALIBRATION_DIR = _os.path.join(_REPO_ROOT, "profiles", "calibration")
+
+# ═══ ثوابت طبقة المصدر (يستعملها الكود الباقي) ═══════════════════
+SOURCE_R_MIN_M         = 0.15
+SOURCE_BG_CPM_DEFAULT  = 18.0
