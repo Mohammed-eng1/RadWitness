@@ -318,6 +318,7 @@ def main() -> int:
         HEADING_SOURCE, BNO055_GYRO_SCALE, HEADING_MAX_CORR, STRAIGHT_BASE_POWER,
         HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, MOTOR_TRIM_L,
         BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S, MISSION_HARD_LIMIT_S,
+        MIN_MOTOR_POWER,
     )
 
     # حسّاسات وهمية تنفّذ عقد IMUReader المستخدَم من مصادر الاتجاه
@@ -451,6 +452,34 @@ def main() -> int:
     check("الوزنية محسوبة في الفراغ المتاح",
           abs(available_headroom(0.35, 0.028, -0.028)
               - (MAX_MOTOR_POWER - 0.35 - 0.028)) < 1e-9)
+    # الفراغ مقيَّد **من طرفين**: أساس منخفض يُنزل محركاً تحت حدّ الزحف
+    check("الفراغ يحترم الحدّ الأدنى للمحرك (لا عجلة واقفة)",
+          abs(available_headroom(0.20, 0.028, -0.028)
+              - (0.20 - 0.028 - MIN_MOTOR_POWER)) < 1e-9,
+          f"عند أساس 0.20 → {available_headroom(0.20, 0.028, -0.028):.3f}")
+
+    # ⚠ **فحص انغلاق الحلقة** — الحارس الذي كان غائباً: كل الفحوص أعلاه
+    # تختبر المتحكّم مفتوح الحلقة (قيمة تصحيح واحدة) فتمرّ حتى لو كانت
+    # الإشارة مقلوبة. الصيغة كانت معكوسة فعلاً وأنتجت تغذية راجعة موجبة:
+    # على العتاد ساء الأداء رتيباً كلما ارتفع KP (1.9 → 34 → 415 سم/م)
+    # ودار الروبوت حول نفسه. نموذج الدفع التفاضلي هنا: معدل اللفّ
+    # (موجب=يميناً) ∝ (يسار − يمين) — مرجعه المؤكَّد على العتاد
+    # `bridge.turn("R") = _drive(+p, −p)` أي اليسار الأسرع يلفّ يميناً.
+    def _closed_loop(kp, start=8.0, steps=120, dt=0.05, gain=140.0):
+        c = HeadingController(kp=kp, kd=0.0)
+        h = start
+        for _ in range(steps):
+            wl = c.wheels(signed_error(h, 0.0), dt, base_power=STRAIGHT_BASE_POWER)
+            h += (wl["left"] - wl["right"]) * gain * dt
+        return h
+
+    conv = {kp: _closed_loop(kp) for kp in (0.008, 0.015, 0.025, 0.035)}
+    check("الحلقة المغلقة **تنغلق** (لا تغذية راجعة موجبة)",
+          all(abs(v) < 8.0 for v in conv.values()),
+          " · ".join(f"KP={k}→{v:+.1f}°" for k, v in conv.items()))
+    check("كسب أعلى ⇒ خطأ متبقٍّ أقل (اتجاه التصحيح سليم)",
+          abs(conv[0.035]) < abs(conv[0.008]),
+          f"{conv[0.035]:+.2f}° مقابل {conv[0.008]:+.2f}°")
     ctl3 = HeadingController(kp=0.02, kd=0.0, max_corr=0.12)
     for e in (5.0, -5.0, 5.0, -5.0):
         ctl3.correction(e, 0.05)
