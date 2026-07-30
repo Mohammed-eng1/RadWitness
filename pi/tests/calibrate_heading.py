@@ -70,12 +70,20 @@ def _pctl(values, p: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
+# ⚠ النص العربي يُطبع بـ`print` **قبل** `input()` ولا يُمرَّر محثّاً له:
+# خلط RTL/LTR داخل محثّ input() يربك readline في حساب موضع المؤشّر فيحقن
+# بايتات في مخزن الدخل → `UnicodeDecodeError: byte 0xd8` يُسقط السكربت **بعد**
+# أن يكون المستخدم قد لفّ الروبوت وقاس بالمنقلة — قياس يدوي يضيع بلا رجعة.
 def _ask_float(prompt: str, interactive: bool = True):
     """يقرأ رقماً من المستخدم؛ Enter فارغ = تخطّي (None)."""
     if not interactive:
         return None
+    print(prompt)
     try:
-        raw = input(prompt).strip().replace("،", ".")
+        raw = input("[رقم] ").strip().replace("،", ".")
+    except UnicodeDecodeError:
+        print("  ⚠ تعذّرت قراءة الإدخال (ترميز) — تُخطّى.")
+        return None
     except (EOFError, KeyboardInterrupt):
         return None
     if not raw:
@@ -88,11 +96,15 @@ def _ask_float(prompt: str, interactive: bool = True):
 
 
 def _pause(msg: str, interactive: bool = True) -> None:
-    if interactive:
-        try:
-            input(msg)
-        except (EOFError, KeyboardInterrupt):
-            raise KeyboardInterrupt
+    if not interactive:
+        return
+    print(msg)
+    try:
+        input("[Enter] ")
+    except UnicodeDecodeError:
+        return                        # إدخال تالف = تابع (لا تُسقط الجلسة)
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
 
 
 def _front_cm(ultrasonic):

@@ -42,14 +42,36 @@ PULSE_POWER = 0.25     # قوة منخفضة (داخل النطاق الآمن،
 HAND_TURN_S = 6.0      # مهلة تدوير اليد
 
 
+# ⚠ النص العربي يُطبع بـ`print` **قبل** `input()` ولا يُمرَّر محثّاً له:
+# خلط RTL/LTR داخل محثّ input() يربك readline في حساب موضع المؤشّر فيحقن
+# بايتات في مخزن الدخل → `UnicodeDecodeError: byte 0xd8` يُسقط الجلسة **بعد**
+# أن يكون المستخدم قد أدّى قياساً يدوياً لا يمكن استرجاعه. ولنفس السبب
+# يُلتقط خطأ الترميز ويُعاد السؤال بدل أن ينهار السكربت.
+def _input(ascii_prompt: str = "> ") -> str:
+    """قراءة سطر بمحثّ ASCII فقط. يرفع KeyboardInterrupt عند EOF/Ctrl-C."""
+    try:
+        return input(ascii_prompt)
+    except UnicodeDecodeError:
+        return "\x00"                 # إشارة «إدخال تالف» — يعالجها المنادي
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+
+
+def _pause(msg: str) -> None:
+    """توقّف حتى Enter — الرسالة العربية بـprint لا داخل input()."""
+    print(msg)
+    _input("[Enter] ")
+
+
 def _ask(prompt: str, options: dict):
-    """يسأل ويقبل أحد المفاتيح؛ يعيد السؤال عند إدخال غير معروف."""
+    """يسأل ويقبل أحد المفاتيح؛ يعيد السؤال عند إدخال غير معروف أو تالف."""
     keys = "/".join(options)
     while True:
-        try:
-            raw = input(f"{prompt} [{keys}]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            raise KeyboardInterrupt
+        print(prompt)
+        raw = _input(f"[{keys}] ").strip().lower()
+        if raw == "\x00":
+            print("  ⚠ تعذّرت قراءة الإدخال (ترميز) — أعد الكتابة.")
+            continue
         if raw in options:
             return options[raw]
         print(f"  ⚠ أدخل أحد: {keys}")
@@ -85,10 +107,7 @@ def stage_gyro_sign(rover) -> dict:
 
     print("  ضع الروبوت على الطاولة. عند البدء **لُفّه بيدك نحو اليمين**")
     print("  (عقارب الساعة منظوراً من فوق) ~90° خلال المهلة.")
-    try:
-        input("  اضغط Enter ثم ابدأ التدوير فوراً… ")
-    except (EOFError, KeyboardInterrupt):
-        raise KeyboardInterrupt
+    _pause("  اضغط Enter ثم ابدأ التدوير فوراً…")
 
     total_raw = 0.0
     peak = 0.0
@@ -131,10 +150,7 @@ def stage_forward(rover, power: float) -> dict:
     """
     print("\n=== ب) اتجاه التقدّم ===")
     print(f"  ⚠ سيتحرك {PULSE_S:.1f}ث بقوة {power}. أخلِ ≥1م أمامه وخلفه.")
-    try:
-        input("  اضغط Enter للنبضة… ")
-    except (EOFError, KeyboardInterrupt):
-        raise KeyboardInterrupt
+    _pause("  اضغط Enter للنبضة…")
 
     _pulse(rover, power, power)       # نيّة: للأمام
 
@@ -161,10 +177,7 @@ def stage_turn(rover, power: float) -> dict:
     """
     print("\n=== ج) اتجاه الدوران ===")
     print(f"  ⚠ سيدور بالمكان {PULSE_S:.1f}ث بقوة {power}. أخلِ مساحة حوله.")
-    try:
-        input("  اضغط Enter للنبضة… ")
-    except (EOFError, KeyboardInterrupt):
-        raise KeyboardInterrupt
+    _pause("  اضغط Enter للنبضة…")
 
     _pulse(rover, power, -power)      # نيّة: يميناً
 
