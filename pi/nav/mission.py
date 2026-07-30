@@ -480,6 +480,18 @@ class MissionSim:
                 covered = fwd.get("covered_m", 0.0)
                 if self.dr and covered:
                     self.dr.advance(covered)
+                # تثبيت الاتجاه: يُبلَّغ عطله **دائماً**، وجودته عند تدهورها
+                # فقط (وإلا أغرق السجل بسطر لكل خلية).
+                hh = fwd.get("heading_hold") or {}
+                if hh.get("lost"):
+                    self._log("heading_hold",
+                              f"⚠ تعذّر تثبيت الاتجاه — {hh['lost']} "
+                              f"(تقدّم بحلقة مفتوحة)")
+                elif hh.get("max_abs_error_deg", 0) > 5.0:
+                    self._log("heading_hold",
+                              f"⚠ خطأ اتجاه {hh['max_abs_error_deg']:.1f}° "
+                              f"(متوسط {hh['mean_abs_error_deg']:.1f}°، "
+                              f"إشباع {hh['saturated_pct']}%)")
                 res = {"ok": fwd["ok"], "turn": t, "forward": fwd,
                        "reason": fwd.get("reason")}
 
