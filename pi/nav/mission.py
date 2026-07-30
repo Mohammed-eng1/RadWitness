@@ -24,6 +24,8 @@ from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
+    BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
+    MISSION_HARD_LIMIT_S,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
@@ -118,6 +120,10 @@ class MissionSim:
         self._returning = False
         self._batt_level = None
         self._rth_triggered = False
+        # الحدّ الزمني (بديل حماية الجهد المعطّلة — القسم 9)
+        self._started_ts = None
+        self._time_warned = False
+        self._time_rth = False
         self._clamp_seen = 0
         self._last_rung = None
         self.last_reactive = None
@@ -185,9 +191,17 @@ class MissionSim:
         self.trail = [self.current]
         self._returning = False
         self.state = RUNNING
+        self._started_ts = time.time()      # ساعة الحدّ الزمني (القسم 9)
+        self._time_warned = False
+        self._time_rth = False
         self._visit(self.current)
         self._log("mission_start",
                   "بدء المسح الذاتي" + (" — قيادة محركات ⚠" if self.drive_motors else " (منطقي)"))
+        if not BATTERY_MONITOR_ENABLED:
+            self._log("time_limit",
+                      f"⚠ مراقبة الجهد معطّلة — الحماية البديلة زمنية: "
+                      f"عودة إجبارية عند {MISSION_TIME_LIMIT_S:.0f}ث، "
+                      f"إيقاف عند {MISSION_HARD_LIMIT_S:.0f}ث. ابدأ ببطارية مشحونة.")
         if self.drive_motors:
             self.executor = DriveExecutor(self.rover, self.reactive,
                                           self.sensors, self.profile)
@@ -269,8 +283,62 @@ class MissionSim:
         """
         return self._check_battery()
 
+    # ── الحدّ الزمني: بديل مؤقت عن حماية الجهد (القسم 9) ──────────
+    def time_limit_info(self) -> dict:
+        """قراءة **بلا أثر جانبي** للبثّ في الواجهة (الإنفاذ في _check_time_limit)."""
+        if BATTERY_MONITOR_ENABLED:
+            return {"enabled": False, "reason": "مراقبة الجهد مفعّلة"}
+        elapsed = 0.0 if self._started_ts is None else time.time() - self._started_ts
+        return {"enabled": True, "running": self.state == RUNNING,
+                "elapsed_s": round(elapsed, 1),
+                "warn_s": MISSION_TIME_WARN_S, "limit_s": MISSION_TIME_LIMIT_S,
+                "hard_s": MISSION_HARD_LIMIT_S,
+                "remaining_s": round(max(0.0, MISSION_HARD_LIMIT_S - elapsed), 1),
+                "rth_triggered": self._time_rth}
+
+    def _check_time_limit(self) -> dict:
+        """
+        مراقبة الجهد معطّلة الآن، فالحماية من استنزاف البطارية **زمنية**:
+            تحذير → عودة إجبارية (RTH) → إيقاف محركات صلب.
+        ⚠ الزمن حاجز خام: لا يعرف حالة الشحن الابتدائية، فابدأ كل مهمة
+          ببطارية مشحونة. يُستبدل بالجهد لحظة عودة قراءته.
+        الساعة تعمل **من بدء المهمة** بزمن الحائط (لا `mission_time_s` الذي
+        يتقدّم بخطوات منطقية ويتجمّد أثناء الإيقاف المؤقت).
+        """
+        if BATTERY_MONITOR_ENABLED or self._started_ts is None:
+            return {"enabled": False}
+        info = self.time_limit_info()
+        elapsed = info["elapsed_s"]
+        if self.state != RUNNING:
+            return info
+        if elapsed >= MISSION_HARD_LIMIT_S:
+            self._log("time_limit",
+                      f"⛔ بلغت المهمة الحدّ الصلب {MISSION_HARD_LIMIT_S:.0f}ث — "
+                      f"إيقاف المحركات فوراً (حماية بديلة عن الجهد)")
+            self.estop()
+            info["action"] = "estop"
+        elif elapsed >= MISSION_TIME_LIMIT_S and not self._time_rth:
+            self._time_rth = True
+            self._log("time_limit",
+                      f"⚠ مضى {elapsed:.0f}ث ≥ {MISSION_TIME_LIMIT_S:.0f}ث — "
+                      f"عودة إجبارية (مراقبة الجهد معطّلة)")
+            self.return_home()
+            info["action"] = "rth"
+        elif elapsed >= MISSION_TIME_WARN_S and not self._time_warned:
+            self._time_warned = True
+            self._log("time_limit",
+                      f"تنبيه: مضى {elapsed:.0f}ث من أصل {MISSION_TIME_LIMIT_S:.0f}ث "
+                      f"قبل العودة الإجبارية")
+            info["action"] = "warn"
+        return info
+
     def _check_battery(self):
         """يطبّق عتبات الجهد الإلزامية (أ-3) على مسار المهمة."""
+        if not BATTERY_MONITOR_ENABLED:
+            # الجهد غير مقروء → الحماية الزمنية هي الفاعلة (لا حماية = مرفوض)
+            self.rover.sim_set_moving(self.state == RUNNING)
+            self._check_time_limit()
+            return self.rover.check_battery()
         self.rover.sim_set_moving(self.state == RUNNING)
         info = self.rover.check_battery()
         if info["action"] == batt.ACTION_STOP:
@@ -399,7 +467,10 @@ class MissionSim:
                     self.dr.turn(turned)
                     self.heading = self.dr.heading
                 if not t["ok"]:
-                    self._log("turn_timeout", f"انتهت مهلة اللفّ نحو {target_heading:.0f}°")
+                    why = ("مهلة اللفّ" if t.get("timed_out")
+                           else f"إجهاض ({t.get('aborted')})")
+                    self._log("turn_failed",
+                              f"فشل اللفّ نحو {target_heading:.0f}° — {why}")
                     continue
 
                 # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
@@ -704,14 +775,19 @@ class MissionSim:
             "speed_mult": self.speed_mult,
             "events": self.events[-40:],
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
-            "battery": batt.classify(self.rover.voltage()),
+            "battery": batt.classify(
+                self.rover.voltage() if BATTERY_MONITOR_ENABLED else None),
+            "time_limit": self.time_limit_info(),     # بديل حماية الجهد (القسم 9)
             "sensors": self.sensors(),
             "reactive": self.last_reactive,
             "reactive_enabled": self.reactive.enabled,
             "drive_motors": self.drive_motors,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),
-                      "bias_calibrated": self.rover.bias_calibrated},
+                      "bias_calibrated": self.rover.bias_calibrated,
+                      # مصدر الاتجاه الفعلي + سلامته (البند 1) — يجب أن يكون
+                      # مرئياً: مصدر ساقط إلى بديل يفسّر أي انحراف لاحق
+                      "heading_source": self.rover.heading_source.state()},
             "calib_warning": batt.calibration_voltage_warning(
                 self.profile.battery_v if self.profile else 0.0, self.rover.voltage()),
         }

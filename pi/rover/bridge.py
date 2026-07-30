@@ -31,50 +31,17 @@ import time
 from pi.config import (
     DRIVE_SPEED_MPS, TURN_RATE_DPS, ROVER_SAFETY_TIMEOUT_S,
     SIM_HOME_LAT, SIM_HOME_LNG,
-    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, GYRO_SCALE, TURN_POWER,
+    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
-    MAX_MOTOR_POWER, GYRO_BIAS_MAX_STD, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
+    MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
+    TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED,
 )
+# مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
+# يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
+from pi.sensors.heading import make_heading_source, robust_bias  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-
-# ═══ إحصاء متين لانحياز الجايرو (وسيط + استبعاد شواذ) ════════════
-def _median(vals):
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
-
-
-def _std(vals, center):
-    if len(vals) < 2:
-        return 0.0
-    return math.sqrt(sum((v - center) ** 2 for v in vals) / len(vals))
-
-
-def robust_bias(samples, max_std: float = GYRO_BIAS_MAX_STD) -> dict:
-    """
-    انحياز الجايرو بـ**الوسيط لا المتوسط**، مع استبعاد الشواذ خارج 3σ ثم
-    إعادة الحساب. السبب المقاس: عينتان شاذتان من 320 رفعتا (max−min) إلى
-    31.69، بينما الوسيط بعد التنقية أعطى انحيازاً 0.011 بانحراف 0.31.
-    تُرفض المعايرة فقط إذا تجاوز الانحراف **بعد التنقية** max_std.
-    """
-    if not samples:
-        return {"ok": False, "bias": 0.0, "std": 0.0, "n": 0,
-                "rejected": 0, "reason": "لا عينات"}
-    med0 = _median(samples)
-    sd0 = _std(samples, med0)
-    kept = [v for v in samples if abs(v - med0) <= 3.0 * sd0] if sd0 > 0 else list(samples)
-    if not kept:
-        kept = list(samples)
-    bias = _median(kept)
-    sd = _std(kept, bias)
-    ok = sd <= max_std
-    return {"ok": ok, "bias": bias, "std": sd, "n": len(kept),
-            "rejected": len(samples) - len(kept), "raw_std": sd0,
-            "reason": None if ok else f"تشتت {sd:.2f} > {max_std}"}
 from pi.rover import battery as batt
 
 # استيراد العتاد محميّ — غيابه (ويندوز) لا يكسر شيئاً
@@ -160,15 +127,13 @@ class WaveRoverBridge:
     إلى `sim` مع تسجيل السبب (لا فشل صامت).
     """
 
-    def __init__(self, mode: str = "sim", port: str = ROVER_PORT, baud: int = ROVER_BAUD):
+    def __init__(self, mode: str = "sim", port: str = ROVER_PORT, baud: int = ROVER_BAUD,
+                 heading_source=None):
         self.requested_mode = mode
         self.mode = "sim"
         self.error = None
         self.port, self.baud = port, baud
         self._ser = None
-        self.gyro_bias = 0.0
-        self.bias_calibrated = False
-        self.heading = 0.0              # درجة — من تكامل الجايرو (لا البوصلة)
         self._last_cmd_ts = 0.0
         self._moving = False
         self._cmd_lr = (0.0, 0.0)
@@ -178,7 +143,6 @@ class WaveRoverBridge:
         self.clamp_count = 0            # مرات قصّ القوة (تُبثّ في سجل الواجهة)
         self.last_clamp_msg = None
         self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
-        self.bias_info = {}
         # محاكاة
         self._sim_v = 12.40
         self._sim_turn_rate = 0.0
@@ -194,6 +158,36 @@ class WaveRoverBridge:
                     self.mode = "real"
                 except Exception as e:      # noqa: BLE001
                     self.error = f"تعذّر فتح {port}: {e} — وضع المحاكاة"
+
+        # ⚠ **بعد** تثبيت self.mode: المصنع يحتاج معرفة الوضع الفعلي ليختار
+        # مصدراً صالحاً (لا BNO055 وهمي في المحاكاة ولا العكس).
+        self.heading_source = heading_source or make_heading_source(bridge=self)
+        if getattr(self.heading_source, "fallback_reason", None):
+            logger.warning(self.heading_source.fallback_reason)
+            self._event("heading_source", self.heading_source.fallback_reason)
+        else:
+            self._event("heading_source", f"مصدر الاتجاه: {self.heading_source.name}")
+
+    # ── الاتجاه والانحياز: مملوكان لمصدر الاتجاه لا للجسر ────────
+    @property
+    def heading(self) -> float:
+        return self.heading_source.heading
+
+    @heading.setter
+    def heading(self, value: float) -> None:
+        self.heading_source.reset(value)
+
+    @property
+    def gyro_bias(self) -> float:
+        return self.heading_source.bias
+
+    @property
+    def bias_calibrated(self) -> bool:
+        return self.heading_source.bias_calibrated
+
+    @property
+    def bias_info(self) -> dict:
+        return self.heading_source.bias_info
 
     def _event(self, kind: str, msg: str) -> None:
         """يسجّل حدثاً يُصرَّف إلى سجل أحداث الواجهة (البند 3)."""
@@ -344,53 +338,65 @@ class WaveRoverBridge:
         """يجعل الاستهلاك الوهمي يعكس كون المهمة جارية."""
         self._moving = bool(moving)
 
-    # ── معايرة انحياز الجايرو (تلقائياً عند بدء كل مهمة) ─────────
+    # ── معايرة انحياز مصدر الاتجاه (تلقائياً عند بدء كل مهمة) ────
     def calibrate_gyro_bias(self, seconds: float = GYRO_BIAS_CALIB_S) -> float:
         """
-        يقيس انحياز gz والروبوت **ساكن**، بالوسيط مع استبعاد الشواذ.
+        يقيس الانحياز والروبوت **ساكن** (وسيط + استبعاد شواذ) — التنفيذ في
+        مصدر الاتجاه، والجسر يوقف المحركات ويسجّل النتيجة فقط.
         ⚠ لا يُثبَّت في الكود — يتغيّر بين التجارب، فيُقاس عند بدء كل مهمة.
         """
         self.stop()
-        samples, deadline = [], time.time() + seconds
-        while time.time() < deadline:
-            d = self.read_imu()
-            if "gz" in d:
-                samples.append(float(d["gz"]))
-            time.sleep(0.05)
-        info = robust_bias(samples)
-        self.bias_info = info
-        if info["ok"]:
-            self.gyro_bias = info["bias"]
-            self.bias_calibrated = True
-            if info["rejected"]:
+        info = self.heading_source.calibrate_bias(seconds)
+        if info.get("ok"):
+            if info.get("rejected"):
                 self._event("gyro_bias",
                             f"انحياز {info['bias']:.3f} (σ={info['std']:.2f})، "
                             f"استُبعدت {info['rejected']} عينة شاذّة")
         else:
-            self.bias_calibrated = False
             self._event("gyro_bias_rejected",
-                        f"⚠ رُفضت معايرة الانحياز — {info['reason']}")
+                        f"⚠ رُفضت معايرة الانحياز ({self.heading_source.name}) — "
+                        f"{info.get('reason')}")
         return self.gyro_bias
 
-    # ── الدوران بزاوية عبر تكامل الجايرو (مهلة أمان) ────────────
+    # ── الدوران بزاوية عبر مصدر الاتجاه (مهلة أمان) ─────────────
     def _turn_segment(self, degrees: float, timeout: float, power: float) -> dict:
-        """مرحلة لفّ واحدة بتكامل الجايرو، بمهلة أمان خاصة بها."""
+        """
+        مرحلة لفّ واحدة، بمهلة أمان خاصة بها. **لا معادلة تكامل هنا** — تُقرأ
+        الزاوية من مصدر الاتجاه (البند 1) فيصير تبديل الحسّاس بلا لمس الجسر.
+
+        حارس الإشارة: لو دار الروبوت **عكس** المطلوب بأكثر من
+        TURN_SIGN_CHECK_DEG فمحور z مقلوب (تثبيت الحسّاس) أو الأسلاك معكوسة —
+        نُجهض بسبب صريح بدل الدوران حتى المهلة (وقد يكون دورانه بلا نهاية).
+        """
         turned = 0.0
         timed_out = False
+        sign_mismatch = False
+        want = 1.0 if degrees >= 0 else -1.0
         direction = "R" if degrees >= 0 else "L"
         try:
+            # ⚠ طور «اللفّ»: يوسّع عتبة القفزة (40–60°/ث دوران طبيعي لا ضجيج)
+            #    ويخفّف التنعيم. بعتبة طور السير كانت كل قراءة تُرفض والزاوية
+            #    المتكاملة تبقى صفراً فيلفّ الروبوت حتى المهلة.
+            self.heading_source.set_phase("turn")
             self.turn(direction, power)
-            last = start = time.time()
+            start = time.time()
+            self.heading_source.update()      # يثبّت مرجع الزمن/الزاوية
             while abs(turned) < abs(degrees):
                 if time.time() - start > timeout:
                     timed_out = True
                     break
-                d = self.read_imu()
-                now = time.time()
-                dt = now - last
-                last = now
-                gz = float(d.get("gz", 0.0)) if isinstance(d, dict) else 0.0
-                turned += (gz - self.gyro_bias) * dt * GYRO_SCALE
+                d = self.heading_source.update()
+                turned += d["delta"]
+                if turned * want < -TURN_SIGN_CHECK_DEG:
+                    sign_mismatch = True
+                    self._event("heading_sign",
+                                f"⚠ دار {turned:.0f}° عكس المطلوب ({degrees:.0f}°) — "
+                                f"إشارة محور z مقلوبة؟ راجع BNO055_GYRO_Z_SIGN")
+                    break
+                if not self.heading_source.ok:
+                    self._event("heading_fault",
+                                f"⚠ مصدر الاتجاه توقّف: {self.heading_source.error}")
+                    break
                 # ⚠ **جدّد أمر اللفّ** كل دورة: بلا تجديد يمرّ 1.5ث فيعتبره
                 # حارس الـheartbeat انقطاعاً ويوقف المحركات في منتصف اللفّة
                 # (كانت اللفّة تتوقف عند ~24° لهذا السبب).
@@ -398,7 +404,10 @@ class WaveRoverBridge:
                 time.sleep(0.02)
         finally:
             self.stop()                      # ⚠ إيقاف مضمون لكل مرحلة
-        return {"turned": turned, "timed_out": timed_out}
+            self.heading_source.set_phase("drive")
+        return {"turned": turned, "timed_out": timed_out,
+                "sign_mismatch": sign_mismatch,
+                "source_ok": self.heading_source.ok}
 
     def turn_by_angle(self, degrees: float,
                       timeout: float = ROVER_TURN_TIMEOUT_S,
@@ -424,6 +433,7 @@ class WaveRoverBridge:
 
         turned_total = 0.0
         timed_out = False
+        aborted = None
         try:
             for i, seg in enumerate(segments):
                 r = self._turn_segment(seg, timeout, power)
@@ -431,13 +441,21 @@ class WaveRoverBridge:
                 if r["timed_out"]:
                     timed_out = True
                     break
+                if r.get("sign_mismatch"):
+                    aborted = "sign_mismatch"
+                    break
+                if not r.get("source_ok", True):
+                    aborted = "heading_source_fault"
+                    break
                 if i < len(segments) - 1:
                     time.sleep(TURN_SEGMENT_PAUSE_S)   # استرداد البطارية والمحركات
         finally:
             self.stop()                      # ⚠ إيقاف مضمون
-        self.heading = (self.heading + turned_total) % 360.0
+        # ⚠ لا نجمع turned_total على self.heading: مصدر الاتجاه حدّثه أصلاً في
+        #    كل update() — الجمع مرة ثانية يضاعف كل لفّة.
         return {"requested_deg": degrees, "turned_deg": round(turned_total, 1),
-                "timed_out": timed_out, "heading": round(self.heading, 1),
+                "timed_out": timed_out, "aborted": aborted,
+                "heading": round(self.heading, 1),
                 "segments": len(segments)}
 
     # ── السلامة: heartbeat + البطارية ───────────────────────────
@@ -449,7 +467,13 @@ class WaveRoverBridge:
         return False
 
     def check_battery(self) -> dict:
-        """يقرأ الجهد ويطبّق عتبات أ-3 الإلزامية."""
+        """
+        يقرأ الجهد ويطبّق عتبات أ-3 الإلزامية.
+        ⚠ مع تعطيل المراقبة (BATTERY_MONITOR_ENABLED=False) لا يُقرأ الجهد ولا
+        يُتَّخذ إجراء — الحماية البديلة **حدّ زمني** على مدة المهمة (mission.py).
+        """
+        if not BATTERY_MONITOR_ENABLED:
+            return batt.classify(None)
         self.read_status()
         info = batt.classify(self.voltage())
         if info["action"] == batt.ACTION_STOP:
@@ -466,10 +490,11 @@ class WaveRoverBridge:
             "gyro_bias": round(self.gyro_bias, 4),
             "bias_calibrated": self.bias_calibrated,
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
-            "battery": batt.classify(self.voltage()),
+            "battery": batt.classify(self.voltage() if BATTERY_MONITOR_ENABLED else None),
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
             "max_motor_power": MAX_MOTOR_POWER,
             "clamp_count": self.clamp_count, "last_clamp_msg": self.last_clamp_msg,
+            "heading_source": self.heading_source.state(),
         }
 
     def close(self) -> None:

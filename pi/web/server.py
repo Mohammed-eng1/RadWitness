@@ -31,7 +31,7 @@ from pi.nav.calibration import CalibrationStore, compute_speed_mps
 # الحساسات الحقيقية (استيرادها آمن على ويندوز — كل مكتبات العتاد محمية داخلها)
 from pi.sensors.geiger import GeigerReader
 from pi.sensors.gps import GPSReader
-from pi.sensors.imu import IMUReader
+from pi.sensors.imu import get_imu
 from pi.sensors.camera import CameraReader
 from pi.sensors.proximity import UltrasonicReader, IRReader
 from pi.rover.bridge import RoverBridge, WaveRoverBridge
@@ -54,7 +54,7 @@ _sim_clients: set[WebSocket] = set()
 # ── الحساسات الحقيقية (M1 — تعمل على الراسبري، خاملة على ويندوز) ──
 geiger = GeigerReader()
 gps = GPSReader()
-imu = IMUReader()
+imu = get_imu()          # ⚠ القارئ **المشترك**: مصدر الاتجاه يستخدم نفس النسخة
 camera = CameraReader()
 rover = RoverBridge(mode="sim")
 # حساسات القرب الحقيقية + مصدر الإشعاع → محرّك المهمة (المرحلة 2)
@@ -106,6 +106,10 @@ def _sensor_telemetry() -> dict:
         "fix": p["fix"], "lat": p["lat"], "lng": p["lng"], "sats": p["sats"], "hdop": p["hdop"],
         "heading": m["heading"], "mag_cal": m["mag_cal"], "sys_cal": m["sys_cal"],
         "gyro_cal": m["gyro_cal"], "accel_cal": m["accel_cal"], "mag_warn": m["mag_warn"],
+        # وضع BNO055 ومعدل الجايرو — الاتجاه صار من هذا الحسّاس (البند 1)
+        "imu_mode": m["mode"], "mag_used": m["mag_used"],
+        "gyro_z_dps": m["gyro_z_dps"], "gyro_ready": m["gyro_ready"],
+        "heading_source": mission.rover.heading_source.state(),
         "rover": r,
         "health": {"geiger": g["ok"], "gps": p["ok"] and p["fix"], "gps_link": p["ok"],
                    "imu": m["ok"], "camera": camera.state()["available"]},
