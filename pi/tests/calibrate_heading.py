@@ -84,7 +84,9 @@ def _ask_float(prompt: str, interactive: bool = True):
         return None
     print(prompt)
     try:
-        raw = input("[رقم] ").strip().replace("،", ".")
+        # ⚠ المحثّ **ASCII حصراً**: «[رقم]» العربية هنا أعادت نفس العلّة
+        # (UnicodeDecodeError يبتلع قياساً يدوياً) — لا عربية في محثّ input.
+        raw = input("[num] ").strip().replace("،", ".")
     except UnicodeDecodeError:
         print("  ⚠ تعذّرت قراءة الإدخال (ترميز) — تُخطّى.")
         return None
