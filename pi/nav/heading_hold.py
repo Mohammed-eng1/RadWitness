@@ -8,8 +8,17 @@ heading_hold.py — متحكم تثبيت الاتجاه (PD) للسير الم�
   - المشي المستقيم في `DriveExecutor` لاحقاً — نفس المتحكم لا نسخة ثانية.
 
     correction = KP·error + KD·d(error)/dt        (مقصوص عند سقف مشتق)
-    left  = base + trim_L − correction
-    right = base + trim_R + correction
+    left  = base + trim_L + correction
+    right = base + trim_R − correction
+
+⚠ **إشارة التصحيح** (صُحّحت 2026-07-30 بعد انفلات مقاس على العتاد): كانت
+   الصيغة معكوسة (`left − corr` و`right + corr`) فصارت الحلقة **تغذية راجعة
+   موجبة**: خطأ موجب = «يجب اللفّ يميناً» فينتج تصحيحاً يجعل اليمين أسرع،
+   والعجلة الأسرع تدفع نحو الجهة الأبطأ ⇒ يلفّ **يساراً** فيكبر الخطأ.
+   المرجع المؤكَّد على العتاد: `bridge.turn("R")` = `_drive(+p, −p)` أي
+   **اليسار أسرع ⇒ لفّ يميناً**، فالتصحيح الموجب يجب أن يزيد اليسار.
+   العرَض المقاس: كلما ارتفع KP ساء الأداء رتيباً (1.9 → 34 → 415 سم/م)،
+   وشوط KP=0.035 دار حول نفسه ~180° وقطع 0.20م فقط في 4ث.
 
 ⚠ سقف التصحيح **يُشتق من حدّ القوة** لا يُختار: لو تجاوز
    `base + |trim| + correction` الحاجز 0.5 لشبع محرك عند الحاجز بينما نزل
@@ -21,7 +30,7 @@ heading_hold.py — متحكم تثبيت الاتجاه (PD) للسير الم�
 from __future__ import annotations
 
 from pi.config import (
-    HEADING_KP, HEADING_KD, HEADING_MAX_CORR, MAX_MOTOR_POWER,
+    HEADING_KP, HEADING_KD, HEADING_MAX_CORR, MAX_MOTOR_POWER, MIN_MOTOR_POWER,
     MOTOR_TRIM_L, MOTOR_TRIM_R, STRAIGHT_BASE_POWER,
 )
 
@@ -34,14 +43,26 @@ def signed_error(current_deg: float, target_deg: float) -> float:
 def available_headroom(base_power: float,
                        trim_l: float = MOTOR_TRIM_L,
                        trim_r: float = MOTOR_TRIM_R,
-                       max_power: float = MAX_MOTOR_POWER) -> float:
+                       max_power: float = MAX_MOTOR_POWER,
+                       min_power: float = MIN_MOTOR_POWER) -> float:
     """
-    أقصى تصحيح يمكن تطبيقه **متماثلاً** عند قوة أساس معطاة:
-        headroom = MAX_MOTOR_POWER − base − max(|trim_L|, |trim_R|)
-    (لا يقلّ عن صفر — عند أساس ملامس للحاجز لا يبقى فراغ للتصحيح.)
+    أقصى تصحيح يمكن تطبيقه **متماثلاً** عند قوة أساس معطاة. القيد **من طرفين**
+    لأن التصحيح يرفع محركاً ويخفض الآخر بنفس المقدار:
+
+        سقف علوي = MAX_MOTOR_POWER − base − |trim|   (لا يتجاوز حاجز 0.5)
+        سقف سفلي = base − |trim| − MIN_MOTOR_POWER   (لا ينزل محرك تحت 0.1)
+        headroom = min(الاثنين)
+
+    ⚠ الطرف السفلي كان **مفقوداً** (صُحّح 2026-07-30): بأساس 0.30 وسقف 0.17
+       ينزل أحد المحركين إلى 0.102 — عند حافة المدى الموثّق (0.1–0.5) أو
+       تحته، فيزحف أو يقف بينما الآخر عند 0.498 ⇒ **دوران بالمكان لا سير
+       مصحَّح**. (لا يقلّ عن صفر: أساس ملامس لأحد الحدّين لا يترك فراغاً.)
     """
-    return max(0.0, float(max_power) - float(base_power)
-               - max(abs(float(trim_l)), abs(float(trim_r))))
+    upper = float(max_power) - float(base_power) \
+        - max(abs(float(trim_l)), abs(float(trim_r)))
+    lower = float(base_power) - max(abs(float(trim_l)), abs(float(trim_r))) \
+        - float(min_power)
+    return max(0.0, min(upper, lower))
 
 
 class HeadingController:
@@ -108,8 +129,11 @@ class HeadingController:
         if head < self.max_corr:
             self.headroom_clipped += 1
         corr = self.correction(error_deg, dt, limit=head)
-        left = base_power + self.trim_l - corr
-        right = base_power + self.trim_r + corr
+        # ⚠ التصحيح الموجب (خطأ موجب = يجب اللفّ يميناً) يزيد **اليسار**:
+        # العجلة الأسرع تدفع نحو الجهة الأبطأ. عكسُها يقلب الحلقة إلى تغذية
+        # راجعة موجبة (انظر رأس الملف) — يحرسها فحص الانغلاق في selftest.
+        left = base_power + self.trim_l + corr
+        right = base_power + self.trim_r - corr
         return {"left": round(left, 4), "right": round(right, 4),
                 "correction": round(corr, 4), "headroom": round(head, 4)}
 
