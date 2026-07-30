@@ -58,7 +58,10 @@ class DriveExecutor:
         if abs(delta) < 2.0:
             return {"ok": True, "turned_deg": 0.0, "skipped": True}
         res = self.rover.turn_by_angle(delta, timeout=ROVER_TURN_TIMEOUT_S)
-        return {"ok": not res["timed_out"], "turned_deg": res["turned_deg"],
+        # `aborted` يعني عطلاً في مصدر الاتجاه أو إشارة محور مقلوبة — فشل
+        # صريح لا يجوز اعتباره لفّة ناجحة (وإلا تقدّم الروبوت باتجاه خاطئ).
+        return {"ok": not res["timed_out"] and not res.get("aborted"),
+                "turned_deg": res["turned_deg"], "aborted": res.get("aborted"),
                 "segments": res.get("segments", 1), "timed_out": res["timed_out"]}
 
     # ── التقدّم خلية واحدة تحت إشراف السلامة ─────────────────────

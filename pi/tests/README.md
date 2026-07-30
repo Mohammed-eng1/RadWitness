@@ -19,12 +19,16 @@ source venv/bin/activate
 | `test_lora.py` | حيّة وصلة HC-14 + RTT | `python3 pi/tests/test_lora.py` | USB-Serial /dev/ttyUSB0 |
 | `test_ultrasonic.py` | مسافة HC-SR04 (اختبار مكتبي) | `python3 pi/tests/test_ultrasonic.py` | TRIG=GPIO23، ECHO=GPIO24 ⚠ **مقسّم جهد** |
 | `test_ir.py` | حساس عائق IR (اختبار مكتبي) | `python3 pi/tests/test_ir.py` | OUT=GPIO25 ⚠ **تغذية 3.3V** |
+| `calibrate_heading.py` | **معايرة الاتجاه** (انحياز/معامل/KP) — يحرّك المحركات في المرحلتين 2 و3 | `python3 -m pi.tests.calibrate_heading` | BNO055 I2C **0x29** + الروفر على `/dev/serial0` |
 
 ملاحظات:
 - **الجيجر** يستخدم `lgpio` (بلا daemon — بديل pigpio المحذوف من Debian trixie).
   إن ظهر خطأ صلاحيات، تأكد أن مستخدمك ضمن مجموعة `gpio`: `groups | grep gpio`.
 - **GPS** قد يستغرق دقائق للقفل الأول في العراء.
-- **BNO055**: افحص الوجود أولاً `i2cdetect -y 1`، ولوّح على شكل ∞ حتى `mag ≥ 2`.
+- **BNO055**: افحص الوجود أولاً `i2cdetect -y 1` (يجب أن يظهر **29**). صار **مصدر
+  الاتجاه الأساسي** بعد موت جايرو الروفر، ويعمل في وضع **IMUPLUS بلا مغنيتومتر**
+  → لا حاجة للتلويح على شكل ∞، و`mag_cal = 0` **متوقَّع** (المهم `gyro_cal ≥ 2`).
+  إجراء المعايرة الكامل في [`docs/PATCH_HEADING_SOURCE.md`](../../docs/PATCH_HEADING_SOURCE.md).
 - **الكاميرا** تحفظ اللقطة في `captures/`.
 - ثوابت معايرة الجيجر (K=111، τ=200µs) مثبتة مخبرياً ضد Cs-137 — لا تُغيَّر.
 

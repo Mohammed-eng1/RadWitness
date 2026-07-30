@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 
 from pi.config import REACTIVE_SAFETY_ENABLED, REACTIVE_LOOP_S, SPEED_NO_READING
 from pi.nav.reactive import speed_for_distance, median, JumpFilter
@@ -303,6 +304,182 @@ def main() -> int:
     check("لفّة 90° تبقى مرحلة واحدة (لا تجزئة)", r90["segments"] == 1)
     check("المهلة لكل مرحلة لا للفّة كاملة",
           br2.turn_by_angle(100000, timeout=1.0)["timed_out"] and not br2._moving)
+
+    # ═══ (ي) مصدر الاتجاه خلف واجهة واحدة + تثبيت الاتجاه ══════════
+    print("\nي) مصدر الاتجاه (البند 1) وتثبيته:")
+    from pi.sensors.heading import (
+        RateConditioner, HeadingSource, BNO055GyroHeading, BNO055FusionHeading,
+        make_heading_source, PHASES,
+    )
+    from pi.nav.heading_hold import (
+        HeadingController, signed_error, available_headroom, config_sanity,
+    )
+    from pi.config import (
+        HEADING_SOURCE, BNO055_GYRO_SCALE, HEADING_MAX_CORR, STRAIGHT_BASE_POWER,
+        HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, MOTOR_TRIM_L,
+        BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S, MISSION_HARD_LIMIT_S,
+    )
+
+    # حسّاسات وهمية تنفّذ عقد IMUReader المستخدَم من مصادر الاتجاه
+    class FakeIMU:
+        def __init__(self, rate=0.0, yaw=0.0, ok=True, mag_used=False):
+            self.ok, self.error, self._r, self._yaw = ok, None, rate, yaw
+            self._mag = mag_used
+        def gyro_z_dps(self):  return self._r
+        def euler_yaw(self):   return self._yaw
+        def state(self):       return {"ok": self.ok, "mag_used": self._mag}
+
+    # تنقية المعدل: ترتيب المراحل (انحياز → قفزة → تنعيم → عتبة)
+    c = RateConditioner(spike_dps=12.0, alpha=1.0, deadband_dps=1.5)
+    check("طرح الانحياز قبل كل شيء", c.feed(10.5, bias=0.5) == 10.0)
+    c.reset()
+    before = c.spikes
+    check("القفزة تُرفض ولا تُحقَن في التكامل",
+          c.feed(80.0, bias=0.0) == 0.0 and c.spikes == before + 1)
+    c.reset()
+    check("عتبة السكون تصفّر الضجيج الصغير", c.feed(1.2, bias=0.0) == 0.0)
+    check("قيمة فوق العتبة تمرّ", c.feed(5.0, bias=0.0) == 5.0)
+    c2 = RateConditioner(spike_dps=12.0, alpha=0.5, deadband_dps=0.0)
+    check("مرشّح التمرير المنخفض ينعّم لا يمرّر خاماً",
+          abs(c2.feed(10.0, 0.0) - 5.0) < 1e-9, f"{c2.feed(10.0, 0.0):.2f} بعد قراءتين")
+    check("عتبة طور اللفّ أوسع من طور السير (40–60°/ث دوران طبيعي)",
+          PHASES["turn"][0] > 60.0 > PHASES["drive"][0]
+          and HEADING_SPIKE_DPS_TURN > HEADING_SPIKE_DPS_DRIVE)
+
+    # BNO055 (جايرو): تكامل بمعامل الحسّاس + إشارة المحور
+    hs = BNO055GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=+1)
+    hs.update(); time.sleep(0.05); d1 = hs.update()
+    check("BNO055_gyro يكامل (gz−bias)·dt·scale",
+          d1["delta"] > 0 and hs.heading > 0, f"heading={hs.heading:.2f}°")
+    hs_neg = BNO055GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=-1)
+    hs_neg.update(); time.sleep(0.05); hs_neg.update()
+    check("إشارة محور z تقلب اتجاه التكامل (تثبيت الحسّاس)",
+          hs_neg.total_deg < 0, f"{hs_neg.total_deg:.2f}°")
+    # ⚠ الطور حاسم: 50°/ث دوران طبيعي في اللفّ وضجيج في السير المستقيم
+    hs_t = BNO055GyroHeading(FakeIMU(rate=50.0), scale=1.0)
+    hs_t.update(); time.sleep(0.05); hs_t.update()
+    check("50°/ث في طور السير = قفزة مرفوضة (لا تكامل)",
+          hs_t.total_deg == 0.0 and hs_t.cond.spikes > 0)
+    hs_t.set_phase("turn")
+    hs_t.update(); time.sleep(0.05); hs_t.update()
+    check("نفس القراءة في طور اللفّ تُقبل وتُكامل",
+          hs_t.total_deg > 0, f"{hs_t.total_deg:.2f}°")
+    check("BNO055 مفقود → المصدر يعلن الخلل لا يتظاهر بالسلامة",
+          not BNO055GyroHeading(FakeIMU(ok=False)).ok)
+
+    # حسّاس ميت يعطي صفراً مضبوطاً — هذا ما أوهم بأن جايرو الروفر سليم
+    dead = BNO055GyroHeading(FakeIMU(rate=0.0), scale=1.0)
+    for _ in range(45):
+        dead.update()
+    check("قراءة صفر مضبوط متتابعة تُكشف كحسّاس ميت",
+          not dead.ok and "ميت" in (dead.error or ""), dead.error)
+
+    # القراءة الفاشلة (None) لا تُكامل ولا تُسكت
+    class NoneIMU(FakeIMU):
+        def gyro_z_dps(self): return None
+    stale = BNO055GyroHeading(NoneIMU())
+    for _ in range(6):
+        stale.update()
+    check("قراءات فاشلة متتابعة → ok=False بسبب مقروء",
+          not stale.ok and stale.total_deg == 0.0, stale.error)
+
+    # الدمج الداخلي: فرق زاوية ملفوف (359°→1° = +2° لا −358°)
+    fus_imu = FakeIMU(yaw=359.0)
+    fus = BNO055FusionHeading(fus_imu)
+    fus.update()
+    fus_imu._yaw = 1.0
+    dfus = fus.update()
+    check("مصدر الزاوية المطلقة يلفّ الفرق حول 360",
+          abs(dfus["delta"] - 2.0) < 1e-6, f"delta={dfus['delta']}")
+    check("مصدر مطلق لا يحتاج انحياز (لكن يعلن ذلك)",
+          BNO055FusionHeading(FakeIMU()).calibrate_bias(0)["ok"]
+          and not BNO055FusionHeading(FakeIMU()).needs_bias)
+    check("BNO055 في وضع NDOF (مغنيتومتر) → yaw مرفوض (قاعدة §1)",
+          not BNO055FusionHeading(FakeIMU(mag_used=True)).ok)
+
+    # المصنع: تبديل معلن السبب لا سقوط صامت
+    fb = make_heading_source(bridge=br2, imu=FakeIMU(ok=False))
+    check("مصدر غير متاح → بديل + سبب معلن",
+          fb.ok and fb.fallback_reason and "البديل" in fb.fallback_reason,
+          fb.fallback_reason)
+    check("مصدر مجهول الاسم يُرفض بوضوح",
+          "غير معروف" in (make_heading_source(bridge=br2,
+                                              source="مجهول").fallback_reason or ""))
+    check("الجسر لا يحتوي معادلة تكامل — الاتجاه من المصدر",
+          br2.heading == br2.heading_source.heading
+          and br2.gyro_bias == br2.heading_source.bias)
+
+    # حارس الإشارة المقلوبة: يُجهض بدل الدوران حتى المهلة
+    class FlippedBridge(WaveRoverBridge):
+        """جسر محاكاة بإشارة gz مقلوبة (كما لو ثُبّت الحسّاس معكوساً)."""
+        def read_imu(self):
+            d = super().read_imu()
+            d["gz"] = -d["gz"]
+            return d
+
+    fbr = FlippedBridge(mode="sim")
+    fbr.calibrate_gyro_bias(seconds=0.3)
+    rflip = fbr.turn_by_angle(90, timeout=5.0)
+    check("دوران عكس المطلوب → إجهاض sign_mismatch (لا انتظار المهلة)",
+          rflip["aborted"] == "sign_mismatch" and not rflip["timed_out"],
+          f"دار {rflip['turned_deg']}°")
+    check("الإجهاض يُسجَّل حدثاً للواجهة",
+          any(e["kind"] == "heading_sign" for e in fbr.events))
+
+    # متحكم تثبيت الاتجاه (PD)
+    check("خطأ الاتجاه ملفوف بإشارة", signed_error(350.0, 10.0) == 20.0
+          and signed_error(10.0, 350.0) == -20.0)
+    ctl = HeadingController(kp=0.01, kd=0.0, max_corr=0.12)
+    check("تصحيح متناسب بالإشارة الصحيحة",
+          abs(ctl.correction(10.0, 0.1) - 0.10) < 1e-9
+          and ctl.correction(-10.0, 0.1) < 0)
+    ctl.reset()
+    check("التصحيح مقصوص عند السقف ويُعدّ الإشباع",
+          ctl.correction(500.0, 0.1) == 0.12 and ctl.summary()["saturated"] == 1)
+    ctl2 = HeadingController(kp=0.5, kd=0.0, max_corr=0.4)
+    w = ctl2.wheels(90.0, 0.1, base_power=0.35)
+    check("قوّتا المحركين ≤ حدّ القوة دائماً (قصّ على الفراغ المتاح)",
+          max(abs(w["left"]), abs(w["right"])) <= MAX_MOTOR_POWER + 1e-9
+          and w["correction"] <= w["headroom"] + 1e-9,
+          f"L={w['left']} R={w['right']} سقف={w['headroom']}")
+    check("سقف التصحيح في config يتّسع داخل حدّ القوة",
+          config_sanity()["ok"], config_sanity().get("reason") or
+          f"الفراغ {config_sanity()['headroom']} ≥ السقف {HEADING_MAX_CORR}")
+    check("الوزنية محسوبة في الفراغ المتاح",
+          abs(available_headroom(0.35, 0.028, -0.028)
+              - (MAX_MOTOR_POWER - 0.35 - 0.028)) < 1e-9)
+    ctl3 = HeadingController(kp=0.02, kd=0.0, max_corr=0.12)
+    for e in (5.0, -5.0, 5.0, -5.0):
+        ctl3.correction(e, 0.05)
+    check("تذبذب الإشارة يُقاس (مؤشر KP مرتفع)",
+          ctl3.summary()["sign_changes"] == 3, str(ctl3.summary()["sign_changes"]))
+    check("المعاملات موسومة «غير معايرة» حتى يقيسها سكربت العتاد",
+          BNO055_GYRO_SCALE == 1.0 and HEADING_SOURCE == "bno055_gyro")
+
+    # ═══ (ك) الحدّ الزمني بديلاً عن حماية الجهد المعطّلة (القسم 9) ══
+    print("\nك) الحدّ الزمني (مراقبة الجهد معطّلة):")
+    check("المراقبة معطّلة والحدود مرتّبة تحذير<عودة<إيقاف",
+          not BATTERY_MONITOR_ENABLED
+          and MISSION_TIME_LIMIT_S < MISSION_HARD_LIMIT_S,
+          f"RTH={MISSION_TIME_LIMIT_S:.0f}ث · إيقاف={MISSION_HARD_LIMIT_S:.0f}ث")
+    ms2 = MissionSim()
+    ms2.configure_room(2.0, 2.0)
+    ms2.set_calibration(default_sim_profile())
+    ms2.start()
+    check("ساعة الحدّ الزمني تبدأ ببدء المهمة",
+          ms2.time_limit_info()["enabled"] and ms2._started_ts is not None)
+    ms2._started_ts = time.time() - (MISSION_TIME_LIMIT_S + 1)
+    ms2._check_time_limit()
+    check("بلوغ حدّ العودة → عودة إجبارية مسجّلة",
+          ms2._returning and ms2._time_rth
+          and any(e["kind"] == "time_limit" for e in ms2.events))
+    ms2._started_ts = time.time() - (MISSION_HARD_LIMIT_S + 1)
+    ms2._check_time_limit()
+    check("بلوغ الحدّ الصلب → إيقاف طوارئ وتوقف المحركات",
+          ms2.state == "estop" and not ms2.rover._moving)
+    check("الجهد غير مقروء → لا يُعرض تصنيف كاذب",
+          ms2.rover.check_battery()["level"] == "unknown"
+          and ms2.state_dict()["battery"]["level"] == "unknown")
 
     # الخلاصة
     passed = sum(_results)
