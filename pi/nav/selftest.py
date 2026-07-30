@@ -356,7 +356,10 @@ def main() -> int:
     check("إشارة محور z تقلب اتجاه التكامل (تثبيت الحسّاس)",
           hs_neg.total_deg < 0, f"{hs_neg.total_deg:.2f}°")
     # ⚠ الطور حاسم: 50°/ث دوران طبيعي في اللفّ وضجيج في السير المستقيم
-    hs_t = BNO055GyroHeading(FakeIMU(rate=50.0), scale=1.0)
+    # ⚠ الإشارة **مثبّتة صراحةً** هنا: الفحص يخصّ عتبة الطور لا إشارة المحور،
+    # وتركه على افتراضي config يربطه بثابت عتادي (انقلب إلى −1 بعد قياس
+    # 2026-07-30) فيسقط الفحص لسبب لا علاقة له بما يقيسه.
+    hs_t = BNO055GyroHeading(FakeIMU(rate=50.0), scale=1.0, sign=+1)
     hs_t.update(); time.sleep(0.05); hs_t.update()
     check("50°/ث في طور السير = قفزة مرفوضة (لا تكامل)",
           hs_t.total_deg == 0.0 and hs_t.cond.spikes > 0)
