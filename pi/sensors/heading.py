@@ -81,6 +81,15 @@ def robust_bias(samples, max_std: float = GYRO_BIAS_MAX_STD) -> dict:
     if not samples:
         return {"ok": False, "bias": 0.0, "std": 0.0, "n": 0,
                 "rejected": 0, "reason": "لا عينات"}
+    # ⚠ حارس الحسّاس الميت: صفر **مضبوط** في كل العينات ليس «سكوناً مثالياً»
+    # بل حسّاس لا يرسل. بدونه ينجح الميت بأفضل درجة ممكنة (σ=0 ≤ أي حدّ)
+    # ويمرّ إلى مرحلة تحرّك المحركات — وهو ما حدث فعلاً مع جايرو الروفر
+    # الميت: انحياز 0.0000 وσ 0.0000 في 152 عينة قُبلت كمعايرة سليمة.
+    if all(float(v) == 0.0 for v in samples):
+        return {"ok": False, "bias": 0.0, "std": 0.0, "n": len(samples),
+                "rejected": 0, "raw_std": 0.0,
+                "reason": f"كل العينات ({len(samples)}) صفر مضبوط — "
+                          f"الحسّاس لا يرسل شيئاً (ميت أو ناقل خاطئ؟)"}
     med0 = _median(samples)
     sd0 = _std(samples, med0)
     kept = [v for v in samples if abs(v - med0) <= 3.0 * sd0] if sd0 > 0 else list(samples)

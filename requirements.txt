@@ -13,5 +13,9 @@ pynmea2
 # يُثبَّت عبر apt (python3-lgpio) في setup_pi.sh ويظهر للبيئة بـ--system-site-packages؛
 # مُدرَج هنا أيضاً كي يعمل pip على أنظمة أخرى (يبني wheel عند غياب حزمة النظام).
 lgpio
+# smbus2: السائق **الافتراضي** لـBNO055 — يقبل رقم الناقل صراحةً، والحسّاس
+# على i2c-4 لا i2c-1 (مثبت بـi2cdetect). مكتبة Adafruit أدناه مقيَّدة بالناقل 1
+# عبر board.SCL/SDA فلا تراه — تبقى احتياطياً لو نُقل الحسّاس إلى الناقل 1.
+smbus2
 adafruit-circuitpython-bno055
 numpy

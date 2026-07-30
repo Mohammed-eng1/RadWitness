@@ -49,6 +49,7 @@ from pi.config import (
     STRAIGHT_BASE_POWER, MOTOR_TRIM_L, MOTOR_TRIM_R, MAX_MOTOR_POWER,
     HEADING_HOLD_LOOP_S, BNO055_READ_PERIOD_S, GYRO_BIAS_CALIB_S,
     STOP_CM, BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S,
+    BNO055_ADDR, BNO055_I2C_BUS,
 )
 from pi.nav.heading_hold import HeadingController, signed_error, available_headroom, config_sanity
 from pi.rover.bridge import WaveRoverBridge
@@ -145,6 +146,24 @@ def stage1_bias(rover, seconds: float, interactive: bool = True) -> dict:
                 "samples": len(raw)}
 
     hz = len(samples) / elapsed if elapsed > 0 else 0.0
+
+    # ⚠ حارس الحسّاس الميت — **قبل** أي اقتراح معامل. هذه المرحلة تقرأ
+    # `_read_rate_dps()` مباشرة فتتجاوز حارس الصفر المضبوط في `update()`،
+    # وσ=0 يبدو «معايرة مثالية». النتيجة المشاهَدة: جايرو ميت أعطى انحياز
+    # 0.0000 وσ 0.0000 فأُعلن «سليم»، ثم تحرّكت المحركات في المرحلة 2 حتى
+    # أطلق حارس update() الإجهاض بعد ~1.3ث (وقد دار الروبوت ~95° عمياناً).
+    if all(v == 0.0 for v in raw):
+        print(f"\n  ⛔ كل العينات ({len(raw)}) **صفر مضبوط** — الحسّاس لا يرسل.")
+        print(f"     المصدر الفعلي «{src.name}» بينما المطلوب {HEADING_SOURCE}.")
+        if src.name == "rover_gyro":
+            print("     جايرو الروفر الداخلي **ميت** (CLAUDE.md §1) — سقط "
+                  "إليه المصنع لتعذّر BNO055.")
+        print(f"     افحص: i2cdetect -y {BNO055_I2C_BUS}  "
+              f"(يجب أن يظهر {hex(BNO055_ADDR)[2:]})")
+        print("     ⚠ لا تلصق أي رقم من هذا التشغيل في config — كله باطل.")
+        return {"ok": False, "reason": "كل العينات صفر مضبوط — حسّاس ميت",
+                "source": src.name, "samples": len(raw), "rate_hz": round(hz, 1),
+                "dead_sensor": True}
     info = robust_bias(raw, max_std=src.max_bias_std)
     resid = [v - info["bias"] for v in raw]
     sigma = statistics.pstdev(resid) if len(resid) > 1 else 0.0
@@ -433,7 +452,13 @@ def _print_config_lines(payload: dict) -> None:
     s2 = payload.get("stage2") or {}
     s3 = payload.get("stage3") or {}
     src = payload.get("source", "")
-    if s1.get("suggested_deadband_dps") is not None:
+    # ⚠ لا يُقترح رقم من مرحلة فاشلة: قيمة مقيسة بحسّاس ميت تبدو ممتازة
+    # (σ=0 → عتبة 0.05) وهي باطلة تماماً — طباعتها تغري بلصقها في config.
+    if not (s1.get("ok") or s2.get("ok") or s3.get("ok")):
+        print("  (لا اقتراح — لم تنجح أي مرحلة. صحّح الحسّاس أولاً ثم أعد.)")
+        print("═" * 62)
+        return
+    if s1.get("ok") and s1.get("suggested_deadband_dps") is not None:
         print(f"  HEADING_DEADBAND_DPS = {s1['suggested_deadband_dps']}   "
               f"# 3σ مقاس ({s1['sigma_dps']}) على {src}")
     if s2.get("suggested_scale"):
