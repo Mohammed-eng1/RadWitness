@@ -58,6 +58,10 @@ from pi.sensors.heading import robust_bias
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 RESULTS_DIR = os.path.join(_REPO_ROOT, "docs", "results")
 
+# فوق هذه النسبة من الدورات يكون التصحيح ملتصقاً بالسقف، فالشوط يقيس السقف
+# لا الكسب ولا يصلح للترشيح (انظر التعليق في stage3_gains).
+SATURATION_LIMIT_PCT = 50.0
+
 
 # ═══ أدوات ═══════════════════════════════════════════════════════
 def _pctl(values, p: float) -> float:
@@ -412,13 +416,49 @@ def stage3_gains(rover, kps, kd: float, duration: float, base: float,
         print("\n  ⚠ كل الأشواط أُجهضت — لا اقتراح كسب.")
         return out
 
-    # الترتيب: خطأ متوسط منخفض **بلا** تذبذب. التذبذب يُعاقَب لأن كسباً عالياً
-    # قد يعطي متوسطاً جيداً وهو يتأرجح يميناً/يساراً (يُبلي المحركات ويزيد
-    # انزلاق العجلات فيفسد حساب المسافة في deadreckoning).
+    # ⚠ **الإشباع يُبطل الشوط كقياس لـKP** (درس مقاس 2026-07-30): فوق
+    #    SATURATION_LIMIT_PCT يكون التصحيح ملتصقاً بالسقف فلا يقيس الشوط الكسب
+    #    بل يقيس السقف — KP=0.035 وKP=0.10 يعطيان السلوك نفسه. والأسوأ أن
+    #    الالتصاق **يُصفّر sign_changes** (الإشارة لا تتبدّل وهي عند الحدّ)
+    #    فيبدو الشوط «بلا تذبذب» وهو تحكّم قافز. الصيغة القديمة كافأت ذلك
+    #    فرشّحت شوطاً بإشباع 72.7% على شوط انحرافه الأرضي أقل بأربعة أضعاف.
     for r in valid:
         osc = r["sign_changes"] / max(1e-6, r["duration_s"])      # تبديل/ث
         r["score"] = round(r["mean_abs_error_deg"] + 2.0 * osc, 3)
-    best = min(valid, key=lambda r: r["score"])
+        r["saturated_out"] = r["saturated_pct"] > SATURATION_LIMIT_PCT
+        # الانحراف الجانبي لكل متر — تطبيع ضروري: شوط انحرف 33سم في 1.6م
+        # أسوأ من شوط انحرف 33سم في 3م.
+        d = r.get("distance_m")
+        r["dev_per_m"] = (round(r["lateral_dev_cm"] / d, 1)
+                          if r.get("lateral_dev_cm") is not None and d else None)
+
+    linear = [r for r in valid if not r["saturated_out"]]
+    dropped = [r for r in valid if r["saturated_out"]]
+    if dropped:
+        print(f"\n  ⚠ استُبعدت من الترشيح (إشباع > {SATURATION_LIMIT_PCT}%): "
+              + "، ".join(f"KP={r['kp']} ({r['saturated_pct']}%)" for r in dropped))
+        print("     التصحيح ملتصق بالسقف فيها فلا تقيس الكسب، و«تذبذب 0» فيها")
+        print("     أثر الالتصاق لا دليل استقرار.")
+    pool = linear or valid          # لو أُشبعت كلها نرتّب على ما لدينا مع تحذير
+    if not linear:
+        print("  ⚠ **كل** الأشواط مُشبَعة — الفراغ المتاح ضيق. أنزِل "
+              "STRAIGHT_BASE_POWER وأعد، فالترشيح أدناه غير موثوق.")
+
+    # ⚠ **الانحراف الجانبي المقاس يعلو على كل مؤشّر داخلي**: الجايرو يقيس
+    #    الاتجاه لا الموضع، فقد يحفظ الاتجاه بينما انزلق الروبوت جانبياً.
+    #    لا نرتّب به إلا إذا قِيس في **كل** أشواط المجموعة (وإلا قارنّا
+    #    مقيساً بغير مقيس — وهو ما رشّح شوطاً لم يُقَس انحرافه أصلاً).
+    ground = [r for r in pool if r["dev_per_m"] is not None]
+    if ground and len(ground) == len(pool):
+        best = min(pool, key=lambda r: r["dev_per_m"])
+        out["ranked_by"] = "الانحراف الجانبي المقاس (سم/م)"
+    else:
+        best = min(pool, key=lambda r: r["score"])
+        out["ranked_by"] = "مؤشّر داخلي (خطأ + تذبذب)"
+        if ground:
+            print(f"\n  ⚠ الانحراف الجانبي قِيس في {len(ground)} من {len(pool)} "
+                  f"أشواط فقط — الترتيب بالمؤشّر الداخلي. قِسه في **كلها** "
+                  f"ليُرجَّح القياس الأرضي.")
     out["suggested_kp"] = best["kp"]
     out["best_run"] = {k: best[k] for k in
                        ("kp", "mean_abs_error_deg", "max_abs_error_deg",
@@ -427,11 +467,13 @@ def stage3_gains(rover, kps, kd: float, duration: float, base: float,
     # السقف: يغطّي 95% من التصحيح المطلوب فعلاً بهامش 1.5، مقصوصاً على الفراغ
     need = max(0.02, best["corr_p95"] * 1.5)
     out["suggested_max_corr"] = round(min(head, need), 3)
-    print("\n  جدول الأشواط (الأدنى نقاطاً أفضل):")
+    print(f"\n  جدول الأشواط (الترتيب: {out['ranked_by']}):")
     for r in valid:
         print(f"    KP={r['kp']:<7} متوسط {r['mean_abs_error_deg']:>6}° "
               f"أقصى {r['max_abs_error_deg']:>6}° تذبذب {r['sign_changes']:>3} "
               f"إشباع {r['saturated_pct']:>5}% نقاط {r['score']}"
+              + ("  ⛔مُشبَع" if r["saturated_out"] else "")
+              + (f" · {r['dev_per_m']}سم/م" if r["dev_per_m"] is not None else "")
               + (f" · جانبي {r['lateral_dev_cm']}سم"
                  if r.get("lateral_dev_cm") is not None else ""))
     print(f"\n  → KP المقترح: **{out['suggested_kp']}** "
