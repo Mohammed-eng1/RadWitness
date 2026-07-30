@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+check_directions.py — تثبيت اتجاهات العتاد الثلاثة (قبل أي معايرة)
+==================================================================
+يحدّد بالتجربة قيمتَي `MOTOR_INVERT` و`BNO055_GYRO_Z_SIGN`، ويكشف
+**انعكاس محرك واحد** (خطأ أسلاك) الذي لا يظهر في أي اختبار زاوية.
+
+⚠ لماذا سكربت مستقل؟ لأن **لفّة 180° لا تفرّق بين اليمين واليسار** — الروبوت
+   ينتهي مواجهاً نفس الجهة في الحالتين. فمعايرة المعامل بلفّات 180° قد تنجح
+   تماماً بينما المحركات **والجايرو معكوسان معاً**، إذ يُلغي الخطآن بعضهما في
+   حارس الإشارة. الأعراض تظهر لاحقاً كسير للخلف وخريطة معكوسة.
+
+ترتيب المراحل **مقصود**: الجايرو أولاً **بلا محركات** (تدوير باليد)، فلا
+يستطيع خطأ المحركات أن يلوّث قياس إشارته. ثم تُقاس المحركات وقد صار لدينا
+مرجع اتجاه موثوق.
+
+  أ) إشارة الجايرو  — تدوير **باليد**، بلا محركات إطلاقاً (آمن تماماً).
+  ب) اتجاه التقدّم  — نبضة قصيرة للأمام بقوة منخفضة.
+  ج) اتجاه الدوران  — نبضة دوران قصيرة، وتقاطعها مع (ب) يكشف خطأ الأسلاك.
+
+    python3 -m pi.tests.check_directions
+    RMS_ROVER_MODE=real python3 -m pi.tests.check_directions --power 0.3
+
+⚠ السلامة: نبضات قصيرة بقوة منخفضة، الأمر يُجدَّد كل دورة (حارس heartbeat
+   1.5ث)، وإيقاف مضمون في `finally` وعند Ctrl-C. ارفع الروبوت على حامل أو
+   أبقِ مساحة ≥1م أمامه وخلفه.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from pi.config import (
+    ROVER_MODE, MOTOR_INVERT, BNO055_GYRO_Z_SIGN, BNO055_READ_PERIOD_S,
+)
+from pi.rover.bridge import WaveRoverBridge
+
+PULSE_S = 1.2          # مدة النبضة — تكفي للرؤية ولا تقطع مسافة خطرة
+PULSE_POWER = 0.25     # قوة منخفضة (داخل النطاق الآمن، وأبطأ من قوة المهمة)
+HAND_TURN_S = 6.0      # مهلة تدوير اليد
+
+
+def _ask(prompt: str, options: dict):
+    """يسأل ويقبل أحد المفاتيح؛ يعيد السؤال عند إدخال غير معروف."""
+    keys = "/".join(options)
+    while True:
+        try:
+            raw = input(f"{prompt} [{keys}]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+        if raw in options:
+            return options[raw]
+        print(f"  ⚠ أدخل أحد: {keys}")
+
+
+def _pulse(rover, l: float, r: float, seconds: float = PULSE_S) -> None:
+    """
+    نبضة حركة قصيرة. ⚠ الأمر **يُجدَّد** كل 100ms: بلا تجديد يمرّ 1.5ث
+    فيعتبره حارس heartbeat انقطاعاً ويوقف المحركات في منتصف النبضة.
+    """
+    deadline = time.time() + seconds
+    try:
+        while time.time() < deadline:
+            rover.motors(l, r)
+            time.sleep(0.1)
+    finally:
+        rover.stop()
+
+
+# ═══ أ) إشارة الجايرو — باليد، بلا محركات ════════════════════════
+def stage_gyro_sign(rover) -> dict:
+    """
+    يقيس إشارة gz أثناء تدوير الروبوت **باليد** يميناً (عقارب الساعة منظوراً
+    من فوق). فصل المحركات هنا **جوهري**: لو دُوّر بالمحركات وكانت معكوسة
+    لقِسنا حاصل ضرب الخطأين وخرجنا بإشارة تبدو سليمة.
+    """
+    src = rover.heading_source
+    imu = getattr(src, "imu", None)
+    print("\n=== أ) إشارة الجايرو (بلا محركات — آمن) ===")
+    if imu is None:
+        print("  ⚠ المصدر الحالي لا يعتمد BNO055 — تُتخطّى.")
+        return {"ok": False, "reason": "لا BNO055"}
+
+    print("  ضع الروبوت على الطاولة. عند البدء **لُفّه بيدك نحو اليمين**")
+    print("  (عقارب الساعة منظوراً من فوق) ~90° خلال المهلة.")
+    try:
+        input("  اضغط Enter ثم ابدأ التدوير فوراً… ")
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+
+    total_raw = 0.0
+    peak = 0.0
+    samples = 0
+    t0 = time.time()
+    last = t0
+    while time.time() - t0 < HAND_TURN_S:
+        v = imu.gyro_z_dps()          # ⚠ **خام** بلا إشارة config
+        now = time.time()
+        dt = now - last
+        last = now
+        if v is not None:
+            total_raw += v * dt
+            peak = max(peak, abs(v))
+            samples += 1
+        time.sleep(BNO055_READ_PERIOD_S)
+
+    print(f"  تكامل خام: {total_raw:+.1f}°  (ذروة {peak:.1f}°/ث، {samples} عينة)")
+    if peak < 5.0:
+        print("  ⚠ لم أرَ دوراناً يُذكر — أعد المحاولة ولُفّه بوضوح.")
+        return {"ok": False, "reason": "لا دوران مقروء", "total_raw": total_raw}
+
+    # اصطلاح المشروع: **موجب = يميناً**. الإشارة الصحيحة تجعل لفّة اليد
+    # اليمنى موجبة بعد ضربها في الثابت.
+    needed = 1 if total_raw > 0 else -1
+    ok = (needed == BNO055_GYRO_Z_SIGN)
+    print(f"  → الإشارة الصحيحة: BNO055_GYRO_Z_SIGN = **{needed:+d}**  "
+          f"(الحالية {BNO055_GYRO_Z_SIGN:+d})" + ("  ✅" if ok else "  ⚠ تحتاج تغيير"))
+    return {"ok": True, "needed_sign": needed, "current_sign": BNO055_GYRO_Z_SIGN,
+            "matches": ok, "total_raw_deg": round(total_raw, 1),
+            "peak_dps": round(peak, 1)}
+
+
+# ═══ ب) اتجاه التقدّم ════════════════════════════════════════════
+def stage_forward(rover, power: float) -> dict:
+    """
+    `forward()` تُرسل motors(+p, +p) فتصير على السلك (MOTOR_INVERT·p).
+    إن تحرّك الروبوت للخلف فالثابت مقلوب — وهو **نفس المسار الذي تستخدمه
+    المهمة كاملة**، لا سكربت المعايرة وحده.
+    """
+    print("\n=== ب) اتجاه التقدّم ===")
+    print(f"  ⚠ سيتحرك {PULSE_S:.1f}ث بقوة {power}. أخلِ ≥1م أمامه وخلفه.")
+    try:
+        input("  اضغط Enter للنبضة… ")
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+
+    _pulse(rover, power, power)       # نيّة: للأمام
+
+    moved = _ask("  إلى أين تحرّك فعلياً؟ (f=للأمام, b=للخلف, n=لم يتحرك)",
+                 {"f": "forward", "b": "backward", "n": "none"})
+    if moved == "none":
+        print("  ⚠ لم يتحرك — بطارية ضعيفة أو أسلاك مفصولة. لا استنتاج.")
+        return {"ok": False, "reason": "لا حركة"}
+    needed = MOTOR_INVERT if moved == "forward" else -MOTOR_INVERT
+    ok = (needed == MOTOR_INVERT)
+    print(f"  → MOTOR_INVERT = **{needed:+d}**  (الحالي {MOTOR_INVERT:+d})"
+          + ("  ✅" if ok else "  ⚠ تحتاج تغيير"))
+    return {"ok": True, "observed": moved, "needed_invert": needed,
+            "current_invert": MOTOR_INVERT, "matches": ok}
+
+
+# ═══ ج) اتجاه الدوران (تقاطع يكشف خطأ الأسلاك) ═══════════════════
+def stage_turn(rover, power: float) -> dict:
+    """
+    `turn("R")` تُرسل motors(+p, −p). الاستنتاج هنا **يجب أن يطابق** استنتاج
+    المرحلة (ب) لأن كليهما يشتقّ من نفس الثابت. اختلافهما يعني أن الانعكاس
+    **ليس عاماً** بل في محرك واحد (أسلاك مقلوبة على جانب) — وهي حالة لا
+    يصلحها أي ثابت في config.
+    """
+    print("\n=== ج) اتجاه الدوران ===")
+    print(f"  ⚠ سيدور بالمكان {PULSE_S:.1f}ث بقوة {power}. أخلِ مساحة حوله.")
+    try:
+        input("  اضغط Enter للنبضة… ")
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+
+    _pulse(rover, power, -power)      # نيّة: يميناً
+
+    got = _ask("  إلى أين دار فعلياً؟ (r=يمين, l=يسار, n=لم يدر/اهتزّ فقط)",
+               {"r": "right", "l": "left", "n": "none"})
+    if got == "none":
+        print("  ⚠ لم يدر — قوة غير كافية أو عجلة معلّقة. لا استنتاج.")
+        return {"ok": False, "reason": "لا دوران"}
+    needed = MOTOR_INVERT if got == "right" else -MOTOR_INVERT
+    print(f"  → من الدوران: MOTOR_INVERT = **{needed:+d}**")
+    return {"ok": True, "observed": got, "needed_invert": needed}
+
+
+# ═══ الخلاصة ═════════════════════════════════════════════════════
+def _verdict(g: dict, f: dict, t: dict) -> None:
+    print("\n" + "═" * 62)
+    print("الخلاصة:")
+    lines = []
+
+    # تقاطع (ب) و(ج): انعكاس عام أم محرك واحد؟
+    if f.get("ok") and t.get("ok"):
+        if f["needed_invert"] != t["needed_invert"]:
+            print("  ⛔ **تناقض بين التقدّم والدوران** — الانعكاس ليس عاماً.")
+            print("     الأرجح أن **أحد المحركين موصول بقطبية مقلوبة**.")
+            print("     ⚠ لا يصلحها أي ثابت في config: اعكس سلكَي ذلك المحرك")
+            print("     عتادياً ثم أعد هذا السكربت. (عرَض مميّز: الأمر بالتقدّم")
+            print("     يجعله يدور بالمكان بدل أن يتقدّم.)")
+            print("═" * 62)
+            return
+        if not f["matches"]:
+            lines.append(f"  MOTOR_INVERT = {f['needed_invert']:+d}"
+                         f"        # كان {f['current_invert']:+d}")
+    elif f.get("ok") and not f["matches"]:
+        lines.append(f"  MOTOR_INVERT = {f['needed_invert']:+d}"
+                     f"        # كان {f['current_invert']:+d}")
+
+    if g.get("ok") and not g["matches"]:
+        lines.append(f"  BNO055_GYRO_Z_SIGN = {g['needed_sign']:+d}"
+                     f"  # كان {g['current_sign']:+d}")
+
+    if lines:
+        print("  عدّل في pi/config.py:")
+        for ln in lines:
+            print(ln)
+        print("\n  ⚠ **أعد معايرة المعامل بعد التعديل** "
+              "(pi.tests.calibrate_heading --stage 2)")
+        print("     وبزاوية **90° لا 180°** — الـ180° لا تكشف انعكاس الجهة.")
+    else:
+        print("  ✅ الاتجاهات كلها سليمة — لا تعديل مطلوب.")
+    print("═" * 62)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="تثبيت اتجاهات العتاد")
+    ap.add_argument("--power", type=float, default=PULSE_POWER,
+                    help=f"قوة النبضة (افتراضي {PULSE_POWER})")
+    ap.add_argument("--allow-sim", action="store_true",
+                    help="⚠ للاختبار البرمجي فقط (المحاكاة لا تُثبت اتجاهاً)")
+    a = ap.parse_args(argv)
+
+    rover = WaveRoverBridge(mode=ROVER_MODE)
+    print("═" * 62)
+    print(f"فحص الاتجاهات · جسر: {rover.mode} · مصدر: {rover.heading_source.name}")
+    print(f"  الحالي: MOTOR_INVERT={MOTOR_INVERT:+d} · "
+          f"BNO055_GYRO_Z_SIGN={BNO055_GYRO_Z_SIGN:+d}")
+    if rover.error:
+        print(f"  ⚠ {rover.error}")
+    print("═" * 62)
+
+    if rover.mode != "real" and not a.allow_sim:
+        print("⛔ الجسر في وضع sim — المحاكاة تُولّد الاتجاه من نفس الثوابت")
+        print("   فلا تُثبت شيئاً عن العتاد. شغّل:")
+        print("   RMS_ROVER_MODE=real python3 -m pi.tests.check_directions")
+        return 2
+
+    g = f = t = {"ok": False}
+    try:
+        g = stage_gyro_sign(rover)
+        f = stage_forward(rover, a.power)
+        t = stage_turn(rover, a.power)
+    except KeyboardInterrupt:
+        print("\n⛔ أُوقف بالمستخدم — المحركات متوقفة.")
+    finally:
+        rover.stop()
+        rover.close()
+
+    _verdict(g, f, t)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
