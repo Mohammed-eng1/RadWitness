@@ -84,6 +84,30 @@
         </div>
       </div>
 
+      <!-- ═══ تحديد موقع المصدر ═══ -->
+      <div class="card" id="srcCard">
+        <h3>تحديد موقع المصدر
+          <label style="float:left;font-size:11px;font-weight:400;color:#94a3b8;cursor:pointer">
+            <input type="checkbox" id="heatToggle" checked style="vertical-align:middle"> خريطة حرارية
+          </label>
+        </h3>
+        <div id="srcAlarm" style="display:none"></div>
+        <div id="srcHead" class="hint" style="font-size:13px;color:#e2e8f0;margin-bottom:6px">
+          لم تُعرَّف الغرفة بعد</div>
+        <div id="srcBlockers" style="display:none"></div>
+        <div class="kv" id="srcKv"></div>
+        <div style="margin-top:8px">
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8">
+            <span>الثقة</span><span id="srcConfTxt">—</span></div>
+          <div style="height:7px;background:#1b2130;border-radius:4px;overflow:hidden;margin-top:3px">
+            <div id="srcConfBar" style="height:100%;width:0;background:linear-gradient(90deg,#38bdf8,#22c55e);transition:width .4s"></div>
+          </div>
+        </div>
+        <div id="srcWarn" class="hint" style="margin-top:6px"></div>
+        <div id="srcTube" class="hint" style="margin-top:4px"></div>
+        <div id="srcVision" class="hint" style="margin-top:4px"></div>
+      </div>
+
       <div class="card">
         <h3>التحكم بالمهمة</h3>
         <div class="btns3">
@@ -268,6 +292,7 @@
       if(cell.priority>0){ctx.strokeStyle="#ff6a3d";ctx.lineWidth=2;
         ctx.strokeRect(x+1.5,y+1.5,cpx-3,cpx-3);}
     }
+    drawHeatmap();          // الخريطة الاحتمالية فوق الخلايا وتحت المسارات
     // المسار المخطط (باهت)
     if(planned.length>1){ctx.strokeStyle="rgba(56,189,248,.55)";ctx.lineWidth=2;
       ctx.setLineDash([5,4]);ctx.beginPath();
@@ -294,6 +319,136 @@
       const s=cpx*0.32;ctx.moveTo(0,s);ctx.lineTo(-s*0.7,-s*0.7);ctx.lineTo(s*0.7,-s*0.7);
       ctx.closePath();ctx.fill();ctx.strokeStyle="#0a0c10";ctx.lineWidth=1.5;ctx.stroke();ctx.restore();
     }
+    drawSource();           // علامة المصدر المقدَّر + دائرة عدم اليقين (فوق الكل)
+  }
+
+  /* ═══ طبقة تحديد المصدر ═══════════════════════════════════════
+     الخريطة الحرارية شبكة **أدقّ** من شبكة التغطية (0.25م مقابل 0.5م)،
+     فالإسقاط يمرّ بالأمتار لا بالخلايا — وإلا انزاحت بمقدار الضعف صامتةً. */
+  let SRC=null, showHeat=true;
+
+  /* حالة الكشف بألوانها — الثلاث المطلوبة صراحةً في التكليف */
+  const SRC_STATES={screening:["لا شيء","#475569"],
+                    confirming:["منطقة مشتبهة (فرز)","#f59e0b"],
+                    confirmed:["مصدر مؤكَّد (تأكيد)","#22c55e"],
+                    rejected:["رُفض بعد التأكيد","#64748b"]};
+
+  function renderSource(){
+    if(!SRC||!SRC.active){ $("srcHead").textContent=(SRC&&SRC.reason)||"لم تُعرَّف الغرفة بعد"; draw(); return; }
+    const [txt,col]=SRC_STATES[SRC.detection_state]||["—","#475569"];
+    $("srcHead").innerHTML=`<span class="pill" style="background:${col}">${txt}</span> `+
+      `<span style="color:#cbd5e1">${SRC.headline||""}</span>`;
+
+    /* 🔴 إنذار الخطر يسبق كل شيء — أبرز عنصر في اللوحة حين يظهر */
+    const al=$("srcAlarm");
+    if(SRC.alarm){ al.style.display="block";
+      al.innerHTML=`<div style="background:#7f1d1d;border:1px solid #dc2626;border-radius:6px;
+        padding:8px;margin-bottom:8px;font-weight:700;color:#fecaca">${SRC.alarm}
+        ${SRC.withdraw?'<div style="font-weight:400;font-size:11px;margin-top:3px">انسحاب تلقائي على أثر المسار</div>':''}</div>`;
+    } else al.style.display="none";
+
+    /* 🔴 موانع ادعاء الموقع — تُعرض بدل الموقع لا بجانبه */
+    const bl=$("srcBlockers");
+    if(SRC.position_blockers&&SRC.position_blockers.length){ bl.style.display="block";
+      bl.innerHTML=`<div style="background:#422006;border:1px solid #a16207;border-radius:6px;
+        padding:7px;margin-bottom:8px;font-size:11px;color:#fde68a">
+        <b>الموقع غير قابل للتحديد:</b><br>${SRC.position_blockers.join("<br>")}</div>`;
+    } else bl.style.display="none";
+
+    const rows=[["الموقع المقدَّر", SRC.position?`${SRC.position[0]} , ${SRC.position[1]} م`:"— لا يُدَّعى"],
+                ["عدم اليقين", SRC.uncertainty_m!=null?"±"+SRC.uncertainty_m+" م":"—"],
+                ["Λ مقابل العتبة", `${SRC.lambda_stat} / ${SRC.threshold}`],
+                ["القراءات", `${SRC.n_readings}`+(SRC.n_confirmation?` (+${SRC.n_confirmation} تأكيد)`:"")],
+                ["درجات الحرية", SRC.dof!=null?String(SRC.dof):"—"],
+                ["أعلى جرعة", (SRC.max_usvh??0)+" µSv/h"],
+                ["حدّ الكشف", (SRC.detection_limit_usvh??"—")+" µSv/h"]];
+    if(SRC.truth&&SRC.position){
+      const e=Math.hypot(SRC.position[0]-SRC.truth[0],SRC.position[1]-SRC.truth[1]);
+      rows.push(["خطأ التقدير (محاكاة)", e.toFixed(2)+" م"]);
+    }
+    $("srcKv").innerHTML=rows.map(([k,v])=>`<span>${k}</span><b>${v}</b>`).join("");
+
+    const cf=SRC.position_reliable?(SRC.confidence||0):0;
+    $("srcConfBar").style.width=Math.round(cf*100)+"%";
+    $("srcConfTxt").textContent=SRC.position_reliable?Math.round(cf*100)+"%":"—";
+
+    /* تحذيرات الصدق: تشبّع، تشتّت زائد، عتبة مستقرأة */
+    const w=[];
+    if(SRC.n_saturated) w.push(`🔴 ${SRC.n_saturated} قراءة مشبوهة بالتشبّع (دخلت كحدّ أدنى)`);
+    if(SRC.n_below_background) w.push(`🔴 ${SRC.n_below_background} قراءة دون الخلفية — شلل عدّاد`);
+    if(SRC.dispersion>1.5) w.push(`⚠ تشتّت زائد φ=${SRC.dispersion} — النموذج لا يلائم، الخريطة وُسِّعت`);
+    if(SRC.threshold_extrapolated) w.push("⚠ "+SRC.threshold_extrapolated);
+    if(SRC.protocol&&SRC.protocol.perimeter_start_ok===false) w.push("🔴 بداية غير قانونية — ضمانة الفرع الصاعد باطلة");
+    $("srcWarn").innerHTML=w.join("<br>");
+
+    /* مؤشّر الأنبوبين — بوسمه الصادق دائماً */
+    const b=SRC.bearing||{};
+    const side={left:"◀ يسار",right:"يمين ▶",ahead:"▲ أمام"}[b.side]||"—";
+    $("srcTube").innerHTML=`الأنبوبان: ${b.usable?`<b>${side}</b>`:"<span style='color:#64748b'>"+side+"</span>"}`+
+      ` <span style="color:#64748b">— ${b.reason||"—"}</span>`;
+
+    /* الرؤية: عدّاد الرصيد + آخر تحليل */
+    const vs=SRC.vision_stats||{};
+    $("srcVision").innerHTML=vs.calls!=null
+      ? `الرؤية: ${vs.calls} استدعاء · ${vs.total_tokens||0} توكن · ~$${vs.estimated_cost_usd||0}`
+        +(vs.last_error?` <span style="color:#f87171">(${vs.last_error})</span>`:"")
+      : `<span style="color:#64748b">الرؤية: لم تُستدعَ بعد</span>`;
+    draw();
+  }
+  function m2px(xm,ym){ return [ox+(xm/G.cell_size_m)*cpx, oy+(ym/G.cell_size_m)*cpx]; }
+
+  function heatColor(t){            // 0→1 : شفاف → سماوي → كهرماني → أحمر
+    const a=0.80*Math.pow(t,0.55);  // غاما ترفع القيم الصغيرة فتُرى البداية
+    if(t<0.5){ const u=t/0.5; return `rgba(${Math.round(34+180*u)},${Math.round(211-40*u)},${Math.round(238-60*u)},${a})`; }
+    const u=(t-0.5)/0.5; return `rgba(${Math.round(214+34*u)},${Math.round(171-100*u)},${Math.round(178-140*u)},${a})`;
+  }
+
+  function drawHeatmap(){
+    if(!showHeat||!SRC||!SRC.active||!SRC.heatmap||!SRC.heatmap.length) return;
+    const hm=SRC.heatmap, res=SRC.grid_res_m||0.25;
+    /* ⚠ التطبيع **بالنسبة إلى انعدام المعلومة لا إلى أعلى قيمة في الخريطة**.
+       القسمة على الأقصى تجعل أي توزيع — حتى المسطّح تماماً — يُرسم مشبعاً
+       بالكامل: شوهد توزيع شبه منتظم (φ=96 يفلطحه) يملأ الغرفة أحمر قانياً
+       فيبدو «المصدر في كل مكان» بينما معناه الحقيقي **«لا أعرف أين»**.
+       المقياس الصادق: نسبة الاحتمال إلى قيمة التوزيع المنتظم (1/عدد الخلايا).
+       نسبة 1 = صفر معلومة ⇒ شفاف تماماً، و100× ⇒ أقصى إشباع. لوغاريتمي
+       لأن التركّز يمتد على مراتب. فتقرأ الخريطة **تركّزاً** لا قيمةً خام. */
+    let n=0; for(const row of hm) n+=row.length;
+    if(!n) return;
+    const uni=1/n, sz=(res/G.cell_size_m)*cpx+0.6;   // +0.6 يمنع خيوط الفواصل
+    for(let r=0;r<hm.length;r++) for(let c=0;c<hm[r].length;c++){
+      const ratio=hm[r][c]/uni;
+      if(ratio<=1.6) continue;                        // عند المنتظم أو دونه: لا شيء
+      const t=Math.min(Math.log10(ratio)/2,1);        // 1.6×→0.1 · 100×→1
+      const [px,py]=m2px(c*res, r*res);
+      ctx.fillStyle=heatColor(t); ctx.fillRect(px,py,sz,sz);
+    }
+  }
+
+  function drawSource(){
+    if(!SRC||!SRC.active) return;
+    // الموقع الحقيقي (محاكاة فقط) — مُعلَّم صراحةً أنه حقيقة المحاكاة
+    if(SRC.truth){
+      const [tx,ty]=m2px(SRC.truth[0],SRC.truth[1]);
+      ctx.strokeStyle="rgba(148,163,184,.85)";ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.moveTo(tx-6,ty);ctx.lineTo(tx,ty-6);
+      ctx.lineTo(tx+6,ty);ctx.lineTo(tx,ty+6);ctx.closePath();ctx.stroke();
+    }
+    if(!SRC.position) return;      // 🔴 لا موقع مُدَّعى ⇒ لا علامة إطلاقاً
+    const [sx,sy]=m2px(SRC.position[0],SRC.position[1]);
+    // دائرة عدم اليقين — تصغر مع تراكم الأدلة
+    if(SRC.uncertainty_m){
+      const ur=(SRC.uncertainty_m/G.cell_size_m)*cpx;
+      ctx.fillStyle="rgba(250,204,21,.10)";ctx.strokeStyle="rgba(250,204,21,.65)";
+      ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
+      ctx.beginPath();ctx.arc(sx,sy,Math.max(ur,4),0,7);ctx.fill();ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    const conf=SRC.detection_state==="confirmed";
+    ctx.strokeStyle=conf?"#22c55e":"#facc15";ctx.lineWidth=2.5;
+    ctx.beginPath();ctx.moveTo(sx-9,sy);ctx.lineTo(sx+9,sy);
+    ctx.moveTo(sx,sy-9);ctx.lineTo(sx,sy+9);ctx.stroke();
+    ctx.beginPath();ctx.arc(sx,sy,4.5,0,7);ctx.fillStyle=conf?"#22c55e":"#facc15";ctx.fill();
   }
 
   // نقر الخريطة → عائق
@@ -327,6 +482,7 @@
     if(d.planned_path) planned=d.planned_path;
     if(d.trail) trail=d.trail;
     if(d.anomaly_cells) anomalyCells=d.anomaly_cells;
+    if(d.source){ SRC=d.source; renderSource(); }
     if(d.state){ state=d.state; updateButtons(); $("stState").textContent=stateAr(d.state); }
     if(d.coverage_text) $("stCov").textContent=d.coverage_text;
     if(robot){$("stPos").textContent=robot.x+" , "+robot.y+" م";
@@ -491,6 +647,7 @@
 
   // إقلاع
   fetch("/api/platform").then(r=>r.json()).then(apply).catch(()=>{});
+  $("heatToggle").onchange=e=>{ showHeat=e.target.checked; draw(); };
   loadCalib(); resize(); connect();
 })();
 </script>
