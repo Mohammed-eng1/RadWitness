@@ -99,6 +99,7 @@ class DriveExecutor:
             hold = src.heading
             self.heading_ctl.reset()
         hold_lost = None
+        base_capped = None       # (المطلوب من السلّم، المطبَّق) عند تقييد السقف
         last_ts = time.time()
         try:
             while covered < distance_m:
@@ -137,7 +138,12 @@ class DriveExecutor:
                     last_ts = now
                     # ⚠ السقف إلزامي: عند 0.50 (أعلى درجة السلّم) الفراغ صفر
                     #    فلا توجيه ممكن — انظر HEADING_HOLD_MAX_BASE.
-                    power = min(power, HEADING_HOLD_MAX_BASE)
+                    # ⚠ ويُسجَّل عند تقييده: السلّم يقرّر 0.50 والواجهة تعرضه،
+                    #    فلو طُبّق 0.40 صامتاً لعُرض رقم لم يحدث. (تقدير المسافة
+                    #    نفسه سليم — يُتكامل على القوة المقصوصة أدناه.)
+                    if power > HEADING_HOLD_MAX_BASE:
+                        base_capped = (power, HEADING_HOLD_MAX_BASE)
+                        power = HEADING_HOLD_MAX_BASE
                     w = self.heading_ctl.wheels(signed_error(src.heading, hold),
                                                 dt, base_power=power)
                     self.rover.motors(w["left"], w["right"])
@@ -165,6 +171,7 @@ class DriveExecutor:
                 "max_abs_error_deg": s["max_abs_error_deg"],
                 "saturated_pct": s["saturated_pct"],
                 "samples": s["samples"], "lost": hold_lost,
+                "base_capped": base_capped,
             }
         elif HEADING_HOLD_IN_MISSION:
             out["heading_hold"] = {"lost": "مصدر الاتجاه غير متاح عند بدء العبور"}

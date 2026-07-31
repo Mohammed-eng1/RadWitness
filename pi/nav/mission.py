@@ -125,6 +125,7 @@ class MissionSim:
         self._time_warned = False
         self._time_rth = False
         self._clamp_seen = 0
+        self._base_cap_logged = False
         self._last_rung = None
         self.last_reactive = None
         self.drive_motors = False
@@ -483,6 +484,13 @@ class MissionSim:
                 # تثبيت الاتجاه: يُبلَّغ عطله **دائماً**، وجودته عند تدهورها
                 # فقط (وإلا أغرق السجل بسطر لكل خلية).
                 hh = fwd.get("heading_hold") or {}
+                if hh.get("base_capped") and not self._base_cap_logged:
+                    self._base_cap_logged = True     # مرة واحدة لا كل خلية
+                    want, got = hh["base_capped"]
+                    self._log("speed_cap",
+                              f"سلّم السلامة يطلب {want} والمطبَّق {got} — "
+                              f"تثبيت الاتجاه يحتاج فراغاً للتصحيح "
+                              f"(0.50 تترك فراغاً صفراً). السرعة ≈{got * 1.5:.2f} م/ث")
                 if hh.get("lost"):
                     self._log("heading_hold",
                               f"⚠ تعذّر تثبيت الاتجاه — {hh['lost']} "
