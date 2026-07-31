@@ -92,7 +92,18 @@ def main() -> int:
     print(f"  الفتح: {time.time() - t0:.2f}ث · available={cam.available}"
           + (f" · خطأ: {cam.error}" if cam.error else ""))
     if not cam.available:
-        print("  ✗ opencv غير مثبّت — ثبّته:  sudo apt install python3-opencv")
+        # ⚠ **اطبع المفسّر المستعمل**: أكثر سبب لهذه الرسالة ليس غياب الحزمة
+        #   بل تشغيل مفسّر غير الذي تحتها. على الراسبري يوجد مفسّران —
+        #   النظام و`venv/bin/python3` — والحزم قد تكون في أحدهما فقط،
+        #   فتظهر «غير مثبّت» وهي مثبّتة في الآخر.
+        in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+        print(f"  ✗ opencv غير متاح **لهذا المفسّر**:")
+        print(f"      {sys.executable}")
+        print(f"      بيئة معزولة (venv): {'نعم' if in_venv else 'لا'}")
+        print("  الحل داخل نفس البيئة التي تُشغّل السيرفر:")
+        print("      ./venv/bin/pip install opencv-python-headless")
+        print("  أو على مستوى النظام (ثم venv بـ--system-site-packages):")
+        print("      sudo apt install -y python3-opencv")
         return 1
 
     print(f"\n  {'#':<3} {'زمن':>7} {'بايت':>9} {'الأبعاد':>11} "

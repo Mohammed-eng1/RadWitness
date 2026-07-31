@@ -6,7 +6,7 @@
 fastapi
 uvicorn
 websockets
-opencv-python
+opencv-python-headless   # بلا GUI: أخفّ وأنسب لروبوت بلا شاشة (cv2 نفسه)
 pyserial
 pynmea2
 # lgpio: بديل pigpio الحديث لعدّ نبضات الجيجر (pigpio محذوف من Debian trixie).
