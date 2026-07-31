@@ -332,6 +332,26 @@ IR_OBSTACLE_LEVEL   = 0           # 0 = عائق (منطق معكوس مثبت)
 ULTRASONIC_TRIG_GPIO = 23         # BCM23 (دبوس 16)
 ULTRASONIC_ECHO_GPIO = 24         # BCM24 (دبوس 18) — ⚠ عبر مقسّم جهد 1kΩ/2kΩ
 
+# ═══ طبقة الرؤية المشتركة (pi/ai/vision_nav.py) ══════════════════
+# ⚠ **وحدة واحدة للمسارين**: الملاحة البصرية (BRIEF_VISUAL_NAV.md) والتوثيق
+# البصري للمصدر يستعملان **نفس المزوّد ونفس المفتاح ونفس العدّاد**. نسختان من
+# التكامل تعني صيانة مزدوجة واستهلاك رصيد مضاعف.
+# البرومتات والمخططات **منفصلة تماماً** لكل مهمة (transport مشترك، مهام لا).
+VISION_ENABLED   = True
+VISION_MODEL     = "gemini-3.1-flash-lite"   # ترقية بسطر واحد هنا
+VISION_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/models"
+VISION_TIMEOUT_S = 12.0           # مهلة كل استدعاء — بعدها يكمل الروبوت محلياً
+VISION_IMAGE_MAX_PX = 512         # دقة منخفضة: أوفر وأسرع وكافية للوصف
+VISION_JPEG_QUALITY = 70
+VISION_THINKING_BUDGET = 0        # أدنى تفكير: المهمة وصف بصري لا استدلال عميق
+VISION_COOLDOWN_S = 20.0          # مانع تكرار لنفس الموقف (حماية الرصيد)
+VISION_MAX_CALLS_PER_MISSION = 60  # سقف صلب — لا استنزاف رصيد في مهمة واحدة
+VISION_MAX_IMAGES_PER_CALL = 8    # عدة صور في **طلب واحد** أوفر من عدة طلبات
+# ⚠ تكلفة **تقديرية** للاستدعاء الواحد (صورة 512px + مخرَج قصير). تُراجَع
+#   مقابل التسعير الحالي قبل الاعتماد عليها مالياً — تُعرض للوعي بالرصيد لا
+#   للمحاسبة. مصدرها تقدير لا فاتورة.
+VISION_COST_PER_CALL_USD = 0.0003
+
 # ═══ الشبكة والبث ════════════════════════════════════════════════
 WEB_HOST = "0.0.0.0"              # يُفتح محلياً وعبر Tailscale (http://therover:8000)
 WEB_PORT = 8000
@@ -419,3 +439,16 @@ CALIBRATION_DIR = _os.path.join(_REPO_ROOT, "profiles", "calibration")
 SOURCE_R_MIN_M         = 0.15
 STAGE2_MIN_MEASUREMENTS = 8
 SOURCE_BG_CPM_DEFAULT  = 18.0
+
+# ═══ ثوابت طبقة المصدر (يستعملها الكود الباقي) ═══════════════════
+CONFIRM_RADIUS_M     = 0.6
+CONFIRM_POSITIONS    = 8
+CONFIRM_REGION_TOL_M = 0.4
+CONFIRM_DWELL_S      = 10.0
+
+# ═══ ثوابت طبقة المصدر (يستعملها الكود الباقي) ═══════════════════
+APPROACH_STEP_M          = 0.25
+APPROACH_MAX_STEPS       = 40
+APPROACH_DWELL_S         = 5.0
+DWELL_MIN_COUNTS = 100
+DWELL_MAX_S      = 60.0
