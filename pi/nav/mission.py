@@ -28,6 +28,7 @@ from pi.config import (
     MISSION_HARD_LIMIT_S,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
+from pi.ai.source_locator import SourceLocator
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
 from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
@@ -134,6 +135,7 @@ class MissionSim:
         self.ultrasonic = None
         self.ir = None
         self.geiger = None
+        self.locator = None      # يُنشأ عند configure_room
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -141,6 +143,13 @@ class MissionSim:
                          start_corner=start_corner, scan_spacing_m=float(scan_spacing_m))
         self.grid = OccupancyGrid(self.room)
         self.world = SimWorld(self.room, source_xy=source_xy, bg_cpm=bg_cpm)
+        # ── محدِّد موقع المصدر: يُنشأ مع الغرفة ويُغذّى من كل قراءة مسح ──
+        # ⚠ محاور الشبكة البايزية: x = العرض، y = الطول — نفس اصطلاح
+        #   `grid.cell_center` تماماً، وإلا انعكست الخريطة الحرارية صامتةً.
+        self.locator = SourceLocator(width_m=float(width_m),
+                                     length_m=float(length_m),
+                                     background_cpm=float(bg_cpm))
+        self.locator.set_background(float(bg_cpm))
         self.state = IDLE
         self.current = self.grid.start_cell()
         self.heading = 0.0
@@ -694,6 +703,19 @@ class MissionSim:
         self.grid.update_reading(x, y, cpm, usvh)
         self.dirty.add(cell)
         risk = classify(usvh)
+        # ── تغذية محدِّد المصدر — **مجاناً بلا وقت إضافي** ────────
+        # كل قراءة مسح تدخل الشبكة البايزية أصلاً؛ لا توقف إضافي ولا مسار
+        # منفصل. وعدم يقين الموقع يُمرَّر من deadreckoning كما هو (البند 3):
+        # تركه صفراً يعني ادعاء موضع مؤكد والروبوت بلا إنكودرات.
+        if self.locator is not None:
+            try:
+                self.locator.add_reading(
+                    x, y, self.heading,
+                    counts_L=cpm * CELL_DWELL_S / 60.0,   # معدّل → عدّات الفترة
+                    duration_s=CELL_DWELL_S,
+                    pos_uncertainty_m=(self.dr.uncertainty if self.dr else 0.0))
+            except Exception:                  # noqa: BLE001 — لا يُسقط المهمة
+                pass
         self.last_reading = {"cpm": round(cpm, 1), "usvh": round(usvh, 3),
                              "risk": risk["risk"], "color": risk["color"]}
         self.records.append({
@@ -765,6 +787,24 @@ class MissionSim:
                       for r in range(self.grid.rows) for c in range(self.grid.cols)],
         }
 
+    def _source_state(self) -> dict:
+        """
+        حالة محدِّد المصدر للبثّ. **الخريطة الحرارية تُبثّ كاملةً**: شبكة غرفة
+        3×4م بدقة 0.25م = 192 خلية — عبء تافه أمام قيمتها البصرية (أقوى عنصر
+        في العرض: تراها تتركّز مع تقدّم المسح).
+        ⚠ أي استثناء هنا يُعيد حالة فارغة ولا يُسقط بثّ المهمة كله.
+        """
+        if self.locator is None:
+            return {"active": False, "reason": "لم تُعرَّف الغرفة بعد"}
+        try:
+            rep = self.locator.report()
+            rep["active"] = True
+            rep["truth"] = (list(self.world.source_xy)
+                            if self.world and self.world.source_xy else None)
+            return rep
+        except Exception as e:                 # noqa: BLE001
+            return {"active": False, "reason": f"خطأ في المحدِّد: {e}"}
+
     def state_dict(self, include_full_grid=False):
         if self.grid is None:
             return {"t": "sim", "state": "no_room"}
@@ -795,6 +835,7 @@ class MissionSim:
             "speed_mult": self.speed_mult,
             "events": self.events[-40:],
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
+            "source": self._source_state(),
             "battery": batt.classify(
                 self.rover.voltage() if BATTERY_MONITOR_ENABLED else None),
             "time_limit": self.time_limit_info(),     # بديل حماية الجهد (القسم 9)
