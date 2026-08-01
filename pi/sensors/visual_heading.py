@@ -43,8 +43,8 @@ from pi.config import (
     VISUAL_MAX_CORRECTION_DEG, VISUAL_MAX_SHIFT_FRAC,
 )
 
-# جوار الذروة الذي يُستبعد عند حساب «الحدّة» (بكسلات)
-_PEAK_GUARD = 3
+# تسامح الاستواء عند تتبّع حدود الفصّ الرئيسي (ضجيج الارتباط)
+_LOBE_FLAT_TOL = 1e-3
 
 
 # ═══ 1) منطق خالص: التوقيع والمطابقة ═════════════════════════════
@@ -93,6 +93,38 @@ def signature_contrast(sig) -> float:
     هذا الفحص يسبق كل شيء: لا معنى للثقة في مطابقة مشهد بلا معالم.
     """
     return float(np.std(np.asarray(sig, dtype=np.float32)))
+
+
+def peak_margin(scores, k: int) -> dict:
+    """
+    فرق الذروة عن أفضل **ذروة منافسة**: أعلى قيمة خارج فصّها الرئيسي.
+
+    ⚠ عطل مقاس على العتاد (2026-08-01): كان الجوار المستبعَد **ثابتاً** (±3
+       بكسل)، وهذا خطأ في القياس لا في المشهد — الارتباط الذاتي لمشهد طبيعي
+       منعَّم **عريض**: عند ±4 بكسل يبقى ~0.98. فكان كل مشهد سليم يُرفض
+       كأنه «نمط متكرّر» (سُجّل: تباين 36.3 وارتباط 1.00 وإزاحة 0.00 بكسل
+       رُفض بحدّة 0.02 — أي رُفض أفضلُ مشهد ممكن).
+
+    الصحيح أن الفصّ الرئيسي يُحدَّد **بالنزول من الذروة حتى ينقلب الميل**،
+    وما بعده وحده منافس حقيقي. النمط الدوري يُنتج فصّاً ثانياً مرتفعاً بعيداً
+    عن الأول — وهو ما نريد رفضه فعلاً.
+    """
+    s = np.asarray(scores, dtype=np.float32)
+    n = len(s)
+    i = k
+    while i > 0 and s[i - 1] <= s[i] + _LOBE_FLAT_TOL:
+        i -= 1
+    j = k
+    while j < n - 1 and s[j + 1] <= s[j] + _LOBE_FLAT_TOL:
+        j += 1
+    mask = np.ones(n, dtype=bool)
+    mask[i:j + 1] = False
+    if not bool(mask.any()):
+        # الفصّ يغطي مدى البحث كله ⇒ لا منافس أصلاً: أوضح حالة ممكنة.
+        return {"margin": 1.0, "lobe": (int(i), int(j)), "rival_at": None}
+    rival = int(np.argmax(np.where(mask, s, -2.0)))
+    return {"margin": float(s[k] - s[rival]), "lobe": (int(i), int(j)),
+            "rival_at": rival, "rival": float(s[rival])}
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -145,11 +177,11 @@ def match_shift(a, b, max_shift: int = None, min_overlap: int = 32) -> dict:
         if abs(den) > 1e-9:
             shift += float(np.clip(0.5 * (y0 - y2) / den, -1.0, 1.0))
 
-    mask = np.ones(len(scores), dtype=bool)
-    mask[max(0, k - _PEAK_GUARD):min(len(scores), k + _PEAK_GUARD + 1)] = False
-    second = float(scores[mask].max()) if bool(mask.any()) else -1.0
+    pm = peak_margin(scores, k)
     return {"ok": True, "shift_px": shift, "peak": peak,
-            "margin": peak - second, "second": second,
+            "margin": pm["margin"], "lobe": pm["lobe"],
+            "rival_shift_px": (None if pm["rival_at"] is None
+                               else pm["rival_at"] - max_shift),
             "at_limit": abs(k - max_shift) >= max_shift}
 
 
@@ -190,8 +222,9 @@ def compare(sig_a, sig_b, hfov_deg: float = CAMERA_HFOV_DEG,
     if m["margin"] < VISUAL_MIN_MARGIN:
         return {"ok": False, "contrast": round(contrast, 2), "peak": m["peak"],
                 "margin": round(m["margin"], 3),
-                "reason": f"ذروة غير مميّزة (حدّة {m['margin']:.2f}) — نمط "
-                          f"متكرّر (بلاط/ستائر/أرفف)؟"}
+                "reason": f"ذروة غير مميّزة (حدّة {m['margin']:.2f}) — ذروة "
+                          f"منافسة عند إزاحة {m.get('rival_shift_px')} بكسل: "
+                          f"نمط متكرّر (بلاط/ستائر/أرفف)؟"}
     if m.get("at_limit"):
         return {"ok": False, "contrast": round(contrast, 2), "peak": m["peak"],
                 "reason": "الإزاحة عند حدّ البحث — الدوران أكبر من مجال الرؤية"}

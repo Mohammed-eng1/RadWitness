@@ -69,10 +69,14 @@ def scene_quality(cam, seconds: float = 3.0) -> dict:
           + ("✅" if c >= VISUAL_MIN_CONTRAST else
              f"⛔ دون {VISUAL_MIN_CONTRAST} — المشهد بلا معالم"))
     if m.get("ok"):
+        lo, hi = m["lobe"]
         print(f"  ثبات المطابقة والروبوت ساكن: إزاحة {drift:.2f} بكسل · "
               f"ارتباط {m['peak']:.2f} · حدّة {m['margin']:.2f}")
+        print(f"  عرض الفصّ الرئيسي: {hi - lo + 1} خطوة · "
+              f"أقرب ذروة منافسة عند إزاحة {m.get('rival_shift_px')} بكسل")
         if m["margin"] < VISUAL_MIN_MARGIN:
-            print(f"  ⚠ حدّة الذروة دون {VISUAL_MIN_MARGIN} — نمط متكرّر "
+            print(f"  ⚠ حدّة الذروة دون {VISUAL_MIN_MARGIN} — توجد ذروة "
+                  f"منافسة بنفس القوة تقريباً عند إزاحة مختلفة: نمط متكرّر "
                   f"(بلاط/ستائر/أرفف)؟ وجّه الكاميرا إلى مشهد أقلّ دورية.")
         if drift > 1.5:
             print("  ⚠ إزاحة ملموسة والروبوت **ساكن**: اهتزاز أو تغيّر إضاءة "
