@@ -43,17 +43,21 @@ from pi.config import (
     HEADING_SOURCE, GYRO_SCALE, BNO055_GYRO_SCALE, BNO055_GYRO_Z_SIGN,
     GYRO_BIAS_CALIB_S, GYRO_BIAS_MAX_STD, GYRO_BIAS_MAX_STD_BNO,
     HEADING_SPIKE_DPS, HEADING_LPF_ALPHA, HEADING_DEADBAND_DPS,
-    HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN,
-    HEADING_LPF_ALPHA_DRIVE, HEADING_LPF_ALPHA_TURN,
+    HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, HEADING_SPIKE_DPS_STEER,
+    HEADING_LPF_ALPHA_DRIVE, HEADING_LPF_ALPHA_TURN, HEADING_LPF_ALPHA_STEER,
     BNO055_READ_PERIOD_S,
     HEADING_RECOVERY_ATTEMPTS, HEADING_RECOVERY_COOLDOWN_S,
 )
 
 # ── أطوار الحركة: عتبة القفزة والتنعيم يختلفان بينها (انظر config) ──
 # `drive` (سير مستقيم/سكون): إشارة صغيرة → عتبة ضيقة وتنعيم قوي.
+# `steer` (سير مع تصحيح خطأ زاوي): المتحكّم يدير الروبوت **عمداً** بمعدل
+#          41–62°/ث عند الإشباع — بعتبة السير يرفض المرشّح دوران الروبوت
+#          نفسه فيتجمّد التكامل ويبقى المتحكّم مشبعاً بلا انغلاق.
 # `turn`  (دوران بالمكان)  : 40–60°/ث طبيعية → عتبة واسعة وتنعيم خفيف.
 PHASES = {
     "drive": (HEADING_SPIKE_DPS_DRIVE, HEADING_LPF_ALPHA_DRIVE),
+    "steer": (HEADING_SPIKE_DPS_STEER, HEADING_LPF_ALPHA_STEER),
     "turn":  (HEADING_SPIKE_DPS_TURN,  HEADING_LPF_ALPHA_TURN),
 }
 

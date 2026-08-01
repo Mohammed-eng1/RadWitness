@@ -712,6 +712,48 @@ def main() -> int:
     check("τ يبقى ~صفر على منصّة تقف فوراً (لا استباق كاذب)",
           clean._coast_tau < 0.02, f"τ={clean._coast_tau:.4f}ث")
 
+    # ── الخطأ الصغير: يُغلق أثناء السير لا بلفّة بالمكان ───────────
+    # ⚠ العطل الذي أنتجه قياسُ التجاوز نفسه: صار النظام يرى خطأه (+4.8°)
+    #    فيطلب لفّة −5°، وقصورها 6.2° فينتهي عند −3.4° فيطلب +3°… رجفة عند
+    #    كل خلية بلا تقارب. الأداة كانت خطأ لا القياس.
+    from pi.nav.executor import DriveExecutor
+    from pi.config import TURN_MIN_ACHIEVABLE_DEG
+
+    ex_br = WaveRoverBridge(mode="sim")
+    ex_br.calibrate_gyro_bias(seconds=0.3)
+    open_road = lambda: {"ultrasonic_cm": 300.0, "ir_left": 1, "ir_right": 1}  # noqa: E731
+    ex = DriveExecutor(ex_br, ReactiveSafety(), open_road, default_sim_profile())
+
+    t_small = ex.turn_to(94.8, 90.0)
+    check("خطأ أصغر من أصغر لفّة ممكنة → لا لفّة بالمكان إطلاقاً",
+          t_small.get("skipped") and t_small["turned_deg"] == 0.0,
+          f"متبقٍّ={t_small.get('residual_deg'):.1f}° < {TURN_MIN_ACHIEVABLE_DEG}°")
+    check("الخطأ المتبقّي يُمرَّر لا يُبتلع (وإلا ثبّتنا الاتجاه الخاطئ)",
+          abs(t_small["residual_deg"] - (-4.8)) < 1e-6,
+          f"{t_small['residual_deg']}°")
+    check("لفّة 90° تبقى لفّة بالمكان كالمعتاد",
+          not ex.turn_to(0.0, 90.0).get("skipped"))
+
+    fw = ex.forward_cell(0.5, heading_error_deg=6.0)
+    hh = fw.get("heading_hold") or {}
+    check("الشوط يثبّت **الهدف** لا الاتجاه الحالي",
+          hh.get("target_offset_deg") == 6.0 and hh["max_abs_error_deg"] >= 5.0,
+          f"إزاحة={hh.get('target_offset_deg')}° أقصى خطأ={hh['max_abs_error_deg']}°")
+    # ⚠ الحارس الحاسم: شوط بخطأ حقيقي = طور **توجيه** لا سير. بعتبة السير
+    #    (12°/ث) يرفض المرشّح دوران الروبوت الذي أمر به المتحكّم نفسه
+    #    (41–62°/ث عند الإشباع) فيتجمّد التكامل ويبقى مشبعاً بلا انغلاق —
+    #    قِيس قبل الإصلاح: 6.0° بقيت 5.1° بإشباع **100%** طوال الشوط.
+    check("شوط بخطأ زاوي حقيقي يعمل في طور «التوجيه»",
+          hh.get("phase") == "steer", f"الطور={hh.get('phase')}")
+    check("تثبيت الاتجاه **يغلق** الخطأ فعلاً أثناء السير",
+          abs(hh["final_error_deg"]) < 1.5 and hh["saturated_pct"] < 50.0,
+          f"6.0° → {hh['final_error_deg']}° · إشباع {hh['saturated_pct']}%")
+    check("الخطأ النهائي **مقاس** ويصل إلى المهمة",
+          hh.get("final_error_deg") is not None)
+    hh0 = (ex.forward_cell(0.5, heading_error_deg=0.0) or {})["heading_hold"]
+    check("السير المستقيم يبقى على عتبته الضيّقة المعايرة (لا توسيع مجاني)",
+          hh0.get("phase") == "drive", f"الطور={hh0.get('phase')}")
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)
