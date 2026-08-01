@@ -35,6 +35,10 @@ from pi.config import (
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
     MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
     TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED,
+    TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
+    TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
+    TURN_COAST_TAU_S, TURN_COAST_TAU_ALPHA, TURN_COAST_TAU_MAX_S,
+    TURN_MAX_LEAD_DEG,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
@@ -140,6 +144,9 @@ class WaveRoverBridge:
         self.rth_requested = False
         self.battery_alarm = False
         self.last_status = {}
+        # ثابت القصور الذاتي للفّ — **يُتعلَّم من القياس** بعد كل لفّة، فلا
+        # يُثبَّت رقم يتغيّر بالأرضية والحمل وشحن البطارية.
+        self._coast_tau = TURN_COAST_TAU_S
         self.clamp_count = 0            # مرات قصّ القوة (تُبثّ في سجل الواجهة)
         self.last_clamp_msg = None
         self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
@@ -383,6 +390,66 @@ class WaveRoverBridge:
         return self.gyro_bias
 
     # ── الدوران بزاوية عبر مصدر الاتجاه (مهلة أمان) ─────────────
+    @staticmethod
+    def _turn_power(remaining_deg: float, turned_deg: float, base: float) -> float:
+        """
+        قوة اللفّ لحظياً: كاملة حتى يقترب الهدف، ثم تنزل خطياً إلى
+        `TURN_MIN_POWER` داخل آخر `TURN_SLOWDOWN_DEG`. الطاقة الحركية تتناسب
+        مع مربّع المعدل، فخفض المعدل قبل القطع يقلّص التجاوز أكثر من نسبياً.
+
+        ⚠ التهدئة **لا تبدأ قبل أن يدور فعلاً** (`turned` > 0.5°): كسر السكون
+           يحتاج القوة الكاملة، ولفّة تصحيح صغيرة تبدأ داخل قوس التهدئة أصلاً
+           فلو خُفّضت قوّتها من اللحظة الأولى لما تحرّك الروبوت إطلاقاً.
+        """
+        if abs(turned_deg) < 0.5 or remaining_deg >= TURN_SLOWDOWN_DEG:
+            return base
+        frac = max(0.0, remaining_deg) / TURN_SLOWDOWN_DEG
+        p = TURN_MIN_POWER + (base - TURN_MIN_POWER) * frac
+        return max(TURN_MIN_POWER, min(base, p))
+
+    def _measure_coast(self) -> float:
+        """
+        يقيس الدوران **بعد قطع الطاقة** حتى يستقرّ الروبوت أو تنتهي النافذة.
+
+        ⚠ بدونه يبقى التجاوز غير مرئي تماماً: حلقة اللفّ تنتهي لحظة بلوغ
+           الهدف فيتجمّد `turned` عند 90 بينما القصور الذاتي يواصل الدوران —
+           فيظنّ النظام أنه على 90° وهو على 100°، ويسير مستقيماً في اتجاه
+           خاطئ (المشي مستقيم والوجهة غلط). القياس لا يمنع التجاوز، لكنه
+           يجعله **رقماً معلوماً** فيصير قابلاً للتصحيح بدل أن يتراكم صامتاً.
+
+        ⚠ يُستدعى **قبل** العودة إلى طور «السير»: عتبة السير (12°/ث) ترفض
+           قراءات القصور الذاتي (عشرات الدرجات/ث) فتضيع القياس كله.
+        """
+        if not self.heading_source.ok:
+            return 0.0
+        extra = 0.0
+        deadline = time.time() + TURN_SETTLE_S
+        while time.time() < deadline:
+            d = self.heading_source.update()
+            extra += d["delta"]
+            if abs(d["dps"]) < TURN_SETTLE_RATE_DPS:
+                break                        # استقرّ — لا تنتظر بقية النافذة
+            time.sleep(0.02)
+        return extra
+
+    def _learn_coast_tau(self, rate_at_cut: float, coast_deg: float) -> None:
+        """
+        يتعلّم ثابت القصور الذاتي من القياس: `τ = القصور ÷ المعدل لحظة القطع`.
+
+        ⚠ **يُقاس ولا يُثبَّت**: يتغيّر بالأرضية (سيراميك/سجاد)، وبالحمل،
+           وبشحن البطارية — تماماً كانحياز الجايرو. تقدير config قيمة ابتدائية
+           تُستبدل بأول قياس صالح لا رقم نهائي.
+        ⚠ الشرط على **المقسوم عليه وحده** (المعدّل لحظة القطع): قسمة على معدّل
+           صغير تضخّم الضجيج فتُفسد التقدير. أما قصورٌ يقارب الصفر مع معدّل
+           كبير فهو **قياس صحيح ومفيد** يقول «هذه المنصّة تقف فوراً» — وكان
+           استبعاده يمنع τ المبالَغ فيه من النزول أبداً، فتقصُر كل لفّة.
+        """
+        if abs(rate_at_cut) < TURN_SETTLE_RATE_DPS:
+            return
+        tau = min(abs(coast_deg) / abs(rate_at_cut), TURN_COAST_TAU_MAX_S)
+        a = TURN_COAST_TAU_ALPHA
+        self._coast_tau = (1.0 - a) * self._coast_tau + a * tau
+
     def _turn_segment(self, degrees: float, timeout: float, power: float) -> dict:
         """
         مرحلة لفّ واحدة، بمهلة أمان خاصة بها. **لا معادلة تكامل هنا** — تُقرأ
@@ -393,6 +460,8 @@ class WaveRoverBridge:
         نُجهض بسبب صريح بدل الدوران حتى المهلة (وقد يكون دورانه بلا نهاية).
         """
         turned = 0.0
+        coast = 0.0
+        rate_at_cut = 0.0
         timed_out = False
         sign_mismatch = False
         want = 1.0 if degrees >= 0 else -1.0
@@ -429,6 +498,7 @@ class WaveRoverBridge:
                     break
                 d = self.heading_source.update()
                 turned += d["delta"]
+                rate_at_cut = d["dps"]
                 if turned * want < -TURN_SIGN_CHECK_DEG:
                     sign_mismatch = True
                     self._event("heading_sign",
@@ -439,16 +509,31 @@ class WaveRoverBridge:
                     self._event("heading_fault",
                                 f"⚠ مصدر الاتجاه توقّف: {self.heading_source.error}")
                     break
+                # ── الاستباق: اقطع الطاقة **قبل** الهدف بزاوية القصور ────
+                # التصحيح بعد الوقوع لا يقارب: لفّة تصحيح صغيرة تحتاج القوة
+                # الكاملة لكسر السكون فتُنتج قصوراً بحجم الخطأ نفسه فتتأرجح.
+                # هنا يقع التصحيح قبل القطع، والثابت الزمني مقاس لا مفترض.
+                lead = min(abs(rate_at_cut) * self._coast_tau, TURN_MAX_LEAD_DEG)
+                if abs(turned) + lead >= abs(degrees):
+                    break
                 # ⚠ **جدّد أمر اللفّ** كل دورة: بلا تجديد يمرّ 1.5ث فيعتبره
                 # حارس الـheartbeat انقطاعاً ويوقف المحركات في منتصف اللفّة
                 # (كانت اللفّة تتوقف عند ~24° لهذا السبب).
-                self.turn(direction, power)
+                # القوة تتهدّأ قرب الهدف — لا قطع مفاجئ من 137°/ث إلى صفر.
+                self.turn(direction,
+                          self._turn_power(abs(degrees) - abs(turned), turned, power))
                 time.sleep(0.02)
         finally:
             self.stop()                      # ⚠ إيقاف مضمون لكل مرحلة
+            # ⚠ الترتيب ملزم: القياس **ثم** العودة إلى طور السير (عتبة السير
+            #    ترفض معدّلات القصور الذاتي فتبتلع القياس).
+            coast = self._measure_coast()
+            turned += coast
+            self._learn_coast_tau(rate_at_cut, coast)
             self.heading_source.set_phase("drive")
         return {"turned": turned, "timed_out": timed_out,
-                "sign_mismatch": sign_mismatch,
+                "sign_mismatch": sign_mismatch, "coast": coast,
+                "rate_at_cut": rate_at_cut, "coast_tau": self._coast_tau,
                 "source_ok": self.heading_source.ok}
 
     def turn_by_angle(self, degrees: float,
@@ -488,10 +573,18 @@ class WaveRoverBridge:
         turned_total = 0.0
         timed_out = False
         aborted = None
+        coast_total = 0.0
+        overshoot = 0.0
+        corrections = 0
         try:
             for i, seg in enumerate(segments):
                 r = self._turn_segment(seg, timeout, power)
                 turned_total += r["turned"]
+                # ⚠ قصور **اللفّة الأصلية وحدها**. جمعه مع قصور لفّات التصحيح
+                #    يُلغيه: التصحيح يدور عكس الاتجاه فيأتي قصوره بالإشارة
+                #    المضادة، فيظهر المجموع ~0 ويبدو كأن لا قصور أصلاً — وهو
+                #    بالضبط الرقم الذي أُضيف ليُرى.
+                coast_total += r.get("coast", 0.0)
                 if r["timed_out"]:
                     timed_out = True
                     break
@@ -503,6 +596,44 @@ class WaveRoverBridge:
                     break
                 if i < len(segments) - 1:
                     time.sleep(TURN_SEGMENT_PAUSE_S)   # استرداد البطارية والمحركات
+
+            # ── تصحيح الخطأ المتبقّي بعد الاستقرار ────────────────
+            # صار ممكناً **لأن التجاوز صار مقاساً**: قبل نافذة الاستقرار كان
+            # `turned` يتجمّد عند الهدف فيبدو الخطأ صفراً دائماً ولا شيء
+            # يُصحَّح. الآن الفرق حقيقي، ولفّة قصيرة تغلقه.
+            overshoot = turned_total - degrees
+            while (aborted is None and not timed_out
+                   and abs(turned_total - degrees) > TURN_TOLERANCE_DEG
+                   and corrections < TURN_CORRECTION_PASSES):
+                corrections += 1
+                err = degrees - turned_total
+                c = self._turn_segment(err, TURN_CORRECTION_TIMEOUT_S, power)
+                turned_total += c["turned"]
+                if c.get("sign_mismatch") or not c.get("source_ok", True):
+                    break
+                # لم يتحرّك: الزاوية أصغر من أن تكسر السكون عند هذه القوة —
+                # التكرار لن يغيّر شيئاً، فنقبل ونُبلّغ بدل حرق المهلة.
+                if abs(c["turned"]) < 0.5:
+                    self._event("turn_stalled",
+                                f"⚠ تعذّر تصحيح {err:+.1f}° — الزاوية أصغر من "
+                                f"أن تكسر السكون عند قوة {power}")
+                    break
+                # ⚠ حارس عدم التقارب: محاولة لم تُقرّبنا من الهدف تعني أن
+                #    قصور لفّة التصحيح نفسه بحجم الخطأ — التكرار يتأرجح حول
+                #    الهدف بلا اقتراب ويستهلك البطارية. نقف ونُبلّغ بالرقم.
+                if abs(degrees - turned_total) >= abs(err):
+                    self._event("turn_stalled",
+                                f"⚠ توقّف التصحيح: الخطأ {err:+.1f}° → "
+                                f"{degrees - turned_total:+.1f}° (لا تقارب) — "
+                                f"قصور لفّة التصحيح بحجم الخطأ نفسه")
+                    break
+            residual = turned_total - degrees
+            if corrections or abs(overshoot) > TURN_TOLERANCE_DEG:
+                self._event("turn_accuracy",
+                            f"لفّ {degrees:.0f}°: تجاوز {overshoot:+.1f}° "
+                            f"(منه {coast_total:+.1f}° قصور ذاتي بعد قطع الطاقة)"
+                            + (f" → {corrections} تصحيح → المتبقّي "
+                               f"{residual:+.1f}°" if corrections else ""))
         finally:
             self.stop()                      # ⚠ إيقاف مضمون
         # ⚠ لا نجمع turned_total على self.heading: مصدر الاتجاه حدّثه أصلاً في
@@ -510,7 +641,14 @@ class WaveRoverBridge:
         return {"requested_deg": degrees, "turned_deg": round(turned_total, 1),
                 "timed_out": timed_out, "aborted": aborted,
                 "heading": round(self.heading, 1),
-                "segments": len(segments)}
+                "segments": len(segments),
+                # أرقام الدقة **مرئية**: تجاوزٌ يتصاعد مع المهمة يعني تهدئة
+                # غير كافية (أنزل TURN_MIN_POWER أو وسّع TURN_SLOWDOWN_DEG).
+                "coast_deg": round(coast_total, 1),
+                "overshoot_deg": round(overshoot, 1),
+                "corrections": corrections,
+                "residual_deg": round(turned_total - degrees, 1),
+                "coast_tau_s": round(self._coast_tau, 4)}
 
     # ── السلامة: heartbeat + البطارية ───────────────────────────
     def check_heartbeat(self) -> bool:
@@ -548,6 +686,8 @@ class WaveRoverBridge:
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
             "max_motor_power": MAX_MOTOR_POWER,
             "clamp_count": self.clamp_count, "last_clamp_msg": self.last_clamp_msg,
+            # ثابت القصور الذاتي المتعلَّم: صفر = لم تُنفَّذ لفّة بعد (لا استباق).
+            "coast_tau_s": round(self._coast_tau, 4),
             "heading_source": self.heading_source.state(),
         }
 
