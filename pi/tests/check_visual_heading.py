@@ -35,7 +35,7 @@ import numpy as np
 
 from pi.config import (
     ROVER_MODE, VISUAL_MIN_CONTRAST, VISUAL_MIN_CORR, VISUAL_MIN_MARGIN,
-    CAMERA_HFOV_DEG, VISUAL_YAW_SIGN,
+    CAMERA_HFOV_DEG, VISUAL_YAW_SIGN, TURN_POWER,
 )
 from pi.sensors.camera import CameraReader
 from pi.sensors.visual_heading import (
@@ -139,14 +139,68 @@ def _turn_and_track(rover, cam, degrees: float) -> dict:
     return {"px": total_px, "weak": weak, "turn": res}
 
 
+def motor_probe(rover, seconds: float = 1.2) -> dict:
+    """
+    فحص فاصل **قبل أي معايرة**: هل تصل الأوامر وهل يدور الروبوت؟
+
+    ⚠ «الجايرو 0° والكاميرا 0 بكسل» تصف العرَض لا السبب. ثلاثة أسباب مختلفة
+       تُنتجها كلها: (أ) البرمجية رفضت الحركة أصلاً (مصدر اتجاه معطّل)، (ب)
+       الأوامر لا تصل الفيرموير (منفذ/أسلاك)، (ج) تصل ولا يدور (بطارية/عائق).
+       هذا الفحص **بحلقة مفتوحة بلا أي شرط برمجي** يفصل الثلاثة.
+    """
+    src = rover.heading_source
+    print(f"\n── فحص فاصل: أمر لفّ خام {seconds:.1f}ث ⚠ يتحرّك ──")
+    print(f"  مصدر الاتجاه: {src.name} · سليم={src.ok} · "
+          f"انحياز مُعاير={src.bias_calibrated}"
+          + (f" · ⛔ {src.error}" if src.error else ""))
+    print(f"  وصلة الروفر: mode={rover.mode} · link_ok={rover.link_ok}"
+          + (f" · ⛔ {rover.link_error}" if rover.link_error else ""))
+    src.set_phase("turn")
+    peak = 0.0
+    total = 0.0
+    t0 = time.time()
+    try:
+        while time.time() - t0 < seconds:
+            rover.turn("R", TURN_POWER)       # أمر خام متجدّد (heartbeat)
+            d = src.update()
+            peak = max(peak, abs(d.get("dps", 0.0)))
+            total += d.get("delta", 0.0)
+            time.sleep(0.02)
+    finally:
+        rover.stop()
+        src.set_phase("drive")
+    print(f"  أُرسل L={rover._cmd_lr[0]:+.2f} R={rover._cmd_lr[1]:+.2f} · "
+          f"ذروة الدوران {peak:.1f}°/ث · تراكم {total:+.1f}°")
+    ok = peak > 5.0
+    if not ok:
+        print("  ⛔ **لم يدر الروبوت بأمر خام**. الأوامر تُرسل (انظر L/R أعلاه)")
+        print("     والجايرو يقرأ صفراً ⇒ إمّا لا يتحرّك فعلياً (بطارية/عائق/"
+              "أسلاك محرّك) وإمّا لا يصل الأمر إلى الفيرموير.")
+        print("     افحص: هل سمعتَ المحركات؟ هل تحرّك الروبوت أصلاً؟")
+        print("     وللفصل: python3 -m pi.tests.check_directions")
+    else:
+        print("  ✅ الروبوت يدور بأمر خام — المشكلة ليست في العتاد.")
+    return {"ok": ok, "peak": peak, "total": total}
+
+
 def calibrate(rover, cam, width: int) -> None:
     print(f"\n── 2) المعايرة: لفّة {CALIB_TURN_DEG:.0f}° ⚠ الروبوت يتحرّك ──")
+    t_start = time.time()
     r = _turn_and_track(rover, cam, CALIB_TURN_DEG)
     t = r["turn"]
     gyro = float(t.get("turned_deg", 0.0))
     px = r["px"]
     print(f"  الجايرو: {gyro:+.1f}° (طُلب {CALIB_TURN_DEG:+.0f}°) · "
           f"الكاميرا: {px:+.1f} بكسل تراكمياً · مطابقات ضعيفة: {r['weak']}")
+    # ⚠ **الحصيلة كاملة**: «دار 0°» وحدها لا تفرّق بين إجهاض برمجي قبل أي
+    #    حركة وبين محركات دارت ولم تُنتج دوراناً. الفرق كله في هذه الحقول.
+    print(f"  الحصيلة: أُجهض={t.get('aborted')} · مهلة={t.get('timed_out')} · "
+          f"لا دوران={t.get('no_rotation')} · ذروة={t.get('peak_rate_dps')}°/ث · "
+          f"مراحل={t.get('segments')} · استغرق {time.time() - t_start:.1f}ث")
+    if t.get("aborted"):
+        print(f"  ⛔ اللفّة **أُجهضت برمجياً قبل الحركة**: {t['aborted']}")
+        print(f"     مصدر الاتجاه: {rover.heading_source.error}")
+        return
     if abs(gyro) < 10.0:
         print("  ⛔ الروبوت لم يلفّ فعلياً — لا معايرة. (بطارية؟ عائق؟)")
         return
@@ -215,7 +269,15 @@ def main() -> int:
         print(f"\n⚠ الجسر في وضع {rover.mode} — لن تتحرّك المحركات. "
               f"شغّل بـ RMS_ROVER_MODE=real")
     try:
-        rover.calibrate_gyro_bias()
+        info = rover.calibrate_gyro_bias()
+        bi = rover.bias_info
+        print(f"\n  انحياز الجايرو: {info:+.4f} (σ={bi.get('std', 0):.3f}، "
+              f"{bi.get('n', 0)} عينة)"
+              + ("" if bi.get("ok") else f" ⛔ رُفض: {bi.get('reason')}"))
+        # الفحص الفاصل قبل المعايرة: عطل عتاد يُنتج نفس أرقام عطل البرمجية
+        if not motor_probe(rover)["ok"]:
+            print("\n⛔ لا معنى لمعايرة بصرية والروبوت لا يدور — عالج ما سبق.")
+            return 1
         calibrate(rover, cam, q["width"])
     finally:
         rover.stop()
