@@ -521,16 +521,32 @@ class MissionSim:
                         break
                     continue
 
+                # ⚠ الخطأ الزاوي المتبقّي بعد اللفّ **لا يُصحَّح بلفّة ثانية**:
+                #   لفّة أصغر من القصور الذاتي (5.5–8°) تتجاوز هدفها بالتعريف
+                #   فتتأرجح عند كل خلية. يُمرَّر إلى الشوط ليغلقه تثبيت الاتجاه
+                #   أثناء السير — تصحيح سلس بمتحكّم معاير وبلا قصور ذاتي.
+                head_err = _ang_signed(self.heading, target_heading)
+
                 # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
                 tx, ty = self.grid.cell_center(*nxt)
-                exp_wall = self._wall_distance_from(tx, ty, self.heading)
-                fwd = self.executor.forward_cell(CELL_SIZE_M, expected_wall_end_m=exp_wall)
+                exp_wall = self._wall_distance_from(tx, ty, target_heading)
+                fwd = self.executor.forward_cell(CELL_SIZE_M,
+                                                 expected_wall_end_m=exp_wall,
+                                                 heading_error_deg=head_err)
                 covered = fwd.get("covered_m", 0.0)
                 if self.dr and covered:
                     self.dr.advance(covered)
                 # تثبيت الاتجاه: يُبلَّغ عطله **دائماً**، وجودته عند تدهورها
                 # فقط (وإلا أغرق السجل بسطر لكل خلية).
                 hh = fwd.get("heading_hold") or {}
+                # ── الاتجاه بعد الشوط: **مقاس** لا مفترض ──────────────
+                # التثبيت يغلق الخطأ لكنه لا يصفّره؛ أخذ الهدف كما هو يعيد
+                # الكذبة القديمة (الكود يظنّ 90 والروبوت على 94).
+                fe = hh.get("final_error_deg")
+                if fe is not None and not hh.get("lost"):
+                    self.heading = (target_heading - fe) % 360.0
+                    if self.dr:
+                        self.dr.set_pose(self.dr.x, self.dr.y, self.heading)
                 if hh.get("base_capped") and not self._base_cap_logged:
                     self._base_cap_logged = True     # مرة واحدة لا كل خلية
                     want, got = hh["base_capped"]
