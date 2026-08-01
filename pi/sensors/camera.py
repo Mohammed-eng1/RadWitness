@@ -45,6 +45,21 @@ class CameraReader:
             self.error = str(e)
             return False
 
+    def frame_array(self):
+        """
+        إطار خام كمصفوفة numpy (H, W, 3) أو None — للاتجاه البصري.
+        ⚠ **بلا ترميز JPEG**: `snapshot_jpeg` يرمّز ثم يفكّ الترميز عند
+           الاستعمال، وهو ضياع وقت وجودة في مسار يُقرأ عند كل خلية.
+        ⚠ يشارك نفس القفل: الكاميرا تُقرأ من خيط البثّ وخيط المحركات معاً.
+        """
+        if not _CV2_OK:
+            return None
+        with self._lock:
+            if not self._ensure_open():
+                return None
+            ok, frame = self._cap.read()
+            return frame if ok else None
+
     def snapshot_jpeg(self):
         """يُعيد بايتات JPEG للقطة واحدة، أو None عند التعذّر."""
         if not _CV2_OK:

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+check_visual_heading.py — معايرة وفحص الاتجاه البصري (الويب كام)
+================================================================
+الكاميرا مرجع اتجاه **مطلق** يكسر تراكم انحراف الجايرو (انظر
+`pi/sensors/visual_heading.py`). لكنها تحتاج رقمين **مقاسين لا مخمَّنين**:
+
+    CAMERA_HFOV_DEG   مجال الرؤية الأفقي بالدرجات
+    VISUAL_YAW_SIGN   اتجاه انزلاق المشهد عند الدوران يميناً
+
+كلاهما يُضرب في إزاحة البكسل، فرقم مفترض خاطئ يُنتج تصحيحاً خاطئاً **واثقاً**
+— أسوأ من غياب التصحيح أصلاً (نفس درس `TURN_COAST_TAU_S`).
+
+المراحل:
+  1. **جودة المشهد** (بلا حركة): هل فيه معالم كافية للمطابقة أصلاً؟
+  2. **المعايرة** (⚠ يلفّ الروبوت): يلفّ زاوية معلومة بالجايرو ويجمع إزاحة
+     البكسل تراكمياً → درجة/بكسل → HFOV، والإشارة من اتجاه الإزاحة.
+  3. **التحقّق** (⚠ يلفّ): لفّة ثانية — كم تقول الكاميرا وكم يقول الجايرو؟
+
+التشغيل على الراسبري (⚠ أوقف السيرفر أولاً — الكاميرا والمنفذ مشتركان):
+    python3 -m pi.tests.check_visual_heading              # المرحلة 1 فقط
+    python3 -m pi.tests.check_visual_heading --calibrate  # ⚠ يحرّك الروبوت
+
+⚠ اجعل أمام الروبوت **مشهداً ثابتاً وفيه تفاصيل** (رفّ، باب، أثاث). جدار
+   أبيض أملس لا يعطي شيئاً — وهذا نفسه ما تقيسه المرحلة 1.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+import numpy as np
+
+from pi.config import (
+    ROVER_MODE, VISUAL_MIN_CONTRAST, VISUAL_MIN_CORR, VISUAL_MIN_MARGIN,
+    CAMERA_HFOV_DEG, VISUAL_YAW_SIGN,
+)
+from pi.sensors.camera import CameraReader
+from pi.sensors.visual_heading import (
+    column_signature, signature_contrast, match_shift,
+)
+
+CALIB_TURN_DEG = 40.0       # زاوية المعايرة: كبيرة للدقة، ودون مجال الرؤية
+SAMPLE_GAP_S = 0.05
+
+
+def scene_quality(cam, seconds: float = 3.0) -> dict:
+    """جودة المشهد بلا حركة: تباين التوقيع + ثبات المطابقة بين لقطتين."""
+    print(f"\n── 1) جودة المشهد ({seconds:.0f}ث، الروبوت ساكن) ──")
+    sigs, contrasts = [], []
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        f = cam.frame_array()
+        if f is not None:
+            s = column_signature(f)
+            sigs.append(s)
+            contrasts.append(signature_contrast(s))
+        time.sleep(0.1)
+    if len(sigs) < 3:
+        print("  ⛔ لا لقطات — الكاميرا لا تقرأ (هل السيرفر يمسكها؟)")
+        return {"ok": False}
+    c = float(np.median(contrasts))
+    m = match_shift(sigs[0], sigs[-1])
+    drift = abs(m.get("shift_px", 0.0)) if m.get("ok") else float("nan")
+    print(f"  لقطات: {len(sigs)} · عرض الصورة: {len(sigs[0])} بكسل")
+    print(f"  التباين (وسيط): {c:.1f}  "
+          + ("✅" if c >= VISUAL_MIN_CONTRAST else
+             f"⛔ دون {VISUAL_MIN_CONTRAST} — المشهد بلا معالم"))
+    if m.get("ok"):
+        print(f"  ثبات المطابقة والروبوت ساكن: إزاحة {drift:.2f} بكسل · "
+              f"ارتباط {m['peak']:.2f} · حدّة {m['margin']:.2f}")
+        if m["margin"] < VISUAL_MIN_MARGIN:
+            print(f"  ⚠ حدّة الذروة دون {VISUAL_MIN_MARGIN} — نمط متكرّر "
+                  f"(بلاط/ستائر/أرفف)؟ وجّه الكاميرا إلى مشهد أقلّ دورية.")
+        if drift > 1.5:
+            print("  ⚠ إزاحة ملموسة والروبوت **ساكن**: اهتزاز أو تغيّر إضاءة "
+                  "أو حركة في المشهد — سيُترجَم لاحقاً إلى دوران وهمي.")
+    ok = (c >= VISUAL_MIN_CONTRAST and m.get("ok")
+          and m["peak"] >= VISUAL_MIN_CORR and m["margin"] >= VISUAL_MIN_MARGIN)
+    print("  " + ("✅ المشهد صالح للاتجاه البصري" if ok else
+                  "⛔ المشهد غير صالح — عالج ما سبق قبل المعايرة"))
+    return {"ok": ok, "contrast": c, "width": len(sigs[0])}
+
+
+def _turn_and_track(rover, cam, degrees: float) -> dict:
+    """
+    يلفّ بالجايرو ويجمع إزاحة البكسل **تراكمياً بين اللقطات المتتابعة**.
+
+    ⚠ التراكم بين لقطات متقاربة لا بمقارنة الأولى بالأخيرة: لفّة 40° تُخرج
+       المعالم من مجال الرؤية فتفشل المطابقة المباشرة تماماً. الخطوات
+       الصغيرة تُبقي تداخلاً كافياً في كل خطوة.
+    """
+    total_px = 0.0
+    weak = 0
+    prev = None
+    f = cam.frame_array()
+    if f is not None:
+        prev = column_signature(f)
+
+    import threading
+    res = {}
+    th = threading.Thread(
+        target=lambda: res.update(rover.turn_by_angle(degrees)), daemon=True)
+    th.start()
+    while th.is_alive():
+        f = cam.frame_array()
+        if f is not None:
+            sig = column_signature(f)
+            if prev is not None:
+                m = match_shift(prev, sig)
+                if m.get("ok") and m["peak"] >= VISUAL_MIN_CORR \
+                        and m["margin"] >= VISUAL_MIN_MARGIN:
+                    total_px += m["shift_px"]
+                else:
+                    weak += 1
+            prev = sig
+        time.sleep(SAMPLE_GAP_S)
+    th.join(timeout=2.0)
+
+    # ⚠ اللقطات بعد توقف المحركات مقصودة: القصور الذاتي يضيف 5–8° بعد قطع
+    #    الطاقة (CLAUDE.md §1.1.1)، والكاميرا تراه كما يراه الجايرو.
+    settle = time.time() + 0.6
+    while time.time() < settle:
+        f = cam.frame_array()
+        if f is not None:
+            sig = column_signature(f)
+            if prev is not None:
+                m = match_shift(prev, sig)
+                if m.get("ok") and m["peak"] >= VISUAL_MIN_CORR:
+                    total_px += m["shift_px"]
+            prev = sig
+        time.sleep(SAMPLE_GAP_S)
+    return {"px": total_px, "weak": weak, "turn": res}
+
+
+def calibrate(rover, cam, width: int) -> None:
+    print(f"\n── 2) المعايرة: لفّة {CALIB_TURN_DEG:.0f}° ⚠ الروبوت يتحرّك ──")
+    r = _turn_and_track(rover, cam, CALIB_TURN_DEG)
+    t = r["turn"]
+    gyro = float(t.get("turned_deg", 0.0))
+    px = r["px"]
+    print(f"  الجايرو: {gyro:+.1f}° (طُلب {CALIB_TURN_DEG:+.0f}°) · "
+          f"الكاميرا: {px:+.1f} بكسل تراكمياً · مطابقات ضعيفة: {r['weak']}")
+    if abs(gyro) < 10.0:
+        print("  ⛔ الروبوت لم يلفّ فعلياً — لا معايرة. (بطارية؟ عائق؟)")
+        return
+    if abs(px) < 20.0:
+        print("  ⛔ الكاميرا لم تر دوراناً — تحقّق من تثبيتها ومن المشهد.")
+        return
+
+    deg_per_px = abs(gyro) / abs(px)
+    hfov = deg_per_px * width
+    sign = -1 if (px * gyro) < 0 else +1
+    print(f"\n  درجة/بكسل = {deg_per_px:.4f}")
+    print(f"  ➜ CAMERA_HFOV_DEG = {hfov:.1f}")
+    print(f"  ➜ VISUAL_YAW_SIGN = {sign:+d}")
+    if not (30.0 <= hfov <= 120.0):
+        print(f"  ⚠ {hfov:.0f}° خارج المدى المعقول لويب كام (30–120°) — "
+              f"الأرجح أن اللفّة أو المطابقة غير موثوقة. أعد التجربة.")
+        return
+
+    print(f"\n── 3) التحقّق: لفّة ثانية {-CALIB_TURN_DEG:.0f}° ⚠ يتحرّك ──")
+    r2 = _turn_and_track(rover, cam, -CALIB_TURN_DEG)
+    g2 = float(r2["turn"].get("turned_deg", 0.0))
+    cam_deg = sign * r2["px"] * deg_per_px
+    err = cam_deg - g2
+    print(f"  الجايرو: {g2:+.1f}°  ·  الكاميرا: {cam_deg:+.1f}°  ·  "
+          f"الفرق: {err:+.1f}°")
+    if abs(err) <= 4.0:
+        print("  ✅ المصدران متفقان — القياس موثوق.")
+    else:
+        print("  ⚠ فرق كبير: انزلاق العجلات (الجايرو أدقّ للدوران) أو مشهد "
+              "قريب جداً (تزيّح المنظر). أعد التجربة أمام مشهد أبعد.")
+
+    print("\n" + "═" * 58)
+    print("ضع في pi/config.py ثم فعّل VISUAL_HEADING_ENABLED = True:")
+    print(f"    CAMERA_HFOV_DEG  = {hfov:.1f}")
+    print(f"    VISUAL_YAW_SIGN  = {sign:+d}")
+    print("═" * 58)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="معايرة الاتجاه البصري")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="⚠ يلفّ الروبوت لقياس HFOV والإشارة")
+    args = ap.parse_args()
+
+    cam = CameraReader()
+    if cam.frame_array() is None:
+        print("⛔ الكاميرا لا تعطي إطاراً. أوقف السيرفر (يمسك /dev/video0) "
+              "وتحقّق: ls /dev/video*")
+        return 1
+    print(f"الحالي في config: CAMERA_HFOV_DEG={CAMERA_HFOV_DEG} · "
+          f"VISUAL_YAW_SIGN={VISUAL_YAW_SIGN:+d}"
+          + ("  (غير مقاس بعد)" if not CAMERA_HFOV_DEG else ""))
+
+    q = scene_quality(cam)
+    if not args.calibrate:
+        print("\nأضف --calibrate لقياس HFOV والإشارة (⚠ يحرّك الروبوت).")
+        return 0 if q.get("ok") else 1
+    if not q.get("ok"):
+        print("\n⛔ لن أعاير على مشهد غير صالح — النتيجة ستكون رقماً واثقاً "
+              "وخاطئاً، وهو أسوأ من لا شيء.")
+        return 1
+
+    from pi.rover.bridge import WaveRoverBridge
+    rover = WaveRoverBridge(mode=ROVER_MODE)
+    if rover.mode != "real":
+        print(f"\n⚠ الجسر في وضع {rover.mode} — لن تتحرّك المحركات. "
+              f"شغّل بـ RMS_ROVER_MODE=real")
+    try:
+        rover.calibrate_gyro_bias()
+        calibrate(rover, cam, q["width"])
+    finally:
+        rover.stop()
+        cam.close()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nتوقّف.")

@@ -853,6 +853,108 @@ def main() -> int:
           next((e["msg"][:70] for e in ms5.events
                 if e["kind"] == "mission_abort"), f"الحالة={ms5.state}"))
 
+    # ═══ (س) الاتجاه البصري — منطق خالص بصور مُزاحة اصطناعياً ══════
+    # الجايرو مصدر **نسبي** يتراكم خطؤه؛ الكاميرا مرجع **مطلق** لأن المشهد لا
+    # يتحرك. كل ما يلي numpy فقط — بلا كاميرا وبلا cv2 (يعمل على ويندوز).
+    print("\nس) الاتجاه البصري (مرجع مطلق يكسر تراكم الجايرو):")
+    import numpy as _np
+    from pi.sensors.visual_heading import (
+        column_signature, signature_contrast, match_shift, shift_to_deg,
+        compare, VisualHeading, _grid_key,
+    )
+    from pi.config import (
+        VISUAL_MIN_CONTRAST, VISUAL_MAX_CORRECTION_DEG, CAMERA_HFOV_DEG,
+    )
+
+    _rng = _np.random.default_rng(7)
+    W, H = 320, 240
+    scene = _np.repeat(_rng.integers(0, 255, size=(1, W)).astype(_np.float32),
+                       H, axis=0)                    # مشهد عمودي غنيّ بالمعالم
+
+    def shifted(px):
+        """المشهد نفسه مُزاحاً أفقياً px بكسل (محاكاة دوران الروبوت)."""
+        return _np.roll(scene, px, axis=1)
+
+    sig0 = column_signature(scene)
+    check("توقيع الأعمدة بطول عرض الصورة", len(sig0) == W, f"{len(sig0)}")
+    check("مشهد غنيّ بالمعالم يتجاوز عتبة التباين",
+          signature_contrast(sig0) >= VISUAL_MIN_CONTRAST,
+          f"تباين={signature_contrast(sig0):.1f}")
+
+    m = match_shift(sig0, column_signature(shifted(17)))
+    check("المطابقة تستخرج الإزاحة بدقّة دون-البكسل",
+          m["ok"] and abs(m["shift_px"] - 17.0) < 1.0,
+          f"طُلب 17 → {m['shift_px']:.2f} بكسل (ارتباط {m['peak']:.2f})")
+    mneg = match_shift(sig0, column_signature(shifted(-11)))
+    check("الإشارة صحيحة في الاتجاهين",
+          mneg["ok"] and abs(mneg["shift_px"] + 11.0) < 1.0,
+          f"{mneg['shift_px']:.2f}")
+
+    # ⚠ الإضاءة تتغيّر باستمرار في غرفة حقيقية — التطبيع يجعلها لا تُذكر
+    bright = column_signature(shifted(9) * 1.4 + 25.0)
+    mb = match_shift(sig0, bright)
+    check("تغيّر الإضاءة لا يزيح المطابقة (تطبيع)",
+          mb["ok"] and abs(mb["shift_px"] - 9.0) < 1.0,
+          f"سطوع ×1.4 +25 → {mb['shift_px']:.2f}")
+
+    # ── الحرّاس: الحالات التي **يجب** أن تُرفض ─────────────────────
+    blank = _np.full((H, W), 128.0, dtype=_np.float32)
+    c_blank = compare(column_signature(blank), column_signature(blank), 60.0)
+    check("جدار أملس بلا معالم → «لا أعرف» لا رقم واثق",
+          not c_blank["ok"] and "معالم" in c_blank["reason"], c_blank["reason"])
+
+    # نمط دوري (بلاط/ستائر/أرفف): ذرى متساوية عند إزاحات مختلفة
+    per = _np.tile(_np.array([0, 0, 0, 0, 255, 255, 255, 255], dtype=_np.float32),
+                   W // 8)
+    per_img = _np.repeat(per[None, :], H, axis=0)
+    c_per = compare(column_signature(per_img),
+                    column_signature(_np.roll(per_img, 24, axis=1)), 60.0)
+    check("نمط متكرّر → يُرفض بحدّة الذروة لا يُصدَّق أعلاه بفارق ضئيل",
+          not c_per["ok"], c_per.get("reason", "قُبل!"))
+
+    # ⚠ نفس درس τ: رقم يُضرب ولم يُقَس ⇒ رفض صريح لا اختراع
+    raised = False
+    try:
+        shift_to_deg(10.0, W, hfov_deg=0.0)
+    except ValueError:
+        raised = True
+    check("HFOV غير مقاس → رفض صريح لا رقم مخترع", raised)
+    check("HFOV مقاس → تحويل خطي صحيح",
+          abs(shift_to_deg(W / 4.0, W, hfov_deg=60.0, sign=+1) - 15.0) < 1e-6,
+          f"{shift_to_deg(W / 4.0, W, 60.0, +1):.2f}°")
+
+    # ── المراسي: مقارنة بمرجع مطلق لا تكامل ───────────────────────
+    check("مفتاح المرساة يثبّت على الاتجاه الشبكي",
+          (_grid_key(88.6), _grid_key(271.0), _grid_key(359.5)) == (90, 270, 0))
+
+    class FakeCam:
+        """كاميرا وهمية: المشهد يُزاح بمقدار ما «دار» الروبوت."""
+        def __init__(self):
+            self.px = 0
+        def frame_array(self):
+            return shifted(self.px)
+
+    cam = FakeCam()
+    vh = VisualHeading(cam, hfov_deg=60.0, sign=+1)
+    check("الاتجاه البصري جاهز بعد قياس HFOV", vh.ready and not vh.error)
+    check("مرساة تُثبَّت أول مرة فقط",
+          vh.set_anchor(90.0) and not vh.set_anchor(90.0) and vh.anchors == {90: vh.anchors[90]})
+    cam.px = 32                      # المشهد انزاح ⇒ الروبوت دار
+    r = vh.residual_deg(90.0)
+    check("الانحراف عن المرساة يُقاس بالدرجات (لا تكامل)",
+          r["ok"] and abs(r["deg"] - 6.0) < 0.6,
+          f"32 بكسل من 320 عند HFOV=60 → {r.get('deg')}° (المتوقَّع 6.0)")
+    check("لا مرساة للاتجاه ⇒ «لا أعرف» لا صفر",
+          not vh.residual_deg(0.0)["ok"])
+    # 80 بكسل من 320 عند HFOV=60 ⇒ 15° — داخل مدى البحث لكن فوق سقف التصحيح
+    cam.px = 80                      # انحراف كبير = مشهد تغيّر لا دوران
+    big = vh.residual_deg(90.0)
+    check("انحراف بصري فوق السقف يُرفض (مطابقة خاطئة أخطر من غيابها)",
+          not big["ok"] and str(VISUAL_MAX_CORRECTION_DEG) in big["reason"],
+          big["reason"][:56])
+    check("العلم مطفأ افتراضياً حتى يُقاس HFOV على العتاد",
+          CAMERA_HFOV_DEG == 0.0 and not VisualHeading(cam).ready)
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)
