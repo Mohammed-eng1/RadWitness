@@ -74,7 +74,11 @@ class DriveExecutor:
         # صريح لا يجوز اعتباره لفّة ناجحة (وإلا تقدّم الروبوت باتجاه خاطئ).
         return {"ok": not res["timed_out"] and not res.get("aborted"),
                 "turned_deg": res["turned_deg"], "aborted": res.get("aborted"),
-                "segments": res.get("segments", 1), "timed_out": res["timed_out"]}
+                "segments": res.get("segments", 1), "timed_out": res["timed_out"],
+                # إشارات تشخيصية تصعد إلى المهمة: العجز عن اللفّ أصلاً، وذروة
+                # معدل الدوران (مقياس الشحن الضمني — لا حسّاس جهد على العتاد).
+                "no_rotation": res.get("no_rotation", False),
+                "peak_rate_dps": res.get("peak_rate_dps")}
 
     # ── التقدّم خلية واحدة تحت إشراف السلامة ─────────────────────
     def forward_cell(self, distance_m: float = CELL_SIZE_M,
