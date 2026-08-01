@@ -24,6 +24,11 @@
   @media(max-width:920px){.layout{grid-template-columns:1fr}}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
   .card h3{margin:0 0 10px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .card h3.hdrow{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .minibtn{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px;font-family:inherit;
+    text-transform:none;letter-spacing:0;white-space:nowrap}
+  .minibtn:active{background:var(--accent);color:#0b0d11}
   label{font-size:12px;color:var(--muted);display:block;margin-bottom:3px}
   input,select{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);
     border-radius:8px;padding:7px;font-size:14px;font-family:inherit}
@@ -230,7 +235,9 @@
       </div>
 
       <div class="card">
-        <h3>سجل الأحداث</h3>
+        <h3 class="hdrow"><span>سجل الأحداث</span>
+          <button id="btnCopyLog" class="minibtn" title="ينسخ السجل كاملاً لا المعروض فقط">
+            📋 انسخ الكل</button></h3>
         <div id="events"></div>
       </div>
     </div>
@@ -534,7 +541,9 @@
     $("btnHome").disabled=!(state==="running"||state==="paused"||state==="done");
   }
 
+  let lastEvents=[];
   function renderEvents(evs){
+    lastEvents=evs;                     // احتياطي لزرّ النسخ لو فشل الجلب
     $("events").innerHTML=evs.slice().reverse().map(e=>
       "<div><span class='k'>"+({mission_start:"بدء",mission_end:"انتهاء",pause:"إيقاف",
       resume:"استئناف",estop:"طوارئ",obstacle_detected:"عائق",obstacle_placed:"عائق يدوي",
@@ -543,6 +552,54 @@
       battery:"بطارية",speed:"سرعة",power_clamp:"قصّ قوة",turn_segmented:"تجزئة لفّ",
       gyro_bias:"انحياز جايرو",gyro_bias_rejected:"رفض معايرة",heartbeat:"heartbeat"}[e.kind]||e.kind)
       +"</span> — "+e.msg+"</div>").join("");
+  }
+
+  // ── نسخ السجل **كاملاً** ───────────────────────────────────────
+  // البثّ يرسل آخر 40 حدثاً فقط، بينما المهمة تحتفظ بـ300 — فالزرّ يجلب
+  // الكل من /api/mission/report ويسقط إلى المعروض عند تعذّر الجلب.
+  // ⚠ `navigator.clipboard` **غير متاح هنا**: يشترط سياقاً آمناً (https أو
+  //   localhost) والواجهة تُفتح عبر http://therover:8000 — فالبديل الإلزامي
+  //   textarea مؤقت + execCommand، وإلا فشل النسخ صامتاً على العتاد.
+  function copyText(txt){
+    if(navigator.clipboard && window.isSecureContext)
+      return navigator.clipboard.writeText(txt);
+    return new Promise((res,rej)=>{
+      const ta=document.createElement("textarea");
+      ta.value=txt; ta.setAttribute("readonly","");
+      ta.style.cssText="position:fixed;top:-9999px;opacity:0";
+      document.body.appendChild(ta);
+      ta.select(); ta.setSelectionRange(0,ta.value.length);
+      let ok=false;
+      try{ ok=document.execCommand("copy"); }catch(e){ ok=false; }
+      document.body.removeChild(ta);
+      ok?res():rej(new Error("execCommand فشل"));
+    });
+  }
+
+  async function copyLog(){
+    const btn=$("btnCopyLog"), old=btn.textContent;
+    btn.textContent="⏳ يجمع…"; btn.disabled=true;
+    try{
+      let evs=null;
+      try{
+        const j=await (await fetch("/api/mission/report")).json();
+        if(j && Array.isArray(j.events) && j.events.length) evs=j.events;
+      }catch(e){ /* السيرفر لا يستجيب — نسقط إلى المعروض */ }
+      if(!evs) evs=lastEvents;
+      if(!evs || !evs.length){ btn.textContent="لا أحداث"; return; }
+      const t0=evs[0].t||0;
+      const body=evs.map(e=>
+        String(((e.t||0)-t0).toFixed(1)).padStart(7)+"ث  "+
+        (e.kind||"")+" — "+(e.msg||"")).join("\n");
+      await copyText("# سجل أحداث RMS Rover — "+new Date().toLocaleString()+
+        "\n# عدد الأحداث: "+evs.length+"\n\n"+body);
+      btn.textContent="✅ نُسخ "+evs.length;
+    }catch(e){
+      btn.textContent="⚠ تعذّر النسخ";
+    }finally{
+      btn.disabled=false;
+      setTimeout(()=>{btn.textContent=old;},2200);
+    }
   }
 
   // رسم CPM
@@ -591,6 +648,7 @@
     updateButtons();
   }
   $("calibSel").onchange=async()=>{if($("calibSel").value)await api("/api/calibration/select",{name:$("calibSel").value});updateButtons();};
+  $("btnCopyLog").onclick=copyLog;
   $("btnNewCalib").onclick=async()=>{await api("/api/calibration/new_sim");await loadCalib();};
   $("btnGyro").onclick=async()=>{
     $("rvBias").textContent="يقيس…";
