@@ -148,6 +148,23 @@ def main() -> int:
     check("فشل القراءة → احترس ولا تقف",
           speed_for_distance(None)["speed"] == SPEED_NO_READING
           and speed_for_distance(None)["rung"] == "no_reading")
+    # ⚠ الحارس الحاسم: الفحص أعلاه يفترض وصول None إلى طبقة السلامة، وهو ما
+    # لم يكن يحدث — المرشّح كان يُعيد آخر قيمة منعَّمة **إلى الأبد** بعد موت
+    # الحسّاس، فتُقرأ مسافة قديمة «طريق مفتوح» والروبوت أعمى (شوهد على
+    # العتاد: جودة 0% ومسافة 165.7سم معروضة).
+    from pi.sensors.ultrasonic import DistanceFilter
+    from pi.config import ULTRASONIC_MAX_STALE
+    _df = DistanceFilter()
+    for _ in range(6):
+        _df.feed(165.7)
+    _fresh = _df.value
+    for _ in range(ULTRASONIC_MAX_STALE):
+        _df.feed(None)
+    _stale = _df.value
+    _df.feed(120.0)
+    check("المسافة تُعلَن None بعد فشل متتابع (لا قيمة قديمة كأنها حيّة)",
+          _fresh is not None and _stale is None and _df.value is not None,
+          f"سليمة={_fresh} · بعد {ULTRASONIC_MAX_STALE} فشلاً={_stale} · تعافت={_df.value is not None}")
 
     # (5) الوسيط + تصفية القفزات
     check("وسيط 3 قراءات يلغي الشاذّة", median([10, 500, 12]) == 12,
