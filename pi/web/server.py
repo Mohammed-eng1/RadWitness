@@ -45,25 +45,82 @@ class RoverTestReq(BaseModel):
 
 _STATIC = Path(__file__).parent / "static"
 
+
+# ═══ إقلاع مُقاس: «يطول ولا يشتغل» يجب أن يصير سطراً معروفاً ══════
+# ⚠ كل الأنظمة الفرعية تُبنى **عند استيراد الوحدة**، أي قبل أن تطبع uvicorn
+#    حرفاً واحداً. فأي تعثّر (منفذ سيريال مشغول، ناقل I2C صامت، مكتبة ثقيلة)
+#    يظهر للمستخدم كشاشة سوداء بلا أي دليل على موضعه. هذه اللافتة تحوّل
+#    «يطول» إلى رقم بجانب اسم النظام الذي أخذ الوقت.
+_BOOT = []
+
+
+def _boot(label: str, factory):
+    """يبني نظاماً فرعياً ويطبع زمنه فوراً (flush) — لا يُسقط الإقلاع بفشله."""
+    t0 = time.time()
+    print(f"[إقلاع] {label} …", flush=True)
+    try:
+        obj = factory()
+        dt = time.time() - t0
+        _BOOT.append({"name": label, "seconds": round(dt, 2), "ok": True})
+        print(f"[إقلاع] {label}: تم في {dt:.2f}ث", flush=True)
+        return obj
+    except Exception as e:                     # noqa: BLE001
+        dt = time.time() - t0
+        _BOOT.append({"name": label, "seconds": round(dt, 2),
+                      "ok": False, "error": str(e)})
+        print(f"[إقلاع] {label}: ⚠ فشل بعد {dt:.2f}ث — {e}", flush=True)
+        raise
+
+
+_T_BOOT = time.time()
+
 # ── محرّك المحاكاة (الدفعة 2) ─────────────────────────────────────
-mission = MissionSim()
+# ⚠ MissionSim أولاً: جسره يفتح السيريال ويطلب **القارئ المشترك** للـBNO055،
+#    فيبقى `imu` أدناه نفس النسخة لا نسخة ثانية تتنازع الناقل.
+mission = _boot("جسر الروفر + مصدر الاتجاه (MissionSim)", MissionSim)
 calib_store = CalibrationStore()
 _active_calib = {"name": None}
 _sim_clients: set[WebSocket] = set()
 
 # ── الحساسات الحقيقية (M1 — تعمل على الراسبري، خاملة على ويندوز) ──
-geiger = GeigerReader()
-gps = GPSReader()
-imu = get_imu()          # ⚠ القارئ **المشترك**: مصدر الاتجاه يستخدم نفس النسخة
-camera = CameraReader()
+geiger = _boot("عدّاد جيجر (lgpio BCM17)", GeigerReader)
+gps = _boot("GPS", GPSReader)
+imu = _boot("BNO055 (القارئ المشترك)", get_imu)
+camera = _boot("الكاميرا (فتحها كسول)", CameraReader)
 rover = RoverBridge(mode="sim")
 # حساسات القرب الحقيقية + مصدر الإشعاع → محرّك المهمة (المرحلة 2)
-ultrasonic = UltrasonicReader()
-ir_sensors = IRReader()
+ultrasonic = _boot("ألترا سونيك", UltrasonicReader)
+ir_sensors = _boot("حسّاسا IR", IRReader)
 mission.set_proximity(ultrasonic, ir_sensors)
 mission.set_geiger(geiger)
 _sensor_clients: set[WebSocket] = set()
 _last_sensor_loop = time.time()
+
+
+def _boot_summary() -> dict:
+    """خلاصة الإقلاع: زمن كل نظام وحالته — تُطبع وتُعرض عبر /api/boot."""
+    return {
+        "total_s": round(time.time() - _T_BOOT, 2),
+        "steps": list(_BOOT),
+        "health": {
+            "geiger": {"ok": geiger.ok, "error": geiger.error},
+            "gps": {"ok": gps.ok, "error": gps.error},
+            "imu": {"ok": imu.ok, "error": imu.error,
+                    "bus": imu.bus_num, "addr": imu.addr,
+                    "driver": imu.driver, "mode": imu.mode_name},
+            "ultrasonic": {"ok": ultrasonic.ok, "error": ultrasonic.error},
+            "ir": {"ok": ir_sensors.ok, "error": ir_sensors.error},
+            "rover": {"mode": mission.rover.mode, "error": mission.rover.error,
+                      "heading_source": mission.rover.heading_source.name},
+        },
+    }
+
+
+print(f"[إقلاع] اكتمل تجهيز الأنظمة في "
+      f"{time.time() - _T_BOOT:.2f}ث — يبدأ uvicorn الآن", flush=True)
+for _k, _v in _boot_summary()["health"].items():
+    if _v.get("error"):
+        print(f"[إقلاع] ⚠ {_k}: {_v['error']}", flush=True)
 
 
 # ═══ حلقات الخلفية ═══════════════════════════════════════════════
@@ -171,6 +228,35 @@ async def sensors_page():
 @app.get("/api/platform")
 async def api_platform():
     return platform_banner()
+
+
+@app.get("/api/boot")
+async def api_boot():
+    """زمن إقلاع كل نظام فرعي وحالته — لتشخيص «السيرفر يطول ولا يشتغل»."""
+    return _boot_summary()
+
+
+@app.get("/api/imu/health")
+def api_imu_health():
+    """
+    حالة شريحة BNO055 كما تقرأها **هي** (CHIP_ID/OPR_MODE/SYS_STAT/SYS_ERR).
+    تفرّق بين «الحسّاس مفقود» و«عاد إلى CONFIG فيقرأ أصفاراً وهو حيّ».
+    """
+    return {"reader": imu.state(), "chip": imu.health(),
+            "heading_source": mission.rover.heading_source.state()}
+
+
+@app.post("/api/imu/recover")
+def api_imu_recover():
+    """إحياء يدوي للحسّاس + إعادة تسليح مصدر الاتجاه (زر «أعِد المحاولة»)."""
+    src = mission.rover.heading_source
+    src.reset_recovery_budget()        # طلب صريح من المستخدم → رصيد جديد
+    res = src.attempt_recovery()
+    mission._log("heading_recover",
+                 ("✅ أُحيي مصدر الاتجاه: " if res.get("recovered")
+                  else "⚠ تعذّر الإحياء: ") + str(res.get("detail")))
+    return {"ok": bool(res.get("recovered")), **res,
+            "heading_source": src.state()}
 
 
 @app.post("/api/room")

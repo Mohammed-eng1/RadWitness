@@ -25,12 +25,18 @@ imu.py — قارئ BNO055 (سائقان: smbus2 الافتراضي، Adafruit �
 
 ⚠ الوصول من خيطين (حلقة بثّ السيرفر + حلقة اللفّ/السير) على نفس الناقل
    يتشابك، فكل تعامل مع الحسّاس داخل قُفل واحد.
+
+⚠ **«صفر مضبوط» ليس دليل موت**: في وضع CONFIG تقرأ كل سجلات البيانات 0x00،
+   والشريحة تعود إلى CONFIG وحدها بعد أي إعادة تشغيل ذاتية (هبوط جهد لحظي
+   عند إقلاع المحركات). فقبل إعلان الوفاة **تُسأل الشريحة**: `health()` تقرأ
+   CHIP_ID/OPR_MODE/SYS_STAT/SYS_ERR، و`recover()` تعيد التهيئة إن كانت حاضرة.
 """
 from __future__ import annotations
 
 import math
 import struct
 import threading
+import time
 
 from pi.config import (
     BNO055_ADDR, BNO055_I2C_BUS, BNO055_NO_MAG_MODE, BNO055_GYRO_IN_RAD,
@@ -42,13 +48,26 @@ try:
 except Exception:                     # noqa: BLE001
     _SMBUS_OK = False
 
-try:
-    import board
-    import busio
-    import adafruit_bno055
-    _ADAFRUIT_OK = True
-except Exception:                     # noqa: BLE001
-    _ADAFRUIT_OK = False
+
+# ⚠ استيراد Adafruit **كسول**: مكتبة Blinka تفحص المنصة عند الاستيراد (قراءة
+# device-tree ومطابقة اللوحة) فتكلّف ثوانٍ في **كل إقلاع** — وهي هنا مسار
+# احتياطي لا يعمل أصلاً على عتادنا (busio مقيَّد بالناقل 1 والحسّاس على 4).
+# دفع ثمنها عند الاستيراد يعني تأخير بدء السيرفر مقابل لا شيء.
+_ADAFRUIT = None                      # None = لم تُجرَّب بعد، False = غير متاحة
+
+
+def _load_adafruit():
+    """يحمّل مكتبات Adafruit عند **أول حاجة فعلية** فقط. False عند غيابها."""
+    global _ADAFRUIT
+    if _ADAFRUIT is None:
+        try:
+            import board
+            import busio
+            import adafruit_bno055
+            _ADAFRUIT = (board, busio, adafruit_bno055)
+        except Exception:             # noqa: BLE001
+            _ADAFRUIT = False
+    return _ADAFRUIT
 
 
 # ═══ سائق 1: smbus2 مباشرة بالسجلات (الافتراضي — يقبل أي ناقل) ════
@@ -62,6 +81,8 @@ class _SMBusDriver:
     GYR_X_LSB = 0x14
     EUL_H_LSB = 0x1A
     CALIB_STAT = 0x35
+    SYS_STATUS = 0x39           # 0=خامل 1=خطأ 5=دمج يعمل 6=دمج متوقف
+    SYS_ERR = 0x3A              # 0 = بلا خطأ
     UNIT_SEL = 0x3B
     OPR_MODE = 0x3D
     SYS_TRIGGER = 0x3F
@@ -74,7 +95,6 @@ class _SMBusDriver:
     name = "smbus2"
 
     def __init__(self, bus_num: int, addr: int):
-        import time
         self.bus_num = int(bus_num)
         self.addr = int(addr)
         self._bus = SMBus(self.bus_num)
@@ -86,7 +106,14 @@ class _SMBusDriver:
                 pass
             raise OSError(f"CHIP_ID={hex(chip)} ≠ 0xA0 على i2c-{self.bus_num} "
                           f"@ {hex(self.addr)} — ليس BNO055")
-        # تهيئة: CONFIG ثم الوحدات ثم وضع التشغيل (تسلسل ورقة البيانات)
+        self._configure()
+
+    def _configure(self) -> None:
+        """
+        تسلسل التهيئة من ورقة البيانات: CONFIG ثم الوحدات ثم وضع التشغيل.
+        مفصول عن `__init__` لأن **`recover()` يعيده حرفياً** بعد أن تُعيد
+        الشريحة تشغيل نفسها — لا نسختين تفترقان مع الوقت.
+        """
         self._bus.write_byte_data(self.addr, self.OPR_MODE, self.MODE_CONFIG)
         time.sleep(0.03)
         self._bus.write_byte_data(self.addr, self.SYS_TRIGGER, 0x00)
@@ -97,12 +124,33 @@ class _SMBusDriver:
 
     def set_mode(self, no_mag: bool) -> tuple:
         """يضبط وضع التشغيل. يُعيد (اسم الوضع، هل يُستخدم المغنيتومتر)."""
-        import time
         mode = self.MODE_IMUPLUS if no_mag else self.MODE_NDOF
         self._bus.write_byte_data(self.addr, self.OPR_MODE, mode)
         time.sleep(0.05)
         return (("IMUPLUS (بلا مغنيتومتر)", False) if no_mag
                 else ("NDOF", True))
+
+    # ── تشخيص الشريحة نفسها (لا بيانات) ─────────────────────────
+    def health(self) -> dict:
+        """
+        لقطة **حالة الشريحة** تفرّق بين ثلاث حالات يخلطها «الجايرو يقرأ صفراً»:
+          • CHIP_ID ≠ 0xA0        → الشريحة غائبة عن الناقل (تغذية/أسلاك).
+          • OPR_MODE == 0 (CONFIG) → حاضرة لكنها أعادت تشغيل نفسها؛ في CONFIG
+                                     **كل سجلات البيانات تقرأ 0x00** فيبدو
+                                     الجايرو ميتاً وهو حيّ → قابلة للإحياء.
+          • وضع تشغيل سليم وصفر    → عطل حقيقي؛ SYS_ERR يسمّيه.
+        """
+        return {
+            "chip_id": self._bus.read_byte_data(self.addr, self.CHIP_ID_REG),
+            "opr_mode": self._bus.read_byte_data(self.addr, self.OPR_MODE) & 0x0F,
+            "sys_stat": self._bus.read_byte_data(self.addr, self.SYS_STATUS),
+            "sys_err": self._bus.read_byte_data(self.addr, self.SYS_ERR),
+        }
+
+    def reinit(self, no_mag: bool) -> tuple:
+        """يعيد تسلسل التهيئة كاملاً (بعد إعادة تشغيل ذاتية للشريحة)."""
+        self._configure()
+        return self.set_mode(no_mag)
 
     @staticmethod
     def _s16(lo: int, hi: int) -> int:
@@ -134,17 +182,29 @@ class _AdafruitDriver:
     name = "adafruit"
 
     def __init__(self, addr: int):
+        libs = _load_adafruit()
+        if not libs:
+            raise OSError("مكتبات Adafruit غير مثبّتة")
+        board, busio, self._ada = libs
         self.addr = int(addr)
         i2c = busio.I2C(board.SCL, board.SDA)
-        self._s = adafruit_bno055.BNO055_I2C(i2c, address=self.addr)
+        self._s = self._ada.BNO055_I2C(i2c, address=self.addr)
         _ = self._s.calibration_status        # قراءة تحقق
         self.bus_num = 1                      # busio مقيَّد بالناقل 1
 
     def set_mode(self, no_mag: bool) -> tuple:
         if not no_mag:
             return ("NDOF", True)
-        self._s.mode = adafruit_bno055.IMUPLUS_MODE
+        self._s.mode = self._ada.IMUPLUS_MODE
         return ("IMUPLUS (بلا مغنيتومتر)", False)
+
+    def health(self) -> dict:
+        """المكتبة لا تكشف SYS_STAT/SYS_ERR — نُعيد ما تكشفه فقط، بلا تخمين."""
+        return {"chip_id": None, "opr_mode": int(self._s.mode),
+                "sys_stat": None, "sys_err": None}
+
+    def reinit(self, no_mag: bool) -> tuple:
+        return self.set_mode(no_mag)
 
     def gyro_z_dps(self):
         g = self._s.gyro
@@ -192,6 +252,9 @@ class IMUReader:
         self._heading = 0.0
         self._gyro_z_dps = 0.0
         self._cal = (0, 0, 0, 0)
+        self._no_mag = bool(no_mag_mode)
+        self.recoveries = 0           # مرات إحياء ناجحة (تُعرض في الواجهة)
+        self.last_recovery = None     # تفاصيل آخر محاولة إحياء
 
         attempts = []                 # (وصف المحاولة، سبب الفشل)
 
@@ -208,9 +271,9 @@ class IMUReader:
         else:
             attempts.append(("smbus2", "غير مثبّت (pip install smbus2)"))
 
-        # ── 2) Adafruit على الناقل 1 (احتياطي) ────────────────────
+        # ── 2) Adafruit على الناقل 1 (احتياطي — يُحمَّل الآن فقط) ──
         if not self.ok:
-            if _ADAFRUIT_OK:
+            if _load_adafruit():
                 for a in (addr, 0x28 if addr != 0x28 else 0x29):
                     try:
                         self._drv = _AdafruitDriver(a)
@@ -244,6 +307,79 @@ class IMUReader:
             self.mode_name = "NDOF (تعذّر التبديل)"
             self.mag_used = True
             self.error = f"تعذّر ضبط وضع IMUPLUS: {e}"
+
+    # ── تشخيص وإحياء (يُستدعيان من مصدر الاتجاه عند اشتباه الموت) ─
+    def health(self) -> dict:
+        """حالة الشريحة كما تقرأها هي — بلا تفسير ولا تخمين."""
+        if not self.ok or self._drv is None:
+            return {"ok": False, "reason": self.error or "الحسّاس غير مفتوح"}
+        try:
+            with self._lock:
+                h = self._drv.health()
+            h["ok"] = True
+            return h
+        except Exception as e:            # noqa: BLE001
+            return {"ok": False, "reason": f"تعذّرت قراءة حالة الشريحة: {e}"}
+
+    def recover(self) -> dict:
+        """
+        محاولة إحياء بعد «صفر مضبوط متتابع». **تسأل الشريحة أولاً** ثم تقرر:
+
+        | ما تقوله الشريحة | التشخيص | الإجراء |
+        |---|---|---|
+        | لا تردّ على الناقل | مفقودة (تغذية/أسلاك) | لا إحياء — عطل حقيقي |
+        | CHIP_ID ≠ 0xA0 | ليست BNO055 / ناقل خاطئ | لا إحياء |
+        | OPR_MODE = 0 (CONFIG) | أعادت تشغيل نفسها | **إعادة تهيئة** |
+        | وضع سليم + صفر | عطل داخلي | لا إحياء — يُبلَّغ بـSYS_ERR |
+
+        ⚠ لا تُعلن النجاح إلا بعد **قراءة تحقّق** بعد إعادة التهيئة: إعلان
+           الإحياء بمجرد نجاح الكتابة يعيدنا إلى نفس الفشل الصامت الذي نطارده.
+        يُعيد: {"recovered": bool, "detail": نص عربي مقروء, "health": {...}}
+        """
+        h = self.health()
+        if not h.get("ok"):
+            self.last_recovery = {"recovered": False, "detail": h.get("reason")}
+            return {"recovered": False, "detail": h.get("reason"), "health": h}
+
+        chip, mode = h.get("chip_id"), h.get("opr_mode")
+        if chip is not None and chip != _SMBusDriver.CHIP_ID_VAL:
+            detail = (f"الشريحة لا تردّ بهويتها (CHIP_ID={hex(chip)} ≠ 0xA0) — "
+                      f"مفقودة عن i2c-{self.bus_num} @ {hex(self.addr or 0)}: "
+                      f"افحص التغذية والأسلاك (i2cdetect -y {self.bus_num})")
+            self.last_recovery = {"recovered": False, "detail": detail}
+            return {"recovered": False, "detail": detail, "health": h}
+
+        if mode not in (None, _SMBusDriver.MODE_CONFIG):
+            detail = (f"الشريحة في وضع تشغيل سليم (OPR_MODE={hex(mode)}) ومع ذلك "
+                      f"الجايرو صفر مضبوط — SYS_STAT={h.get('sys_stat')} "
+                      f"SYS_ERR={h.get('sys_err')}: عطل داخلي لا تصلحه إعادة التهيئة")
+            self.last_recovery = {"recovered": False, "detail": detail}
+            return {"recovered": False, "detail": detail, "health": h}
+
+        # حاضرة وفي CONFIG (أو وضع مجهول) → أعِد التهيئة ثم **تحقّق**
+        try:
+            with self._lock:
+                self.mode_name, self.mag_used = self._drv.reinit(self._no_mag)
+                after = self._drv.health()
+                z = self._drv.gyro_z_dps()
+        except Exception as e:                # noqa: BLE001
+            detail = f"فشلت إعادة التهيئة: {e}"
+            self.last_recovery = {"recovered": False, "detail": detail}
+            return {"recovered": False, "detail": detail, "health": h}
+
+        back = after.get("opr_mode")
+        if back in (None, _SMBusDriver.MODE_CONFIG):
+            detail = (f"أُعيدت التهيئة لكن الشريحة بقيت في CONFIG "
+                      f"(OPR_MODE={back}) — لا تقبل وضع التشغيل")
+            self.last_recovery = {"recovered": False, "detail": detail}
+            return {"recovered": False, "detail": detail, "health": after}
+
+        self.recoveries += 1
+        detail = (f"عادت الشريحة إلى CONFIG (إعادة تشغيل ذاتية — الأرجح هبوط "
+                  f"جهد عند إقلاع المحركات) وأُعيدت تهيئتها إلى {self.mode_name}؛ "
+                  f"قراءة تحقّق gz={z}")
+        self.last_recovery = {"recovered": True, "detail": detail}
+        return {"recovered": True, "detail": detail, "health": after}
 
     # ── قراءة سريعة للاتجاه (تُستدعى من حلقات اللفّ ~50Hz) ────────
     def gyro_z_dps(self):
@@ -314,6 +450,10 @@ class IMUReader:
             # التي تستخدم المغنيتومتر فعلاً، وإلا كان إنذاراً كاذباً دائماً.
             "mag_warn": bool(self.mag_used and mag_c < 2),
             "gyro_ready": gyro_c >= 2,    # الجايرو هو ما يهمّ الاتجاه الآن
+            # إحياء الشريحة بعد عودتها إلى CONFIG — **يجب أن يكون مرئياً**:
+            # عدّاد يتصاعد يعني تغذية 3.3V تنهار مع كل إقلاع محركات.
+            "recoveries": self.recoveries,
+            "last_recovery": self.last_recovery,
         }
 
     def close(self) -> None:

@@ -25,7 +25,7 @@ from pi.config import (
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
-    MISSION_HARD_LIMIT_S,
+    MISSION_HARD_LIMIT_S, MISSION_STEP_RETRY_S, MISSION_MAX_CONSECUTIVE_FAILS,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator
@@ -444,7 +444,29 @@ class MissionSim:
         ينفّذ المسح على المحركات فعلياً. يعمل في خيط مستقل لأن كل خطوة
         تستغرق ثوانٍ (لفّ + تقدّم + توقّف قياس)، بينما تبقى حلقة البثّ حيّة.
         ⚠ ينتهي دائماً بـstop() مهما حدث.
+
+        ⚠⚠ **كل مسار `continue` هنا يمرّ بـ`_step_failed`** ⚠⚠
+        السبب مقاس (2026-08-01): مع عطل دائم في مصدر الاتجاه كانت اللفّة تفشل
+        في **صفر ثانية**، والحلقة تعيدها بلا أي تأخير — آلاف الدورات في
+        الثانية، كل واحدة تنبض المحركات لحظة (ارتجاف الروبوت في مكانه)، وتكتب
+        سطراً في السجل (40 حدثاً في 0.2ث)، وتلتهم المعالج فتتجمّد الواجهة.
+        حلقة بلا مخرج ليست «إعادة محاولة» — هي عطل ثانٍ فوق الأول.
         """
+        fails = 0                     # إخفاقات **متتابعة** بلا تقدّم فعلي
+
+        def _step_failed(reason: str) -> bool:
+            """تسجيل إخفاق خطوة + تهدئة إلزامية. True = المهمة يجب أن تتوقف."""
+            nonlocal fails
+            fails += 1
+            if fails >= MISSION_MAX_CONSECUTIVE_FAILS:
+                self._log("mission_abort",
+                          f"⛔ {fails} خطوات متتالية بلا تقدّم ({reason}) — "
+                          f"إيقاف المهمة بدل الدوران على الفراغ")
+                self.estop()
+                return True
+            time.sleep(MISSION_STEP_RETRY_S)
+            return False
+
         try:
             while self.state in (RUNNING, PAUSED):
                 if self.state == PAUSED:
@@ -463,6 +485,8 @@ class MissionSim:
                     self.grid.mark_unreachable(*target)
                     self.dirty.add(target)
                     self._log("unreachable", f"هدف غير قابل للوصول ({target[0]},{target[1]})")
+                    if _step_failed("لا مسار"):
+                        break
                     continue
                 self.planned_path = path
                 nxt = path[1]
@@ -481,6 +505,20 @@ class MissionSim:
                            else f"إجهاض ({t.get('aborted')})")
                     self._log("turn_failed",
                               f"فشل اللفّ نحو {target_heading:.0f}° — {why}")
+                    # ⚠ عطل مصدر الاتجاه ليس «خطوة فاشلة تُعاد»: بلا زاوية
+                    #    مقروءة لا توجد ملاحة أصلاً، والمحاولة التالية ستفشل
+                    #    بنفس السبب حتماً. وإشارة محور مقلوبة عطلُ تركيب لا
+                    #    يُصلحه التكرار. الاثنان **قاتلان للمهمة**: نتوقف
+                    #    بسبب صريح بدل حرث المكان.
+                    if t.get("aborted") in ("heading_source_fault", "sign_mismatch"):
+                        src = getattr(self.rover, "heading_source", None)
+                        self._log("mission_abort",
+                                  f"⛔ توقّفت المهمة — الملاحة بلا اتجاه مستحيلة: "
+                                  f"{getattr(src, 'error', None) or t.get('aborted')}")
+                        self.estop()
+                        break
+                    if _step_failed("فشل اللفّ"):
+                        break
                     continue
 
                 # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
@@ -535,8 +573,11 @@ class MissionSim:
                         self.grid.mark_unreachable(*target)
                         self.dirty.add(target)
                         self._log("unreachable", f"هدف محاصر ({target[0]},{target[1]})")
+                    if _step_failed("أُجهض التقدّم"):
+                        break
                     continue
 
+                fails = 0                  # تقدّمنا خلية فعلاً → صفّر العدّاد
                 self.current = nxt
                 self.trail.append(self.current)
                 self.mission_time_s += CELL_DWELL_S
@@ -759,7 +800,22 @@ class MissionSim:
         self.planned_path = []
 
     def _log(self, kind, msg):
-        self.events.append({"t": round(time.time(), 2), "kind": kind, "msg": msg})
+        """
+        ⚠ **يُضغط التكرار المتتابع** بدل تكديسه: الواجهة تعرض آخر 40 حدثاً،
+        فعطل واحد يتكرر ثلاثين مرة يمسح كل ما قبله — أي أن السجل كان يفقد
+        السبب **الأول** وهو بالضبط ما يُبحَث عنه عند التشخيص. سطر واحد بعدّاد
+        يحفظ المعلومتين معاً: ماذا حدث، وكم مرة.
+        """
+        now = round(time.time(), 2)
+        if self.events and self.events[-1]["kind"] == kind \
+                and self.events[-1].get("base") == msg:
+            e = self.events[-1]
+            e["n"] = e.get("n", 1) + 1
+            e["msg"] = f"{msg}  (تكرر ×{e['n']})"
+            e["t"] = now
+            return
+        self.events.append({"t": now, "kind": kind, "msg": msg,
+                            "base": msg, "n": 1})
         if len(self.events) > 300:
             self.events = self.events[-300:]
 

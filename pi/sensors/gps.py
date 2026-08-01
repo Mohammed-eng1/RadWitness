@@ -4,11 +4,18 @@ gps.py — قارئ GPS (منقول من pi/tests/test_gps.py المثبت)
 =========================================================
 pyserial + pynmea2 على /dev/serial0. القراءة في خيط خلفي (readline حاجب)
 يحدّث حالة مشتركة؛ state() لقطة غير حاجبة لحلقة السيرفر.
+
+⚠ **لا يُفتح على منفذ الروفر** (docs/wiring.md §«تعارض UART»): قارئان على
+   نفس الـUART يتخاطفان الأسطر — خيط الـGPS هنا يقرأ ردود الروفر ويرميها
+   (ليست NMEA) فتضيع على الجسر، وهو التفسير المباشر لاختفاء حقل الجهد `v`
+   من T=130 الذي عُطّلت بسببه مراقبة البطارية. الأولوية للروفر: هو طبقة
+   سلامة، والـGPS بلا فائدة داخل المباني أصلاً.
 """
+import os
 import threading
 import time
 
-from pi.config import GPS_PORT, GPS_BAUD
+from pi.config import GPS_PORT, GPS_BAUD, ROVER_PORT, ROVER_MODE
 
 try:
     import serial
@@ -16,6 +23,14 @@ try:
     _GPS_LIBS_OK = True
 except Exception:                     # noqa: BLE001
     _GPS_LIBS_OK = False
+
+
+def _same_device(a: str, b: str) -> bool:
+    """هل المساران لنفس جهاز TTY فعلياً؟ (يفكّ الوصلات الرمزية)."""
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:                 # noqa: BLE001
+        return a == b
 
 
 class GPSReader:
@@ -34,6 +49,16 @@ class GPSReader:
 
         if not _GPS_LIBS_OK:
             self.error = "pyserial/pynmea2 غير مثبّت"
+            return
+        # ⚠ التعارض يُفحص **قبل** الفتح: بعده يكون الضرر وقع (خيط يقرأ ويبتلع).
+        # يُقارَن المسار الحقيقي لا النصّي — /dev/serial0 وصلة رمزية إلى
+        # ttyAMA0/ttyS0، فمقارنة الأسماء وحدها تفوّت التعارض نفسه.
+        if ROVER_MODE == "real" and _same_device(port, ROVER_PORT):
+            self.error = (f"⛔ معطَّل: {port} هو منفذ الروفر نفسه (تعارض UART "
+                          f"موثّق في docs/wiring.md). قارئان على منفذ واحد "
+                          f"يتخاطفان ردود الروفر (T:1001/1002) فتضيع قراءة "
+                          f"الجهد. الحل: محوّل USB-Serial ثم "
+                          f"RMS_GPS_PORT=/dev/ttyUSB0")
             return
         try:
             self._ser = serial.Serial(port, baud, timeout=1.0)

@@ -190,8 +190,19 @@ class WaveRoverBridge:
         return self.heading_source.bias_info
 
     def _event(self, kind: str, msg: str) -> None:
-        """يسجّل حدثاً يُصرَّف إلى سجل أحداث الواجهة (البند 3)."""
-        self.events.append({"kind": kind, "msg": msg})
+        """
+        يسجّل حدثاً يُصرَّف إلى سجل أحداث الواجهة (البند 3).
+        ⚠ **يُضغط التكرار**: عطل واحد مستمر كان يكتب عشرات الأسطر المتطابقة في
+           أجزاء الثانية فيدفن كل ما قبله في نافذة الأحداث الأربعين — أي أن
+           الفيضان نفسه كان يُخفي السبب الأول الذي نبحث عنه.
+        """
+        if self.events and self.events[-1]["kind"] == kind \
+                and self.events[-1].get("base") == msg:
+            e = self.events[-1]
+            e["n"] = e.get("n", 1) + 1
+            e["msg"] = f"{msg}  (تكرر ×{e['n']})"
+            return
+        self.events.append({"kind": kind, "msg": msg, "base": msg, "n": 1})
         if len(self.events) > 100:
             self.events = self.events[-100:]
 
@@ -386,6 +397,24 @@ class WaveRoverBridge:
         sign_mismatch = False
         want = 1.0 if degrees >= 0 else -1.0
         direction = "R" if degrees >= 0 else "L"
+
+        # ⚠⚠ **لا تُشغَّل المحركات ومصدر الاتجاه معطّل** ⚠⚠
+        # اللفّ بلا زاوية مقروءة لفّ أعمى، والأسوأ أن حلقة المهمة كانت تعيد
+        # المحاولة فوراً: كل محاولة تُشغّل المحركات لحظة ثم توقفها عند أول
+        # `update()` فاشل، فيرتجف الروبوت في مكانه بمعدل مئات النبضات في
+        # الثانية (شوهد على العتاد مع 40 حدثاً في 0.2ث). الفحص هنا — قبل أي
+        # أمر حركة — يجعل الإجهاض **بلا حركة إطلاقاً**.
+        if not self.heading_source.ok:
+            rec = self.heading_source.attempt_recovery()
+            if rec.get("recovered"):
+                self._event("heading_recovered",
+                            f"✅ أُحيي مصدر الاتجاه: {rec.get('detail')}")
+            else:
+                self._event("heading_fault",
+                            f"⚠ لفّ مرفوض — مصدر الاتجاه معطّل: "
+                            f"{self.heading_source.error}")
+                return {"turned": 0.0, "timed_out": False,
+                        "sign_mismatch": False, "source_ok": False}
         try:
             # ⚠ طور «اللفّ»: يوسّع عتبة القفزة (40–60°/ث دوران طبيعي لا ضجيج)
             #    ويخفّف التنعيم. بعتبة طور السير كانت كل قراءة تُرفض والزاوية
@@ -431,6 +460,18 @@ class WaveRoverBridge:
         بينها — لفّة 360° متواصلة تفشل على العتاد (تُنهك البطارية فتتوقف عند
         ~195°). المهلة (8ث) **لكل مرحلة** لا للفّة كاملة.
         """
+        # ⚠ الترتيب مقصود: **صحّة المصدر قبل المعايرة**. معايرة الانحياز تدور
+        #   GYRO_BIAS_CALIB_S كاملة (4-5ث) وهي تقرأ أصفاراً من حسّاس معطّل، ثم
+        #   تُرفض حتماً — فكل لفّة تدفع خمس ثوانٍ ثمناً لنتيجة معروفة سلفاً.
+        if not self.heading_source.ok:
+            rec = self.heading_source.attempt_recovery()
+            if not rec.get("recovered"):
+                self._event("heading_fault",
+                            f"⚠ لفّ مرفوض — مصدر الاتجاه معطّل: "
+                            f"{self.heading_source.error}")
+                return {"requested_deg": degrees, "turned_deg": 0.0,
+                        "timed_out": False, "aborted": "heading_source_fault",
+                        "heading": round(self.heading, 1), "segments": 0}
         if not self.bias_calibrated:
             self.calibrate_gyro_bias()
         sign = 1.0 if degrees >= 0 else -1.0
