@@ -22,7 +22,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
+from pi.config import (
+    WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
+)
+from pi.rover import battery as batt
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
 from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
@@ -339,11 +342,24 @@ async def api_rover_mode(req: Request):
     if mode not in ("sim", "real"):
         return JSONResponse({"ok": False, "error": "الوضع يجب أن يكون sim أو real"},
                             status_code=400)
+    # ⚠⚠ **لا تبديل والمهمة جارية** ⚠⚠
+    # `close()` يقفل منفذ السيريال بينما خيط المحركات يكتب عليه، فيموت بـ
+    # `write failed: [Errno 9] Bad file descriptor` وسط الحركة (شوهد على
+    # العتاد 2026-08-01). والأسوأ أن `DriveExecutor` يحتفظ بمرجع **الجسر
+    # القديم** فيظل يكتب على منفذ مغلق حتى لو نجح التبديل.
+    if mission.state in ("running", "paused") or (
+            mission._worker is not None and mission._worker.is_alive()):
+        return JSONResponse(
+            {"ok": False, "rover_mode": mission.rover.mode,
+             "error": "المهمة جارية — أوقفها (إيقاف طوارئ) قبل تبديل وضع "
+                      "الروفر. التبديل يقفل منفذ السيريال تحت خيط المحركات."},
+            status_code=409)
     try:
         mission.rover.close()
     except Exception:                          # noqa: BLE001
         pass
     mission.rover = WaveRoverBridge(mode=mode)
+    mission.executor = None        # المنفّذ يحمل مرجع الجسر القديم — أبطِله
     if mission.rover.mode != "real":
         mission.drive_motors = False   # لا تُبقِ قيادة محركات على جسر sim
     mission._log("rover_mode",
@@ -385,6 +401,28 @@ def api_rover_test(body: RoverTestReq):
     except Exception as e:                      # noqa: BLE001
         rv.stop()                               # ⚠ أي استثناء → إيقاف
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/rover/status")
+def api_rover_status():
+    """
+    ردّ `T=130` **خاماً** + الجهد إن وُجد.
+
+    ⚠ الغرض تشخيصي محدّد: حقل الجهد `v` اختفى سابقاً فعُطّلت مراقبة البطارية
+       كلها (`BATTERY_MONITOR_ENABLED=False`) واستُبدلت بحدّ زمني خام. والسبب
+       المرجّح كان **خيط الـGPS يبتلع ردود الروفر** على `/dev/serial0` — وقد
+       فُصل المنفذان الآن. هذا المنفذ يقول هل عاد `v` فعلاً.
+    """
+    st = mission.rover.read_status()
+    v = mission.rover.voltage()
+    return {
+        "raw": st, "voltage": v, "mode": mission.rover.mode,
+        "battery_monitor_enabled": BATTERY_MONITOR_ENABLED,
+        "battery": batt.classify(v) if v is not None else batt.classify(None),
+        "hint": ("✅ الجهد يُقرأ — يمكن إعادة تفعيل BATTERY_MONITOR_ENABLED"
+                 if v is not None else
+                 "⚠ لا حقل v في ردّ T=130 — الحماية تبقى زمنية"),
+    }
 
 
 @app.get("/api/sensors/check")

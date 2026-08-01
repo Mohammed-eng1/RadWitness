@@ -139,6 +139,18 @@ class MissionSim:
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
+        # ⚠ **أوقف أي مهمة جارية أولاً**: إعادة تعريف الغرفة تستبدل الشبكة
+        #   تحت خيط المحركات، فيواصل الخيط القديم قيادة الروبوت على خريطة لم
+        #   تعد موجودة ويكتب أحداثه في سجل صُفّر للتوّ — فتظهر أحداثه وكأنها
+        #   سبقت بدء المهمة الجديدة (شوهد: turn_failed قبل mission_start).
+        if self.state in (RUNNING, PAUSED) or (
+                self._worker is not None and self._worker.is_alive()):
+            self.estop()
+            w = self._worker
+            if w is not None and w is not threading.current_thread():
+                w.join(timeout=3.0)
+            self._worker = None
+        self.rover.stop()
         self.room = Room(length_m=float(length_m), width_m=float(width_m),
                          start_corner=start_corner, scan_spacing_m=float(scan_spacing_m))
         self.grid = OccupancyGrid(self.room)
@@ -501,8 +513,9 @@ class MissionSim:
                     self.dr.turn(turned)
                     self.heading = self.dr.heading
                 if not t["ok"]:
-                    why = ("مهلة اللفّ" if t.get("timed_out")
-                           else f"إجهاض ({t.get('aborted')})")
+                    # الرقم المُنجَز جزء من التشخيص: 70° ثم تعثّر ≠ لم يدر أصلاً
+                    why = (f"مهلة اللفّ (أنجز {turned:+.1f}°)"
+                           if t.get("timed_out") else f"إجهاض ({t.get('aborted')})")
                     self._log("turn_failed",
                               f"فشل اللفّ نحو {target_heading:.0f}° — {why}")
                     # ⚠ عطل مصدر الاتجاه ليس «خطوة فاشلة تُعاد»: بلا زاوية

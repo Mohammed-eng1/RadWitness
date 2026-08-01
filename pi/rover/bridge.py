@@ -38,7 +38,7 @@ from pi.config import (
     TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
     TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
     TURN_COAST_TAU_S, TURN_COAST_TAU_ALPHA, TURN_COAST_TAU_MAX_S,
-    TURN_MAX_LEAD_DEG,
+    TURN_MAX_LEAD_DEG, TURN_MIN_ACHIEVABLE_DEG,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
@@ -531,6 +531,22 @@ class WaveRoverBridge:
             turned += coast
             self._learn_coast_tau(rate_at_cut, coast)
             self.heading_source.set_phase("drive")
+        # ⚠ «مهلة اللفّ» وحدها تشخيص فقير: لفّة أنجزت 70° ثم تعثّرت ≠ لفّة
+        #    **لم تدر أصلاً**. الثانية تعني أن الأوامر تُرسل والروبوت لا
+        #    يستجيب — وأشيع أسبابها بترتيب الاحتمال:
+        #      • بطارية منهكة: الدوران بالمكان أثقل مناورة (أربعة محركات +
+        #        احتكاك جانبي) فهو أول ما يسقط، بينما يبقى السير ممكناً.
+        #      • عائق مادي يمنع الدوران، أو عجلة عالقة.
+        #      • الأوامر لا تصل الفيرموير (منفذ/أسلاك).
+        #    ⚠ مراقبة الجهد معطّلة، فلا شيء يكشف الأول تلقائياً — لذلك تُسمّى
+        #      الاحتمالات في الرسالة بدل تركها «مهلة».
+        if timed_out and abs(turned) < TURN_MIN_ACHIEVABLE_DEG:
+            self._event("turn_no_rotation",
+                        f"⚠ اللفّ لم يبدأ أصلاً: أُمرت المحركات {timeout:.0f}ث "
+                        f"ودار الروبوت {turned:+.1f}° فقط (من {degrees:+.0f}°). "
+                        f"الأرجح **بطارية منهكة** — الدوران بالمكان أثقل مناورة "
+                        f"وأول ما يسقط بينما يبقى السير ممكناً. تحقّق أيضاً من "
+                        f"عائق يمنع الدوران أو عجلة عالقة.")
         return {"turned": turned, "timed_out": timed_out,
                 "sign_mismatch": sign_mismatch, "coast": coast,
                 "rate_at_cut": rate_at_cut, "coast_tau": self._coast_tau,
