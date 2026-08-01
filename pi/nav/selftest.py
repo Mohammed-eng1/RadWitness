@@ -368,9 +368,9 @@ def main() -> int:
     #    **198°/ث** بينما العتبة كانت 200 — أي 99% منها. فوق العتبة يُعيد
     #    المرشّح صفراً لا القراءة، فيتجمّد التكامل في أسرع لحظة من اللفّة.
     #    العتبة يجب أن تسبق أسرع دوران ممكن بهامش، لا أن تلامسه.
-    check("عتبة اللفّ تسبق أسرع دوران مقاس (198°/ث) بهامش ≥2×",
-          HEADING_SPIKE_DPS_TURN >= 2.0 * 198.0,
-          f"{HEADING_SPIKE_DPS_TURN:.0f}°/ث مقابل 198°/ث مقاسة")
+    check("عتبة اللفّ تسبق أسرع دوران مقاس (221°/ث) بهامش ≥2×",
+          HEADING_SPIKE_DPS_TURN >= 2.0 * 221.0,
+          f"{HEADING_SPIKE_DPS_TURN:.0f}°/ث مقابل 221°/ث مقاسة")
 
     # BNO055 (جايرو): تكامل بمعامل الحسّاس + إشارة المحور
     hs = BNO055GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=+1)
@@ -871,6 +871,7 @@ def main() -> int:
     )
     from pi.config import (
         VISUAL_MIN_CONTRAST, VISUAL_MAX_CORRECTION_DEG, CAMERA_HFOV_DEG,
+        VISUAL_YAW_SIGN,
     )
 
     _rng = _np.random.default_rng(7)
@@ -977,8 +978,11 @@ def main() -> int:
     check("انحراف بصري فوق السقف يُرفض (مطابقة خاطئة أخطر من غيابها)",
           not big["ok"] and str(VISUAL_MAX_CORRECTION_DEG) in big["reason"],
           big["reason"][:56])
-    check("العلم مطفأ افتراضياً حتى يُقاس HFOV على العتاد",
-          CAMERA_HFOV_DEG == 0.0 and not VisualHeading(cam).ready)
+    # ✅ مقاس ومُتحقَّق منه على العتاد: الجايرو −43.4° مقابل الكاميرا −44.5°
+    #    في لفّة مستقلة — مصدران لا يشتركان في شيء اتفقا ضمن 1.1°.
+    check("HFOV مقاس على العتاد وداخل المدى المعقول لويب كام",
+          30.0 <= CAMERA_HFOV_DEG <= 120.0 and VisualHeading(cam).ready,
+          f"{CAMERA_HFOV_DEG}° · إشارة {VISUAL_YAW_SIGN:+d}")
 
     # الخلاصة
     passed = sum(_results)
