@@ -26,7 +26,7 @@ from pi.config import (
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
     MISSION_HARD_LIMIT_S, MISSION_STEP_RETRY_S, MISSION_MAX_CONSECUTIVE_FAILS,
-    TURN_NO_ROTATION_LIMIT, VISUAL_HEADING_ENABLED,
+    TURN_NO_ROTATION_LIMIT,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator
@@ -136,8 +136,6 @@ class MissionSim:
         self.ultrasonic = None
         self.ir = None
         self.geiger = None
-        self.camera = None
-        self.visual = None       # مرجع الاتجاه البصري (يُحقن بـset_camera)
         self.locator = None      # يُنشأ عند configure_room
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
@@ -387,24 +385,6 @@ class MissionSim:
     def set_geiger(self, geiger=None):
         self.geiger = geiger
 
-    def set_camera(self, camera=None):
-        """
-        يحقن الكاميرا فيُبنى مرجع الاتجاه البصري (البند 1 — كاسر التراكم).
-        ⚠ يبقى `None` إن كان العلم مطفأً أو `CAMERA_HFOV_DEG` غير مقاس —
-           فالوحدة ترفض إخراج درجات من رقم مخترع، والملاحة تكمل بالجايرو.
-        """
-        self.camera = camera
-        self.visual = None
-        if not VISUAL_HEADING_ENABLED or camera is None:
-            return
-        try:
-            from pi.sensors.visual_heading import VisualHeading
-            vh = VisualHeading(camera)
-            self.visual = vh
-            if vh.error:
-                self._log("visual_heading", f"⚠ الاتجاه البصري معطّل: {vh.error}")
-        except Exception as e:                 # noqa: BLE001
-            self._log("visual_heading", f"⚠ تعذّر بناء الاتجاه البصري: {e}")
 
     def set_drive_motors(self, enabled: bool, allow_sim: bool = False) -> dict:
         """
@@ -586,19 +566,6 @@ class MissionSim:
                 #   أثناء السير — تصحيح سلس بمتحكّم معاير وبلا قصور ذاتي.
                 head_err = _ang_signed(self.heading, target_heading)
 
-                # ── مرجع بصري مطلق: يكسر تراكم انحراف الجايرو ──────────
-                # ⚠ **استشاري لا آمر** (§5): يقترح خطأً يغلقه تثبيت الاتجاه
-                #   أثناء السير، ولا يقود محركاً ولا يوقف مهمة. `ok=False`
-                #   (مشهد بلا معالم، نمط متكرّر، لا مرساة) يكمل بالجايرو.
-                if self.visual is not None and self.visual.ready:
-                    v = self.visual.residual_deg(target_heading)
-                    if v.get("ok"):
-                        head_err = -float(v["deg"])
-                        if abs(v["deg"]) > 1.0:
-                            self._log("visual_heading",
-                                      f"📷 مرجع بصري: انحراف {v['deg']:+.1f}° عن "
-                                      f"مرساة {v['anchor']}° (تطابق {v['peak']}) "
-                                      f"— يُصحَّح أثناء الشوط")
 
                 # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
                 tx, ty = self.grid.cell_center(*nxt)
@@ -620,13 +587,6 @@ class MissionSim:
                     self.heading = (target_heading - fe) % 360.0
                     if self.dr:
                         self.dr.set_pose(self.dr.x, self.dr.y, self.heading)
-                # مرساة الاتجاه تُثبَّت **أول مرة فقط** عند كل اتجاه شبكي:
-                # تحديثها كل زيارة يجعلها تنجرف مع الجايرو الذي وُجدت لتصحيحه.
-                if self.visual is not None and self.visual.ready \
-                        and abs(fe or 0.0) < 2.0:
-                    if self.visual.set_anchor(target_heading):
-                        self._log("visual_heading",
-                                  f"📷 ثُبّتت مرساة الاتجاه {target_heading:.0f}°")
                 if hh.get("base_capped") and not self._base_cap_logged:
                     self._base_cap_logged = True     # مرة واحدة لا كل خلية
                     want, got = hh["base_capped"]
