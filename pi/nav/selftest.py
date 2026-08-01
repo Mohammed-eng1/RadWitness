@@ -903,6 +903,24 @@ def main() -> int:
     check("جدار أملس بلا معالم → «لا أعرف» لا رقم واثق",
           not c_blank["ok"] and "معالم" in c_blank["reason"], c_blank["reason"])
 
+    # ⚠ انحدار مقاس على العتاد: مشهد **سليم تماماً** كان يُرفض «نمطاً متكرّراً»
+    #   لأن جوار استبعاد الذروة كان ثابتاً (±3 بكسل) بينما الارتباط الذاتي
+    #   لمشهد طبيعي منعَّم عريض — فعند ±4 بكسل يبقى ~0.98. (سُجّل: تباين 36.3
+    #   وارتباط 1.00 وإزاحة 0.00 رُفض بحدّة 0.02 — أي رُفض أفضل مشهد ممكن.)
+    #   الفصّ الرئيسي يُحدَّد بالنزول من الذروة، لا بجوار ثابت.
+    natural = _np.repeat(
+        _np.convolve(_rng.normal(128, 40, W + 20), _np.ones(21) / 21,
+                     mode="valid")[:W][None, :].astype(_np.float32), H, axis=0)
+    nat_sig = column_signature(natural)
+    c_same = compare(nat_sig, column_signature(natural.copy()), 60.0)
+    check("مشهد طبيعي مقابل نفسه يُقبل (لا يُرفض كنمط متكرّر)",
+          c_same["ok"] and abs(c_same["deg"]) < 0.5,
+          f"حدّة={c_same.get('margin')} · إزاحة={c_same.get('shift_px')} بكسل")
+    m_nat = match_shift(nat_sig, column_signature(_np.roll(natural, 6, axis=1)))
+    check("الفصّ الرئيسي أعرض من ±3 بكسل (سبب الرفض الكاذب)",
+          (m_nat["lobe"][1] - m_nat["lobe"][0] + 1) > 7,
+          f"عرض الفصّ={m_nat['lobe'][1] - m_nat['lobe'][0] + 1} خطوة")
+
     # نمط دوري (بلاط/ستائر/أرفف): ذرى متساوية عند إزاحات مختلفة
     per = _np.tile(_np.array([0, 0, 0, 0, 255, 255, 255, 255], dtype=_np.float32),
                    W // 8)
