@@ -582,6 +582,7 @@ class WaveRoverBridge:
             #    ويخفّف التنعيم. بعتبة طور السير كانت كل قراءة تُرفض والزاوية
             #    المتكاملة تبقى صفراً فيلفّ الروبوت حتى المهلة.
             self.heading_source.set_phase("turn")
+            spikes0 = self.heading_source.cond.spikes
             self.turn(direction, power)
             start = time.time()
             self.heading_source.update()      # يثبّت مرجع الزمن/الزاوية
@@ -639,6 +640,20 @@ class WaveRoverBridge:
         #      • الأوامر لا تصل الفيرموير (منفذ/أسلاك).
         #    ⚠ مراقبة الجهد معطّلة، فلا شيء يكشف الأول تلقائياً — لذلك تُسمّى
         #      الاحتمالات في الرسالة بدل تركها «مهلة».
+        # ⚠⚠ **القراءات المرفوضة كقفزة لا تُبتلع صامتةً** ⚠⚠
+        # فوق عتبة الطور يُعيد المرشّح صفراً لا القراءة، فيتجمّد التكامل في
+        # أسرع لحظة من اللفّة: الروبوت يدور والجايرو لا يعدّ. والعرَض المميّز
+        # خبيث — لفّة تتجاوز هدفها فعلياً بينما البرمجية تظنّها ناقصة، أي نفس
+        # بصمة «معامل جايرو خاطئ» وهي ليست كذلك.
+        # مقاس على العتاد (2026-08-01): ذروة 198°/ث مقابل عتبة كانت 200.
+        spikes = self.heading_source.cond.spikes - spikes0
+        if spikes:
+            self._event("turn_spikes",
+                        f"⚠ رُفضت {spikes} قراءة كقفزة أثناء لفّة {degrees:+.0f}° "
+                        f"(ذروة {peak_rate:.0f}°/ث مقابل عتبة "
+                        f"{self.heading_source.cond.spike_dps:.0f}°/ث) — "
+                        f"التكامل يفقد جزءاً من الدوران. ارفع "
+                        f"HEADING_SPIKE_DPS_TURN.")
         no_rotation = (timed_out and not link_fault
                        and abs(turned) < TURN_MIN_ACHIEVABLE_DEG)
         if no_rotation:
@@ -652,7 +667,7 @@ class WaveRoverBridge:
                 "sign_mismatch": sign_mismatch, "coast": coast,
                 "rate_at_cut": rate_at_cut, "coast_tau": self._coast_tau,
                 "peak_rate": peak_rate, "link_fault": link_fault,
-                "no_rotation": no_rotation,
+                "no_rotation": no_rotation, "spikes": spikes,
                 "source_ok": self.heading_source.ok}
 
     def turn_by_angle(self, degrees: float,
@@ -696,12 +711,14 @@ class WaveRoverBridge:
         overshoot = 0.0
         corrections = 0
         peak = 0.0
+        spikes_total = 0
         no_rotation = False
         try:
             for i, seg in enumerate(segments):
                 r = self._turn_segment(seg, timeout, power)
                 turned_total += r["turned"]
                 peak = max(peak, r.get("peak_rate", 0.0))
+                spikes_total += r.get("spikes", 0)
                 no_rotation = no_rotation or r.get("no_rotation", False)
                 if r.get("link_fault"):
                     aborted = "rover_link_fault"
@@ -767,6 +784,7 @@ class WaveRoverBridge:
         #    كل update() — الجمع مرة ثانية يضاعف كل لفّة.
         return {"requested_deg": degrees, "turned_deg": round(turned_total, 1),
                 "peak_rate_dps": round(peak, 1), "no_rotation": no_rotation,
+                "spikes": spikes_total,
                 "timed_out": timed_out, "aborted": aborted,
                 "heading": round(self.heading, 1),
                 "segments": len(segments),

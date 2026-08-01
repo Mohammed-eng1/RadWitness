@@ -38,6 +38,7 @@ from pi.config import (
     CAMERA_HFOV_DEG, VISUAL_YAW_SIGN, TURN_POWER,
 )
 from pi.sensors.camera import CameraReader
+from pi.sensors.heading import PHASES
 from pi.sensors.visual_heading import (
     column_signature, signature_contrast, match_shift,
 )
@@ -190,21 +191,32 @@ def motor_probe(rover, seconds: float = 1.2) -> dict:
     print(f"  وصلة الروفر: mode={rover.mode} · link_ok={rover.link_ok}"
           + (f" · ⛔ {rover.link_error}" if rover.link_error else ""))
     src.set_phase("turn")
+    spikes0 = src.cond.spikes
     peak = 0.0
     total = 0.0
+    sent = (0.0, 0.0)
     t0 = time.time()
     try:
         while time.time() - t0 < seconds:
             rover.turn("R", TURN_POWER)       # أمر خام متجدّد (heartbeat)
-            d = src.update()
+            sent = rover._cmd_lr               # ⚠ تُلتقط **قبل** stop() وإلا
+            d = src.update()                   #    طبعنا أمر الإيقاف (0,0)
             peak = max(peak, abs(d.get("dps", 0.0)))
             total += d.get("delta", 0.0)
             time.sleep(0.02)
     finally:
         rover.stop()
         src.set_phase("drive")
-    print(f"  أُرسل L={rover._cmd_lr[0]:+.2f} R={rover._cmd_lr[1]:+.2f} · "
+    spikes = src.cond.spikes - spikes0
+    print(f"  أُرسل L={sent[0]:+.2f} R={sent[1]:+.2f} · "
           f"ذروة الدوران {peak:.1f}°/ث · تراكم {total:+.1f}°")
+    # ⚠ الحارس الذي كشف العطل: ذروة تلامس العتبة تعني قراءات تُرمى صامتةً
+    thr = PHASES["turn"][0]
+    if spikes or peak > 0.8 * thr:
+        print(f"  ⚠ عتبة رفض القفزة {thr:.0f}°/ث والذروة {peak:.0f}°/ث "
+              f"({100.0 * peak / thr:.0f}%) · رُفضت {spikes} قراءة")
+        print("     فوق العتبة يُعيد المرشّح صفراً لا القراءة ⇒ يتجمّد التكامل "
+              "في أسرع لحظة من اللفّة. ارفع HEADING_SPIKE_DPS_TURN.")
     ok = peak > 5.0
     if not ok:
         print("  ⛔ **لم يدر الروبوت بأمر خام**. الأوامر تُرسل (انظر L/R أعلاه)")
@@ -230,7 +242,13 @@ def calibrate(rover, cam, width: int) -> None:
     #    حركة وبين محركات دارت ولم تُنتج دوراناً. الفرق كله في هذه الحقول.
     print(f"  الحصيلة: أُجهض={t.get('aborted')} · مهلة={t.get('timed_out')} · "
           f"لا دوران={t.get('no_rotation')} · ذروة={t.get('peak_rate_dps')}°/ث · "
+          f"قفزات مرفوضة={t.get('spikes')} · تصحيحات={t.get('corrections')} · "
+          f"قصور={t.get('coast_deg')}° · τ={t.get('coast_tau_s')}ث · "
           f"مراحل={t.get('segments')} · استغرق {time.time() - t_start:.1f}ث")
+    if t.get("spikes"):
+        print("  ⚠ قراءات رُفضت كقفزة ⇒ الزاوية المقروءة **أقلّ من الحقيقية**، "
+              "فالمعايرة أدناه مبنية على مرجع ناقص. ارفع HEADING_SPIKE_DPS_TURN "
+              "وأعد التجربة قبل اعتماد الرقم.")
     if t.get("aborted"):
         print(f"  ⛔ اللفّة **أُجهضت برمجياً قبل الحركة**: {t['aborted']}")
         print(f"     مصدر الاتجاه: {rover.heading_source.error}")
@@ -260,6 +278,11 @@ def calibrate(rover, cam, width: int) -> None:
     err = cam_deg - g2
     print(f"  الجايرو: {g2:+.1f}°  ·  الكاميرا: {cam_deg:+.1f}°  ·  "
           f"الفرق: {err:+.1f}°")
+    print(f"  (مطابقات ضعيفة: {r2['weak']} · قفزات مرفوضة: "
+          f"{r2['turn'].get('spikes')} · ذروة {r2['turn'].get('peak_rate_dps')}°/ث)")
+    if r2["weak"] > 2:
+        print("  ⚠ مطابقات ضعيفة كثيرة: الدوران أسرع ممّا تلحقه الكاميرا "
+              "(ضبابية حركة + إزاحة ضخمة بين لقطتين). أعد بـ--power أقلّ.")
     if abs(err) <= 4.0:
         print("  ✅ المصدران متفقان — القياس موثوق.")
     else:
