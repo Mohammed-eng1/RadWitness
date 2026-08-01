@@ -754,6 +754,39 @@ def main() -> int:
     check("السير المستقيم يبقى على عتبته الضيّقة المعايرة (لا توسيع مجاني)",
           hh0.get("phase") == "drive", f"الطور={hh0.get('phase')}")
 
+    # ── «مهلة اللفّ» تُسمّى: هل تعثّر بعد 70° أم لم يدر أصلاً؟ ──────
+    class StuckBridge(WaveRoverBridge):
+        """روبوت تصل إليه الأوامر ولا يدور (بطارية منهكة / عجلة عالقة)."""
+        def read_imu(self):
+            d = super().read_imu()
+            d["gz"] = self._sim_bias        # لا دوران مهما أُمر
+            return d
+
+    stuck = StuckBridge(mode="sim")
+    stuck.calibrate_gyro_bias(seconds=0.3)
+    rst = stuck.turn_by_angle(90, timeout=1.0)
+    check("لفّ بلا دوران يُسمّى بوضوح لا «مهلة» مبهمة",
+          rst["timed_out"]
+          and any(e["kind"] == "turn_no_rotation" for e in stuck.events),
+          next((e["msg"][:70] for e in stuck.events
+                if e["kind"] == "turn_no_rotation"), "لا حدث"))
+
+    # ── إعادة تعريف الغرفة توقف خيط المحركات الجاري ────────────────
+    # ⚠ بدونه يواصل الخيط القديم قيادة الروبوت على شبكة استُبدلت تحته، ويكتب
+    #   أحداثه في سجل صُفّر للتوّ — فتظهر وكأنها **سبقت** بدء المهمة الجديدة
+    #   (شوهد على العتاد: turn_failed عند 1.9ث و mission_start عند 4.0ث).
+    ms4 = MissionSim()
+    ms4.configure_room(2.0, 2.0)
+    ms4.set_calibration(default_sim_profile())
+    ms4.set_drive_motors(True, allow_sim=True)
+    ms4.start()
+    ms4.configure_room(3.0, 2.0)              # إعادة تعريف والمهمة جارية
+    check("إعادة تعريف الغرفة توقف المهمة والخيط الجاري",
+          ms4.state == "idle"
+          and (ms4._worker is None or not ms4._worker.is_alive())
+          and not ms4.rover._moving,
+          f"الحالة={ms4.state} · محركات={ms4.rover._moving}")
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)
