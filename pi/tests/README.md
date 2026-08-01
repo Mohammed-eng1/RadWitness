@@ -21,7 +21,6 @@ source venv/bin/activate
 | `test_ir.py` | حساس عائق IR (اختبار مكتبي) | `python3 pi/tests/test_ir.py` | OUT=GPIO25 ⚠ **تغذية 3.3V** |
 | `calibrate_heading.py` | **معايرة الاتجاه** (انحياز/معامل/KP) — يحرّك المحركات في المرحلتين 2 و3 | `python3 -m pi.tests.calibrate_heading` | BNO055 I2C **0x29** + الروفر على `/dev/serial0` |
 | `check_imu_health.py` | **«الحسّاس ميت» أم عاد إلى CONFIG؟** يقرأ CHIP_ID/OPR_MODE/SYS_ERR ويحصي الصفر المضبوط | `python3 -m pi.tests.check_imu_health` (أضف `--motors` لإعادة إنتاج انهيار التغذية ⚠ يحرّك الروبوت) | BNO055 على i2c-**4** @ 0x29 |
-| `check_visual_heading.py` | **معايرة الاتجاه البصري**: جودة المشهد ثم قياس `CAMERA_HFOV_DEG` و`VISUAL_YAW_SIGN` | `python3 -m pi.tests.check_visual_heading` (أضف `--calibrate` ⚠ يلفّ الروبوت) | ويب كام + الروفر. ⚠ **أوقف السيرفر** (يمسك `/dev/video0`) |
 
 ملاحظات:
 - **الجيجر** يستخدم `lgpio` (بلا daemon — بديل pigpio المحذوف من Debian trixie).

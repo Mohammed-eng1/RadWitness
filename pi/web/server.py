@@ -95,9 +95,6 @@ ultrasonic = _boot("ألترا سونيك", UltrasonicReader)
 ir_sensors = _boot("حسّاسا IR", IRReader)
 mission.set_proximity(ultrasonic, ir_sensors)
 mission.set_geiger(geiger)
-# الاتجاه البصري: مرجع مطلق يكسر تراكم انحراف الجايرو. يبقى معطّلاً حتى
-# يُقاس CAMERA_HFOV_DEG ويُرفع VISUAL_HEADING_ENABLED (لا تخمين لرقم يُضرب).
-mission.set_camera(camera)
 _sensor_clients: set[WebSocket] = set()
 _last_sensor_loop = time.time()
 
