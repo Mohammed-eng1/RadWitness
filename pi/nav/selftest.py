@@ -787,6 +787,72 @@ def main() -> int:
           and not ms4.rover._moving,
           f"الحالة={ms4.state} · محركات={ms4.rover._moving}")
 
+    # ═══ (ن) وصلة الروفر + الحماية البديلة عن حسّاس الجهد ══════════
+    print("\nن) وصلة الروفر والحماية بلا حسّاس جهد:")
+    from pi.config import TURN_RATE_FADE_WARN, TURN_NO_ROTATION_LIMIT
+
+    # ⚠ الحارس الحاسم: منفذ ميت كان يجعل `finally: self.stop()` **نفسه** يرمي
+    #    استثناءً — فتضيع «الإيقاف المضمون» في اللحظة الوحيدة التي وُجدت لها،
+    #    ويطبع بايثون شلال استثناءات متداخلة يدفن السبب الأول (شوهد على العتاد).
+    class DeadPort:
+        closed = False
+        def write(self, _b):  raise OSError(9, "Bad file descriptor")   # noqa: E704
+        def close(self):      self.closed = True                        # noqa: E704
+
+    dead = WaveRoverBridge(mode="sim")
+    dead.mode, dead._ser = "real", DeadPort()      # منفذ يرفض كل كتابة
+    try:
+        dead.motors(0.4, -0.4)
+        dead.stop()
+        raised = False
+    except Exception:                              # noqa: BLE001
+        raised = True
+    check("منفذ ميت لا يرمي استثناءً — الإيقاف المضمون يبقى مضموناً",
+          not raised and not dead.link_ok, f"link_ok={dead.link_ok}")
+    check("انقطاع الوصلة يُعلَن حدثاً مقروءاً مرة واحدة",
+          sum(1 for e in dead.events if e["kind"] == "rover_link_fault") == 1,
+          next((e["msg"][:60] for e in dead.events
+                if e["kind"] == "rover_link_fault"), "لا حدث"))
+    rlink = dead.turn_by_angle(90, timeout=1.0)
+    check("اللفّ على وصلة ميتة يُجهض بسبب صريح لا بمهلة",
+          rlink["aborted"] == "rover_link_fault", str(rlink["aborted"]))
+
+    # ذروة معدل الدوران = مقياس شحن ضمني (لا فولتميتر على هذا العتاد)
+    class FadingBridge(WaveRoverBridge):
+        """بطارية تنهك: معدل الدوران المتاح ينزل لفّة بعد لفّة."""
+        gain = 1.0
+        def read_imu(self):
+            d = super().read_imu()
+            d["gz"] = round(d["gz"] * self.gain, 3)
+            return d
+
+    fade = FadingBridge(mode="sim")
+    fade.calibrate_gyro_bias(seconds=0.3)
+    fade.turn_by_angle(90, timeout=8.0)
+    base_peak = fade.turn_peak_baseline
+    fade.gain = 0.4                                # البطارية تنهك
+    fade.turn_by_angle(90, timeout=8.0)
+    check("ذروة الدوران تُقاس وتُتخذ مرجعاً (بديل حسّاس الجهد)",
+          base_peak and base_peak > 0, f"مرجع={base_peak:.0f}°/ث")
+    check("هبوط ذروة الدوران يُعلَن تحذير إنهاك بطارية",
+          any(e["kind"] == "turn_fade" for e in fade.events),
+          next((e["msg"][:64] for e in fade.events
+                if e["kind"] == "turn_fade"), f"عتبة={TURN_RATE_FADE_WARN}"))
+
+    # العجز الكامل عن اللفّ يُنهي المهمة (RTH يحتاج لفّاً أيضاً)
+    ms5 = MissionSim()
+    ms5.rover = StuckBridge(mode="sim")
+    ms5.configure_room(2.0, 2.0)
+    ms5.set_calibration(default_sim_profile())
+    ms5.set_drive_motors(True, allow_sim=True)
+    ms5.start()
+    ms5._worker.join(timeout=30.0)
+    check(f"{TURN_NO_ROTATION_LIMIT} لفّتان بلا دوران → إنهاء المهمة بسبب صريح",
+          ms5.state == "estop"
+          and any("اشحن البطارية" in e["msg"] for e in ms5.events),
+          next((e["msg"][:70] for e in ms5.events
+                if e["kind"] == "mission_abort"), f"الحالة={ms5.state}"))
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)

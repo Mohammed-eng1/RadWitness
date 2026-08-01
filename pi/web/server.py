@@ -25,7 +25,6 @@ from pydantic import BaseModel
 from pi.config import (
     WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
 )
-from pi.rover import battery as batt
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
 from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
@@ -406,22 +405,24 @@ def api_rover_test(body: RoverTestReq):
 @app.get("/api/rover/status")
 def api_rover_status():
     """
-    ردّ `T=130` **خاماً** + الجهد إن وُجد.
+    ردّ `T=130` **خاماً** (تشخيص وصلة السيريال والفيرموير).
 
-    ⚠ الغرض تشخيصي محدّد: حقل الجهد `v` اختفى سابقاً فعُطّلت مراقبة البطارية
-       كلها (`BATTERY_MONITOR_ENABLED=False`) واستُبدلت بحدّ زمني خام. والسبب
-       المرجّح كان **خيط الـGPS يبتلع ردود الروفر** على `/dev/serial0` — وقد
-       فُصل المنفذان الآن. هذا المنفذ يقول هل عاد `v` فعلاً.
+    ⛔ **لا حسّاس جهد على هذا العتاد** — الحقل `v` لا يصل والحسّاس معطّل. لا
+       تبنِ عليه شيئاً. الحماية من الاستنزاف قائمة على بديلين لا يحتاجان
+       فولتميتر: حدّ زمني، و**ذروة معدل الدوران** (الدوران بالمكان أثقل
+       مناورة فهو أول ما يسقط مع ضعف البطارية).
     """
     st = mission.rover.read_status()
-    v = mission.rover.voltage()
+    rv = mission.rover
     return {
-        "raw": st, "voltage": v, "mode": mission.rover.mode,
+        "raw": st, "mode": rv.mode,
+        "link_ok": rv.link_ok, "link_error": rv.link_error,
+        "voltage_sensor": "معطّل — لا قراءة جهد على هذا العتاد",
         "battery_monitor_enabled": BATTERY_MONITOR_ENABLED,
-        "battery": batt.classify(v) if v is not None else batt.classify(None),
-        "hint": ("✅ الجهد يُقرأ — يمكن إعادة تفعيل BATTERY_MONITOR_ENABLED"
-                 if v is not None else
-                 "⚠ لا حقل v في ردّ T=130 — الحماية تبقى زمنية"),
+        # الحماية البديلة الفعلية
+        "turn_peak_baseline_dps": rv.turn_peak_baseline,
+        "last_turn_peak_dps": rv.last_turn_peak,
+        "time_limit": mission.time_limit_info(),
     }
 
 

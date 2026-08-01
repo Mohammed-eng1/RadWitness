@@ -26,6 +26,7 @@ from pi.config import (
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
     MISSION_HARD_LIMIT_S, MISSION_STEP_RETRY_S, MISSION_MAX_CONSECUTIVE_FAILS,
+    TURN_NO_ROTATION_LIMIT,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator
@@ -465,6 +466,7 @@ class MissionSim:
         حلقة بلا مخرج ليست «إعادة محاولة» — هي عطل ثانٍ فوق الأول.
         """
         fails = 0                     # إخفاقات **متتابعة** بلا تقدّم فعلي
+        no_rot = 0                    # لفّات متتابعة لم يدر فيها الروبوت أصلاً
 
         def _step_failed(reason: str) -> bool:
             """تسجيل إخفاق خطوة + تهدئة إلزامية. True = المهمة يجب أن تتوقف."""
@@ -530,6 +532,29 @@ class MissionSim:
                                   f"{getattr(src, 'error', None) or t.get('aborted')}")
                         self.estop()
                         break
+                    # وصلة الروفر ميتة: لا أمر حركة يصل، فكل خطوة تالية عبث
+                    if t.get("aborted") == "rover_link_fault":
+                        self._log("mission_abort",
+                                  f"⛔ توقّفت المهمة — انقطع اتصال الروفر: "
+                                  f"{self.rover.link_error}")
+                        self.estop()
+                        break
+                    # ── العجز عن اللفّ = الحماية البديلة عن حسّاس الجهد ────
+                    # لا فولتميتر على هذا العتاد، والدوران بالمكان أثقل مناورة
+                    # فهو أول ما يسقط. لفّتان بلا دوران ⇒ لا مسح ولا حتى عودة
+                    # إجبارية (RTH يحتاج لفّاً أيضاً) — نتوقف بسبب صريح.
+                    if t.get("no_rotation"):
+                        no_rot += 1
+                        if no_rot >= TURN_NO_ROTATION_LIMIT:
+                            self._log("mission_abort",
+                                      f"⛔ توقّفت المهمة — {no_rot} لفّتان بلا "
+                                      f"دوران: المنصّة لم تعد تستطيع اللفّ. "
+                                      f"**اشحن البطارية** (لا حسّاس جهد يحذّر "
+                                      f"مسبقاً)، أو افحص عائقاً/عجلة عالقة.")
+                            self.estop()
+                            break
+                    else:
+                        no_rot = 0
                     if _step_failed("فشل اللفّ"):
                         break
                     continue
