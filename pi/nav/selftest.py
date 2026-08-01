@@ -326,8 +326,9 @@ def main() -> int:
     print("\nي) مصدر الاتجاه (البند 1) وتثبيته:")
     from pi.sensors.heading import (
         RateConditioner, HeadingSource, BNO055GyroHeading, BNO055FusionHeading,
-        make_heading_source, PHASES,
+        make_heading_source, PHASES, ZERO_RUN_DEAD,
     )
+    from pi.config import HEADING_RECOVERY_ATTEMPTS
     from pi.nav.heading_hold import (
         HeadingController, signed_error, available_headroom, config_sanity,
     )
@@ -535,6 +536,96 @@ def main() -> int:
     check("الجهد غير مقروء → لا يُعرض تصنيف كاذب",
           ms2.rover.check_battery()["level"] == "unknown"
           and ms2.state_dict()["battery"]["level"] == "unknown")
+
+    # ═══ (ل) عطل مصدر الاتجاه: إحياء، لا محركات، ولا حلقة لا نهائية ══
+    # عطل مقاس على العتاد (2026-08-01): مصدر الاتجاه أعلن الموت، فصار كل لفّ
+    # يفشل في صفر ثانية وتعيده حلقة المحركات فوراً — عشرات المحاولات في عُشر
+    # ثانية، كلٌّ تنبض المحركات لحظة (ارتجاف في المكان) وتكتب سطراً مكرّراً.
+    print("\nل) عطل مصدر الاتجاه — إحياء وحواجز:")
+
+    class ResettableIMU(FakeIMU):
+        """
+        يحاكي BNO055 عاد إلى وضع CONFIG: حاضر على الناقل ويردّ **صفراً
+        مضبوطاً** حتى تُعاد تهيئته، وبعدها يقرأ طبيعياً.
+        """
+        def __init__(self, recoverable=True):
+            super().__init__(rate=0.0)
+            self.recoverable = recoverable
+            self.reinits = 0
+
+        def recover(self):
+            if not self.recoverable:
+                return {"recovered": False,
+                        "detail": "CHIP_ID=0xff — الشريحة مفقودة عن الناقل"}
+            self.reinits += 1
+            self._r = 30.0                 # عادت الحياة بعد إعادة التهيئة
+            return {"recovered": True, "detail": "عادت إلى CONFIG وأُعيدت تهيئتها"}
+
+    live = ResettableIMU(recoverable=True)
+    hs_rec = BNO055GyroHeading(live, scale=1.0, sign=+1)
+    for _ in range(ZERO_RUN_DEAD + 2):
+        hs_rec.update()
+    check("صفر مضبوط + شريحة قابلة للإحياء → تُحيا ولا يُعلَن العطل",
+          hs_rec.ok and hs_rec.recoveries == 1 and live.reinits == 1,
+          f"إحياءات={hs_rec.recoveries} · ok={hs_rec.ok}")
+
+    gone = ResettableIMU(recoverable=False)
+    hs_dead = BNO055GyroHeading(gone, scale=1.0, sign=+1)
+    for _ in range(ZERO_RUN_DEAD * 8):
+        hs_dead.update()
+    check("شريحة غير قابلة للإحياء → عطل معلن **بحالتها المقروءة**",
+          not hs_dead.ok and "CHIP_ID" in (hs_dead.error or ""), hs_dead.error)
+    check("محاولات الإحياء محدودة (لا إغراق للناقل)",
+          hs_dead.recovery_attempts <= HEADING_RECOVERY_ATTEMPTS,
+          f"{hs_dead.recovery_attempts} ≤ {HEADING_RECOVERY_ATTEMPTS}")
+
+    # الحاجز الحاسم: **لا أمر حركة** ومصدر الاتجاه معطّل
+    class SpyBridge(WaveRoverBridge):
+        """
+        يعدّ أوامر المحركات **المُشغِّلة فقط** (قوة ≠ 0). أوامر الإيقاف
+        (0,0) لا تُعدّ: هي عكس ما نحرسه — الإيقاف المضمون مطلوب دائماً.
+        """
+        def motors(self, l, r):
+            if l or r:
+                self.motor_calls = getattr(self, "motor_calls", 0) + 1
+            return super().motors(l, r)
+
+    spy = SpyBridge(mode="sim", heading_source=hs_dead)
+    spy.motor_calls = 0
+    t0 = time.time()
+    rdead = spy.turn_by_angle(90, timeout=5.0)
+    check("لفّ ومصدر الاتجاه معطّل → إجهاض بلا أي أمر حركة",
+          rdead["aborted"] == "heading_source_fault" and spy.motor_calls == 0,
+          f"أوامر محركات={spy.motor_calls} · إجهاض={rdead['aborted']}")
+    check("لا معايرة انحياز 5ث على حسّاس معطّل (الإجهاض فوري)",
+          (time.time() - t0) < 1.0, f"{time.time() - t0:.2f}ث")
+
+    # الأحداث المتطابقة تُضغط بعدّاد بدل أن تدفن ما قبلها
+    for _ in range(5):
+        spy._event("heading_fault", "نفس الرسالة")
+    faults = [e for e in spy.events if e["kind"] == "heading_fault"
+              and e.get("base") == "نفس الرسالة"]
+    check("الأحداث المتطابقة تُضغط بعدّاد لا تُكدَّس",
+          len(faults) == 1 and faults[0]["n"] == 5, faults[0]["msg"])
+
+    # خيط المحركات: عطل الاتجاه يوقف المهمة بدل الدوران على الفراغ
+    ms3 = MissionSim()
+    ms3.rover = SpyBridge(mode="sim", heading_source=hs_dead)
+    ms3.rover.motor_calls = 0
+    ms3.configure_room(2.0, 2.0)
+    ms3.set_calibration(default_sim_profile())
+    ms3.set_drive_motors(True, allow_sim=True)
+    ms3.start()
+    ms3._worker.join(timeout=10.0)
+    aborts = [e for e in ms3.events if e["kind"] == "mission_abort"]
+    check("عطل الاتجاه يُنهي المهمة بسبب صريح (لا حلقة لا نهائية)",
+          ms3.state == "estop" and aborts and not ms3._worker.is_alive(),
+          aborts[0]["msg"][:60] if aborts else f"الحالة={ms3.state}")
+    check("لم تُشغَّل المحركات ولا مرة أثناء الإجهاض",
+          ms3.rover.motor_calls == 0, f"{ms3.rover.motor_calls} أمر")
+    turn_fails = [e for e in ms3.events if e["kind"] == "turn_failed"]
+    check("سطر فشل واحد لا عشرات (السجل يحفظ السبب الأول)",
+          len(turn_fails) <= 1, f"{len(turn_fails)} سطر")
 
     # الخلاصة
     passed = sum(_results)

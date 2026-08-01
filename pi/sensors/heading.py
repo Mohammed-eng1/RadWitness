@@ -26,6 +26,13 @@ heading.py — **مصدر الاتجاه خلف واجهة واحدة** (الب�
 ⚠ لا فشل صامت: مصدر لا يقرأ (حسّاس مفقود/ميت) يُعلن `ok=False` مع سبب مقروء،
    ويُصعِّد التبديل التلقائي إلى مصدر بديل مع تسجيل السبب — لا يُرجِع أصفاراً
    تبدو «اتجاهاً ثابتاً» (وهو ما جعل جايرو الروفر الميت يوهم بأن كل شيء سليم).
+
+⚠ **العطل ليس أبدياً**: كان `ok=False` طريقاً بلا رجعة — لحظة عابرة تقتل
+   الملاحة حتى إعادة تشغيل العملية. وسبب «الصفر المضبوط» الأشيع في BNO055 هو
+   عودة الشريحة إلى وضع CONFIG بعد إعادة تشغيل ذاتية (هبوط جهد عند إقلاع
+   المحركات)، وهي حالة تُصلَح في ~150ms. فقبل إعلان الوفاة يُستدعى
+   `attempt_recovery()` (محاولات محدودة بفاصل زمني)، والعطل يُعلَن **بحالة
+   الشريحة المقروءة** لا بتخمين.
 """
 from __future__ import annotations
 
@@ -39,6 +46,7 @@ from pi.config import (
     HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN,
     HEADING_LPF_ALPHA_DRIVE, HEADING_LPF_ALPHA_TURN,
     BNO055_READ_PERIOD_S,
+    HEADING_RECOVERY_ATTEMPTS, HEADING_RECOVERY_COOLDOWN_S,
 )
 
 # ── أطوار الحركة: عتبة القفزة والتنعيم يختلفان بينها (انظر config) ──
@@ -171,6 +179,10 @@ class HeadingSource:
         self._last_ts = None
         self._last_angle = None
         self.skipped_dt = 0           # قراءات أُسقطت لفجوة زمنية كبيرة
+        self.recoveries = 0           # مرات إحياء ناجحة للحسّاس
+        self.recovery_attempts = 0    # محاولات الإحياء (تُستنفد فيُعلَن العطل)
+        self.last_recovery = None
+        self._last_recovery_ts = 0.0
 
     # ── تُنفَّذ في المشتقات ──────────────────────────────────────
     def _read_rate_dps(self):
@@ -178,6 +190,69 @@ class HeadingSource:
 
     def _read_angle_deg(self):
         raise NotImplementedError
+
+    def _try_recover(self):
+        """
+        إحياء الحسّاس خلف هذا المصدر. المشتقات التي لا تملك حسّاساً قابلاً
+        للإحياء تتركها كما هي → `None` = «لا سبيل للإحياء».
+        """
+        return None
+
+    # ── الإحياء المحدود ─────────────────────────────────────────
+    def rearm(self) -> None:
+        """
+        يعيد تسليح المصدر بعد إحياء **مؤكَّد** للحسّاس. لا يُستدعى إلا من
+        `attempt_recovery` بعد قراءة تحقّق ناجحة — تسليحه بلا تحقّق يعيدنا
+        إلى التظاهر بالسلامة.
+        """
+        self.ok = True
+        self.error = None
+        self.stale_reads = 0
+        self._zero_run = 0
+        self.cond.reset()
+        self._last_ts = None          # لا تكامل على الفجوة الزمنية للإحياء
+        self._last_angle = None
+
+    def reset_recovery_budget(self) -> None:
+        """
+        يعيد رصيد محاولات الإحياء كاملاً — **بطلب صريح من المستخدم فقط**
+        (زرّ «أعِد المحاولة» بعد إصلاح التغذية مثلاً). تصفيره تلقائياً يحوّل
+        الحدّ إلى زينة ويعيد إغراق الناقل.
+        """
+        self.recovery_attempts = 0
+        self._last_recovery_ts = 0.0
+
+    def attempt_recovery(self) -> dict:
+        """
+        محاولة إحياء **محدودة العدد وبفاصل زمني**: الإغراق هنا يشلّ الناقل
+        ويطيل كل دورة تحكّم. النتيجة: {"recovered", "detail"}.
+        """
+        now = time.time()
+        if now - self._last_recovery_ts < HEADING_RECOVERY_COOLDOWN_S:
+            return {"recovered": False, "detail": "محاولة إحياء قريبة جداً — انتظار"}
+        if self.recovery_attempts >= HEADING_RECOVERY_ATTEMPTS:
+            return {"recovered": False,
+                    "detail": f"استُنفدت محاولات الإحياء ({HEADING_RECOVERY_ATTEMPTS})"}
+        self._last_recovery_ts = now
+        self.recovery_attempts += 1
+        res = self._try_recover()
+        if res is None:
+            return {"recovered": False, "detail": "لا سبيل لإحياء هذا المصدر"}
+        self.last_recovery = res
+        if res.get("recovered"):
+            self.recoveries += 1
+            self.recovery_attempts = 0        # نجح → أعِد الرصيد كاملاً
+            self.rearm()
+        return res
+
+    def _fault(self, reason: str) -> None:
+        """
+        يُعلن العطل **بعد** استنفاد الإحياء، ويضمّ تفصيل آخر محاولة إلى السبب
+        (حالة الشريحة المقروءة) — رسالة تقود التشخيص لا تعمّمه.
+        """
+        detail = (self.last_recovery or {}).get("detail")
+        self.ok = False
+        self.error = f"{self.name}: {reason}" + (f" — {detail}" if detail else "")
 
     # ── واجهة الاستخدام ────────────────────────────────────────
     def set_phase(self, phase: str) -> str:
@@ -240,24 +315,26 @@ class HeadingSource:
         if raw is None:
             self.stale_reads += 1
             if self.stale_reads >= MAX_STALE_READS and self.ok:
-                self.ok = False
-                self.error = (f"{self.name}: {self.stale_reads} قراءات فاشلة "
-                              f"متتابعة — تحقّق من التوصيل")
+                # ⚠ جرّب الإحياء قبل الإعلان: قد يكون انقطاعاً عابراً على الناقل
+                if not self.attempt_recovery().get("recovered"):
+                    self._fault(f"{self.stale_reads} قراءات فاشلة متتابعة — "
+                                f"تحقّق من التوصيل")
             self._last_ts = now
-            return {"ok": False, "dps": 0.0, "delta": 0.0,
+            return {"ok": self.ok, "dps": 0.0, "delta": 0.0,
                     "heading": self.heading, "dt": 0.0, "error": self.error}
         self.stale_reads = 0
         self.samples += 1
 
-        # حسّاس ميت يعطي صفراً **مضبوطاً** بلا أي ضجيج — وهو ما جعل جايرو
-        # الروفر الميت يبدو سليماً. الجايرو الحيّ لا يعطي 0.0 بالضبط أبداً.
+        # صفر **مضبوط** متتابع: إمّا حسّاس ميت (كجايرو الروفر) وإمّا شريحة
+        # BNO055 عادت إلى وضع CONFIG حيث تقرأ كل سجلات البيانات 0x00 وهي حيّة.
+        # الفرق لا يُخمَّن — يُسأل عنه الحسّاس في `attempt_recovery`.
         if self.kind == "rate":
             if float(raw) == 0.0:
                 self._zero_run += 1
                 if self._zero_run >= ZERO_RUN_DEAD and self.ok:
-                    self.ok = False
-                    self.error = (f"{self.name}: {self._zero_run} قراءة صفر مضبوط "
-                                  f"متتابعة — الحسّاس لا يرسل شيئاً (ميت؟)")
+                    if not self.attempt_recovery().get("recovered"):
+                        self._fault(f"{self._zero_run} قراءة صفر مضبوط متتابعة — "
+                                    f"الحسّاس لا يرسل شيئاً (ميت؟)")
             else:
                 self._zero_run = 0
 
@@ -301,6 +378,11 @@ class HeadingSource:
             "samples": self.samples, "spikes": self.cond.spikes,
             "stale_reads": self.stale_reads, "skipped_dt": self.skipped_dt,
             "deadband_dps": self.cond.deadband_dps, "phase": self.phase,
+            # الإحياء مرئي: عدّاد يتصاعد = الحسّاس يُعاد تشغيله فعلياً أثناء
+            # المهمة (تغذية غير مستقرة)، وليس مجرّد ضجيج قراءة.
+            "recoveries": self.recoveries,
+            "recovery_attempts": self.recovery_attempts,
+            "last_recovery": (self.last_recovery or {}).get("detail"),
         }
 
 
@@ -326,6 +408,14 @@ class BNO055GyroHeading(HeadingSource):
     def _read_rate_dps(self):
         v = self.imu.gyro_z_dps()
         return None if v is None else self.sign * v
+
+    def _try_recover(self):
+        """
+        يفوّض الإحياء إلى قارئ BNO055 (يسأل الشريحة ثم يعيد التهيئة).
+        قارئ لا يدعمه (حسّاس وهمي في الاختبارات) → None = لا إحياء.
+        """
+        rec = getattr(self.imu, "recover", None)
+        return rec() if callable(rec) else None
 
     def state(self) -> dict:
         st = super().state()
@@ -359,6 +449,10 @@ class BNO055FusionHeading(HeadingSource):
 
     def _read_angle_deg(self):
         return self.imu.euler_yaw()
+
+    def _try_recover(self):
+        rec = getattr(self.imu, "recover", None)
+        return rec() if callable(rec) else None
 
 
 # ═══ 3) جايرو الروفر عبر T=126 — **معطّل عتادياً** ════════════════
