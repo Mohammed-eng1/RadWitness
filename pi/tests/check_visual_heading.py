@@ -46,6 +46,40 @@ CALIB_TURN_DEG = 40.0       # زاوية المعايرة: كبيرة للدقة
 SAMPLE_GAP_S = 0.05
 
 
+def diagnose_camera(cam) -> None:
+    """
+    «لا إطار» ثلاثة أعطال مختلفة تماماً — تسميتها بالاسم توفّر جولة تخمين:
+      • cv2 غير مستورَد   → شُغّل خارج البيئة الافتراضية (الأشيع بفارق كبير).
+      • لا جهاز /dev/video* → الكاميرا غير موصولة.
+      • الجهاز موجود ولا يفتح → عملية أخرى تمسكه (السيرفر، mjpg-streamer).
+    """
+    import glob
+    import os
+    print("\n⛔ الكاميرا لا تعطي إطاراً — التشخيص:")
+    st = cam.state()
+    if not st.get("available"):
+        print(f"  ⛔ مكتبة opencv غير متاحة لهذا المفسّر ({cam.error})")
+        print(f"     المفسّر الحالي: {sys.executable}")
+        if "venv" not in sys.executable:
+            print("     ⇒ **أنت خارج البيئة الافتراضية**. شغّل أولاً:")
+            print("         source venv/bin/activate")
+        else:
+            print("     ⇒ pip install opencv-python-headless")
+        return
+    devs = sorted(glob.glob("/dev/video*"))
+    if not devs:
+        print("  ⛔ لا يوجد أي /dev/video* — الكاميرا غير موصولة أو لم تُعرَّف.")
+        print("     افحص: lsusb   ثم أعد توصيل الكابل.")
+        return
+    print(f"  الأجهزة الموجودة: {' '.join(devs)}")
+    print("  ⇒ الجهاز موجود ولا يُفتح: **عملية أخرى تمسكه**.")
+    print("     أوقف السيرفر، وتحقّق من mjpg-streamer:")
+    print("         pkill -f 'pi.web.server' ; pkill -f mjpg_streamer")
+    print("     ولمعرفة مَن يمسكه:  sudo fuser -v /dev/video0")
+    if os.path.exists("/dev/video0"):
+        print("     (⚠ بعض الويب كامات تُظهر عدّة أجهزة وأولها فقط هو الصورة)")
+
+
 def scene_quality(cam, seconds: float = 3.0) -> dict:
     """جودة المشهد بلا حركة: تباين التوقيع + ثبات المطابقة بين لقطتين."""
     print(f"\n── 1) جودة المشهد ({seconds:.0f}ث، الروبوت ساكن) ──")
@@ -247,8 +281,7 @@ def main() -> int:
 
     cam = CameraReader()
     if cam.frame_array() is None:
-        print("⛔ الكاميرا لا تعطي إطاراً. أوقف السيرفر (يمسك /dev/video0) "
-              "وتحقّق: ls /dev/video*")
+        diagnose_camera(cam)
         return 1
     print(f"الحالي في config: CAMERA_HFOV_DEG={CAMERA_HFOV_DEG} · "
           f"VISUAL_YAW_SIGN={VISUAL_YAW_SIGN:+d}"
