@@ -149,6 +149,10 @@ async def lifespan(_app: FastAPI):
     ultrasonic.close(); ir_sensors.close()
 
 
+# ⚠ حقن الكاميرا في المهمة: التوثيق البصري بعد المسح يحتاجها، وبلا هذا
+#   السطر يعمل كل شيء **عدا التقاط الصور** بلا أي رسالة خطأ.
+mission.camera = camera
+
 app = FastAPI(title="RMS Rover v2", lifespan=lifespan)
 
 

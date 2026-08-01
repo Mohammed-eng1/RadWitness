@@ -23,12 +23,13 @@ from pathlib import Path
 from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
-    ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG,
+    ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
     MISSION_HARD_LIMIT_S,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator
+from pi.ai.approach_document import run_documentation, approach_blockers
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
 from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
@@ -136,6 +137,8 @@ class MissionSim:
         self.ir = None
         self.geiger = None
         self.locator = None      # يُنشأ عند configure_room
+        self.camera = None       # تُحقن من السيرفر (اختيارية)
+        self.documentation = None  # نتيجة التوثيق البصري بعد المسح
 
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
@@ -756,7 +759,75 @@ class MissionSim:
             self.state = DONE
             self._log("mission_end",
                       f"انتهى المسح — {self.grid.coverage_text()}")
+            self._document_source()          # ← يكمل حلقة المشروع
         self.planned_path = []
+
+    # ── التوثيق البصري بعد المسح (يكمل حلقة المشروع) ─────────────
+    def _document_source(self) -> None:
+        """
+        بعد انتهاء المسح: **اذهب إلى الموقع المقدَّر وصوّره**.
+
+        بلا هذا يبقى نصف هدف المشروع المعلن («تحديد + صورة + تقرير») مبنياً
+        وغير موصول: المسح يغذّي المنسّق وتُعرض الخريطة الحرارية ثم تنتهي
+        المهمة بلا اقتراب ولا صورة.
+
+        🔴 **الموانع تُفحص أولاً** (`approach_blockers`): منطقة خطرة بكاملها،
+        أو موقع غير قابل للتحديد، أو بداية غير قانونية، أو لا دليل أصلاً ⇒
+        **لا اقتراب ولا تصوير**، ويُسجَّل السبب صراحةً في تقرير المهمة.
+        وهذا ليس تحفّظاً زائداً: الاقتراب من موقع لا نثق به سيرٌ عشوائي داخل
+        حقل إشعاعي، والصورة عندها توثّق **مكاناً خاطئاً** وتمنح التقرير ثقة
+        لا يملكها.
+        """
+        self.documentation = None
+        if self.locator is None:
+            return
+        try:
+            rep = self.locator.report()
+            blockers = approach_blockers(rep)
+            if blockers:
+                self.documentation = {"documented": False, "blockers": blockers,
+                                      "statement": "🔴 لم يُنفَّذ التوثيق البصري: "
+                                                   + " · ".join(blockers)}
+                self._log("documentation_skipped", self.documentation["statement"])
+                return
+            # الكاميرا والدوران **اختياريان**: غيابهما يُبلَّغ ولا يُسقط المهمة
+            x = self.dr.x if self.dr else 0.0
+            y = self.dr.y if self.dr else 0.0
+            self.documentation = run_documentation(
+                rep, robot_xy=(x, y), robot_heading_deg=self.heading,
+                camera=self.camera, turn_fn=self._doc_turn_fn())
+            self._log("documentation",
+                      self.documentation.get("statement", "")[:160])
+        except Exception as e:                # noqa: BLE001 — لا يُسقط المهمة
+            self.documentation = {"documented": False, "blockers": [],
+                                  "statement": f"⚠ تعذّر التوثيق البصري: {e}"}
+            self._log("documentation_error", str(e)[:120])
+        finally:
+            # 🔴 المحركات تُوقَف صراحةً بعد التصوير مهما كانت النتيجة
+            try:
+                self.rover.stop()
+            except Exception:                 # noqa: BLE001
+                pass
+
+    def _doc_turn_fn(self):
+        """
+        دالة الدوران للتصوير — أو `None` حين لا يُسمح بالحركة.
+
+        ⚠ لا نُدير الروبوت إلا إذا كانت المهمة **تقود المحركات فعلاً**
+        (`drive_motors`): في وضع «المسح المنطقي» لا حركة أصلاً، وتمرير دالة
+        دوران هناك يجعل التقرير يدّعي «زوايا مختلفة» بلا دوران — نفس العلّة
+        المقاسة على العتاد.
+        """
+        if not self.drive_motors:
+            return None
+
+        def _turn(deg):
+            r = self.rover.turn_by_angle(deg, timeout=ROVER_TURN_TIMEOUT_S)
+            ok = not (r.get("timed_out") or r.get("aborted"))
+            if ok:
+                self.heading = (self.heading + deg) % 360.0
+            return ok
+        return _turn
 
     def _log(self, kind, msg):
         self.events.append({"t": round(time.time(), 2), "kind": kind, "msg": msg})
@@ -805,6 +876,14 @@ class MissionSim:
         except Exception as e:                 # noqa: BLE001
             return {"active": False, "reason": f"خطأ في المحدِّد: {e}"}
 
+    def _doc_state(self) -> dict | None:
+        """نتيجة التوثيق البصري للبثّ — بلا بايتات الصور (تُطلب بمسارها)."""
+        d = self.documentation
+        if not d:
+            return None
+        return {k: v for k, v in d.items() if k != "images"} | {
+            "n_images": len(d.get("images") or [])}
+
     def state_dict(self, include_full_grid=False):
         if self.grid is None:
             return {"t": "sim", "state": "no_room"}
@@ -836,6 +915,7 @@ class MissionSim:
             "events": self.events[-40:],
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
             "source": self._source_state(),
+            "documentation": self._doc_state(),
             "battery": batt.classify(
                 self.rover.voltage() if BATTERY_MONITOR_ENABLED else None),
             "time_limit": self.time_limit_info(),     # بديل حماية الجهد (القسم 9)
