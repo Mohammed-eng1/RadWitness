@@ -25,7 +25,7 @@ from pi.config import (
     REACTIVE_LOOP_S, ROVER_TURN_TIMEOUT_S, CELL_DWELL_S,
     WALL_ALIGN_TOL_DEG, MAX_MOTOR_POWER, SPEED_LADDER,
     KNOWN_WALL_TOL_M, HARD_STOP_CM, IR_RANGE_CM,
-    HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE,
+    HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE, SPEED_RAMP_UP_PER_S,
 )
 from pi.nav.room import CELL_SIZE_M
 from pi.nav.heading_hold import HeadingController, signed_error
@@ -100,6 +100,8 @@ class DriveExecutor:
             self.heading_ctl.reset()
         hold_lost = None
         base_capped = None       # (المطلوب من السلّم، المطبَّق) عند تقييد السقف
+        applied = 0.0            # آخر قوة **مطبَّقة** — أساس تدرّج التسارع
+        ramped = 0               # عدد الدورات التي قُيّد فيها الرفع
         last_ts = time.time()
         try:
             while covered < distance_m:
@@ -130,20 +132,32 @@ class DriveExecutor:
                         break
                 else:
                     power = min(d["speed"], MAX_MOTOR_POWER)
+
+                # ⚠ سقف تثبيت الاتجاه إلزامي: عند 0.50 (أعلى درجة السلّم)
+                #    الفراغ صفر فلا توجيه ممكن — انظر HEADING_HOLD_MAX_BASE.
+                # ⚠ ويُسجَّل عند تقييده: السلّم يقرّر 0.50 والواجهة تعرضه، فلو
+                #    طُبّق 0.40 صامتاً لعُرض رقم لم يحدث.
+                if hold is not None and power > HEADING_HOLD_MAX_BASE:
+                    base_capped = (power, HEADING_HOLD_MAX_BASE)
+                    power = HEADING_HOLD_MAX_BASE
+
+                # ── تنعيم التسارع: **الرفع فقط** ────────────────────
+                # الخفض يمرّ فورياً (كبح لا يُؤجَّل — شرط سلامة). الرفع
+                # يتدرّج لأن القفزة تُدير العجلات أسرع من قدرة الاحتكاك
+                # فتنزلق، والانزلاق يفسد المسافة والاتجاه بلا إنكودرات
+                # تكشفه. يُطبَّق **قبل** تكامل المسافة أدناه.
+                step = SPEED_RAMP_UP_PER_S * REACTIVE_LOOP_S
+                if power > applied + step:
+                    power = applied + step
+                    ramped += 1
+                applied = power
+
                 # ── القيادة: بتثبيت الاتجاه إن توفّر، وإلا قوة متساوية ──
                 if hold is not None and src.ok:
                     src.update()
                     now = time.time()
                     dt = now - last_ts
                     last_ts = now
-                    # ⚠ السقف إلزامي: عند 0.50 (أعلى درجة السلّم) الفراغ صفر
-                    #    فلا توجيه ممكن — انظر HEADING_HOLD_MAX_BASE.
-                    # ⚠ ويُسجَّل عند تقييده: السلّم يقرّر 0.50 والواجهة تعرضه،
-                    #    فلو طُبّق 0.40 صامتاً لعُرض رقم لم يحدث. (تقدير المسافة
-                    #    نفسه سليم — يُتكامل على القوة المقصوصة أدناه.)
-                    if power > HEADING_HOLD_MAX_BASE:
-                        base_capped = (power, HEADING_HOLD_MAX_BASE)
-                        power = HEADING_HOLD_MAX_BASE
                     w = self.heading_ctl.wheels(signed_error(src.heading, hold),
                                                 dt, base_power=power)
                     self.rover.motors(w["left"], w["right"])
