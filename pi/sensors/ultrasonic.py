@@ -26,7 +26,7 @@ from collections import deque
 from pi.config import (
     ULTRASONIC_TRIG_GPIO, ULTRASONIC_ECHO_GPIO,
     ULTRASONIC_MEDIAN_N, ULTRASONIC_EMA_ALPHA, ULTRASONIC_QUALITY_WINDOW_S,
-    USE_GPIOZERO_DISTANCE, MAX_JUMP_CM,
+    USE_GPIOZERO_DISTANCE, MAX_JUMP_CM, ULTRASONIC_MAX_STALE,
 )
 
 try:
@@ -54,18 +54,27 @@ class DistanceFilter:
 
     def __init__(self, median_n: int = ULTRASONIC_MEDIAN_N,
                  alpha: float = ULTRASONIC_EMA_ALPHA,
-                 max_jump_cm: float = MAX_JUMP_CM):
+                 max_jump_cm: float = MAX_JUMP_CM,
+                 max_stale: int = ULTRASONIC_MAX_STALE):
         self.median_n = median_n
         self.alpha = alpha
         self.max_jump = max_jump_cm
+        self.max_stale = int(max_stale)
         self.jump_filter_enabled = True
         self._raw = deque(maxlen=median_n)
         self._ema = None
         self._last_accepted = None
         self._pending_jump = 0
+        self.stale_reads = 0        # قراءات فاشلة متتابعة
 
     def feed(self, raw_cm):
         """يضيف قراءة خاماً ويُعيد القيمة المنعَّمة (أو None قبل توفّر بيانات)."""
+        # ⚠ عدّاد التقادم: القيمة المنعَّمة لا تُقدَّم إلى ما لا نهاية بعد موت
+        # الحسّاس — انظر `value` وتعليق ULTRASONIC_MAX_STALE في config.
+        if raw_cm is None:
+            self.stale_reads += 1
+        else:
+            self.stale_reads = 0
         self._raw.append(raw_cm)
         med = median(self._raw)
         if med is None:
@@ -94,6 +103,14 @@ class DistanceFilter:
 
     @property
     def value(self):
+        """
+        ⚠ **None بعد max_stale فشلاً متتابعاً** — لا تُقدَّم قيمة قديمة كأنها
+        حيّة. كانت تُعاد `self._ema` إلى الأبد بعد موت الحسّاس، فتقرأ طبقة
+        السلامة «طريق مفتوح» وهي عمياء تماماً (شوهد على العتاد: جودة 0%
+        ومسافة 165.7سم معروضة). None ينزل بالسرعة إلى SPEED_NO_READING.
+        """
+        if self.stale_reads >= self.max_stale:
+            return None
         return self._ema
 
 
