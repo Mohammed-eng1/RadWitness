@@ -627,6 +627,91 @@ def main() -> int:
     check("سطر فشل واحد لا عشرات (السجل يحفظ السبب الأول)",
           len(turn_fails) <= 1, f"{len(turn_fails)} سطر")
 
+    # ═══ (م) دقّة نهاية اللفّة: تهدئة + قياس القصور + تصحيح ═════════
+    # مقاس على العتاد (2026-08-01): `rate_dps = 137.4` **لحظة قطع الطاقة**،
+    # فيواصل الروبوت الدوران بالقصور الذاتي بينما حلقة اللفّ انتهت — التجاوز
+    # لا يُقاس أصلاً فيظنّ النظام أنه على 90° وهو على ~100°.
+    print("\nم) دقّة نهاية اللفّة (التجاوز والقصور الذاتي):")
+    import math as _math
+    from pi.config import (
+        TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_TOLERANCE_DEG,
+        TURN_CORRECTION_PASSES, TURN_POWER,
+    )
+
+    # منحنى القوة: منطق خالص، يُختبر مباشرةً
+    _tp = WaveRoverBridge._turn_power
+    check("قوة كاملة بعيداً عن الهدف",
+          _tp(TURN_SLOWDOWN_DEG + 10, 45.0, TURN_POWER) == TURN_POWER)
+    check("القوة تنزل إلى الأدنى عند الهدف",
+          abs(_tp(0.0, 45.0, TURN_POWER) - TURN_MIN_POWER) < 1e-9,
+          f"{_tp(0.0, 45.0, TURN_POWER)}")
+    check("التهدئة تنازلية لا قفزة",
+          _tp(30, 45.0, TURN_POWER) > _tp(10, 45.0, TURN_POWER)
+          > _tp(2, 45.0, TURN_POWER))
+    # ⚠ الحارس الحاسم: لفّة تصحيح صغيرة تبدأ **داخل** قوس التهدئة، فلو خُفّضت
+    #   قوّتها قبل أن يدور الروبوت لما كسرت السكون ولما تحرّك إطلاقاً.
+    check("قبل بدء الدوران القوة كاملة (كسر السكون في لفّة التصحيح)",
+          _tp(5.0, 0.0, TURN_POWER) == TURN_POWER)
+
+    class InertialBridge(WaveRoverBridge):
+        """
+        جسر محاكاة **بقصور ذاتي**: الدوران لا ينقطع مع الطاقة بل يخبو أسّياً.
+        بدونه تبقى المحاكاة أنظف من العتاد في النقطة التي انكسر فيها بالضبط.
+        """
+        TAU = 0.10
+
+        def stop(self):
+            rate = self._sim_turn_rate
+            super().stop()
+            if rate:
+                self._coast_rate, self._coast_ts = rate, time.time()
+
+        def read_imu(self):
+            d = super().read_imu()
+            if not self._moving and getattr(self, "_coast_rate", 0.0):
+                r = self._coast_rate * _math.exp(
+                    -(time.time() - self._coast_ts) / self.TAU)
+                if abs(r) < 1.0:
+                    r = self._coast_rate = 0.0
+                d["gz"] = round(r + self._sim_bias, 3)
+            return d
+
+    inr = InertialBridge(mode="sim")
+    inr.calibrate_gyro_bias(seconds=0.3)
+    check("لا استباق مفترض قبل أي قياس (τ يبدأ صفراً)", inr._coast_tau == 0.0)
+
+    first = inr.turn_by_angle(90, timeout=8.0)
+    check("القصور الذاتي بعد قطع الطاقة **يُقاس** لا يُهمَل",
+          abs(first["coast_deg"]) > 0.5, f"قصور={first['coast_deg']}°")
+    check("اللفّة الأولى: التجاوز رقم معلوم لا 90.0 مضبوطة تخفيه",
+          abs(first["overshoot_deg"]) > 0.0,
+          f"تجاوز={first['overshoot_deg']}° · دار {first['turned_deg']}°")
+    check("τ يُشتقّ من القياس لا من config",
+          inr._coast_tau > 0.0, f"τ={inr._coast_tau:.3f}ث")
+
+    # ⚠ جوهر الإصلاح: اللفّات التالية تستفيد مما قيس في الأولى
+    for _ in range(3):
+        last = inr.turn_by_angle(90, timeout=8.0)
+    check("بعد التعلّم: اللفّة تصيب الهدف ضمن التسامح",
+          abs(last["residual_deg"]) <= TURN_TOLERANCE_DEG,
+          f"متبقٍّ={last['residual_deg']}° مقابل {first['residual_deg']}° أولاً")
+    check("الاستباق ألغى الحاجة إلى دورات التصحيح",
+          last["corrections"] == 0, f"{last['corrections']} تصحيح")
+    check("التصحيح محدود العدد دائماً (لا مطاردة بلا نهاية)",
+          first["corrections"] <= TURN_CORRECTION_PASSES
+          and last["corrections"] <= TURN_CORRECTION_PASSES)
+
+    # منصّة بلا قصور ذاتي: الاستباق يبقى صفراً فلا تقصُر اللفّة أبداً
+    clean = WaveRoverBridge(mode="sim")
+    clean.calibrate_gyro_bias(seconds=0.3)
+    rcl = clean.turn_by_angle(90, timeout=8.0)
+    check("بلا قصور ذاتي: إصابة ضمن التسامح بلا تصحيح ولا نقص",
+          rcl["corrections"] == 0
+          and abs(rcl["residual_deg"]) <= TURN_TOLERANCE_DEG,
+          f"متبقٍّ={rcl['residual_deg']}° · تصحيحات={rcl['corrections']}")
+    check("τ يبقى ~صفر على منصّة تقف فوراً (لا استباق كاذب)",
+          clean._coast_tau < 0.02, f"τ={clean._coast_tau:.4f}ث")
+
     # الخلاصة
     passed = sum(_results)
     total = len(_results)
