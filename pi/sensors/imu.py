@@ -59,8 +59,10 @@ class _SMBusDriver:
     """
     # سجلات BNO055 (من ورقة البيانات)
     CHIP_ID_REG = 0x00
+    ACC_X_LSB = 0x08            # التسارع الخام (يشمل الجاذبية)
     GYR_X_LSB = 0x14
     EUL_H_LSB = 0x1A
+    LIA_X_LSB = 0x28            # التسارع الخطّي (الجاذبية مطروحة بالدمج)
     CALIB_STAT = 0x35
     UNIT_SEL = 0x3B
     OPR_MODE = 0x3D
@@ -70,6 +72,7 @@ class _SMBusDriver:
     MODE_IMUPLUS = 0x08
     MODE_NDOF = 0x0C
     LSB_PER_DEG = 16.0          # UNIT_SEL=0x00: زاوية ومعدل بـ1/16 درجة
+    LSB_PER_MPS2 = 100.0        # UNIT_SEL=0x00: تسارع بـ1/100 م/ث²
 
     name = "smbus2"
 
@@ -117,6 +120,21 @@ class _SMBusDriver:
         e = self._bus.read_i2c_block_data(self.addr, self.EUL_H_LSB, 2)
         return self._s16(e[0], e[1]) / self.LSB_PER_DEG
 
+    def accel_mps2(self) -> tuple:
+        """
+        (ax, ay, az) م/ث². يُفضَّل **التسارع الخطّي** (LIA) لأن الجاذبية
+        مطروحة منه بالدمج، ويسقط إلى الخام إن لم يُخرِج الوضعُ دمجاً.
+        ⚠ الوحدة من UNIT_SEL=0x00 (1/100 م/ث² لكل LSB) — لا تحويل خارجي.
+        """
+        a = self._bus.read_i2c_block_data(self.addr, self.LIA_X_LSB, 6)
+        v = tuple(self._s16(a[i], a[i + 1]) / self.LSB_PER_MPS2
+                  for i in (0, 2, 4))
+        if any(v):
+            return v
+        a = self._bus.read_i2c_block_data(self.addr, self.ACC_X_LSB, 6)
+        return tuple(self._s16(a[i], a[i + 1]) / self.LSB_PER_MPS2
+                     for i in (0, 2, 4))
+
     def calibration(self) -> tuple:
         """(sys, gyro, accel, mag) — كلٌّ 0..3."""
         c = self._bus.read_byte_data(self.addr, self.CALIB_STAT)
@@ -160,6 +178,13 @@ class _AdafruitDriver:
             return None
         return float(e[0])
 
+    def accel_mps2(self):
+        """مكتبة Adafruit تُرجع م/ث² أصلاً — لا تحويل (خلاف الجايرو براديان)."""
+        for src in (self._s.linear_acceleration, self._s.acceleration):
+            if src and None not in src and any(src):
+                return tuple(float(v) for v in src)
+        return None
+
     def calibration(self) -> tuple:
         return self._s.calibration_status
 
@@ -191,6 +216,7 @@ class IMUReader:
         self._lock = threading.Lock()
         self._heading = 0.0
         self._gyro_z_dps = 0.0
+        self._accel = (0.0, 0.0, 0.0)
         self._cal = (0, 0, 0, 0)
 
         attempts = []                 # (وصف المحاولة، سبب الفشل)
@@ -260,6 +286,24 @@ class IMUReader:
         self._gyro_z_dps = float(z)
         return self._gyro_z_dps
 
+    def accel_mps2(self):
+        """
+        (ax, ay, az) م/ث² — **للسؤال الثنائي «هل تحرّك؟» فقط** (البند 0).
+        ⚠ لا يُشتقّ منه مسافة: التكامل المزدوج للتسارع ينجرف تربيعياً مع
+           الزمن، وأي انحياز صغير يصير أمتاراً خلال ثوانٍ.
+        """
+        if not self.ok:
+            return None
+        try:
+            with self._lock:
+                a = self._drv.accel_mps2()
+        except Exception:                 # noqa: BLE001 — I2C عابر
+            return None
+        if a is None or len(a) != 3:
+            return None
+        self._accel = tuple(float(v) for v in a)
+        return self._accel
+
     def euler_yaw(self):
         """yaw المدموج داخلياً (نسبي في IMUPLUS)، أو None عند فشل عابر."""
         if not self.ok:
@@ -306,6 +350,7 @@ class IMUReader:
             "mag_used": self.mag_used if self.ok else None,
             "heading": round(self._heading, 1),
             "gyro_z_dps": round(self._gyro_z_dps, 2),
+            "accel_mps2": [round(v, 2) for v in self._accel],
             "sys_cal": sys_c,
             "gyro_cal": gyro_c,
             "accel_cal": accel_c,

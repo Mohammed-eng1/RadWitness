@@ -84,6 +84,7 @@
           <span><i class="sw" style="background:#22c55e"></i> مزارة (آمنة)</span>
           <span><i class="sw" style="background:#3a2020;border-color:#5a1e1e"></i> محجوبة</span>
           <span><i class="sw" style="background:#4c1d95"></i> غير قابلة للوصول</span>
+          <span><i class="sw" style="background:repeating-linear-gradient(45deg,#22c55e,#22c55e 2px,#e2e8f0 2px,#e2e8f0 4px)"></i> حركة غير متحقَّقة (ثقة منخفضة)</span>
           <span><i class="sw" style="border-color:var(--accent);background:transparent"></i> أولوية</span>
           <span>🔺 الروبوت · ⭕ عدم اليقين · ⚡ شذوذ</span>
         </div>
@@ -169,7 +170,9 @@
       <div class="card">
         <h3>لوحة الحالة</h3>
         <div class="stat"><span>الحالة</span><b id="stState">—</b></div>
+        <div class="stat"><span>المرحلة</span><b id="stPhase">—</b></div>
         <div class="stat"><span>التغطية</span><b id="stCov">—</b></div>
+        <div class="stat"><span>تحقّق الحركة</span><b id="stMotion">—</b></div>
         <div class="stat"><span>الموقع (x,y)</span><b id="stPos">—</b></div>
         <div class="stat"><span>الاتجاه</span><b id="stHdg">—</b></div>
         <div class="stat"><span>عدم اليقين</span><b id="stUnc">—</b></div>
@@ -254,7 +257,7 @@
   // ── الحالة ────────────────────────────────────────────────────
   let G=null;            // {rows,cols,cell_size_m,start_cell,...}
   let cells=[];          // cells[r][c]
-  let robot=null, planned=[], trail=[], anomalyCells=[];
+  let robot=null, planned=[], trail=[], anomalyCells=[], breadcrumbs=[];
   let corner="back_left", speed=1, state="idle";
   const cpmHist=[];
 
@@ -296,6 +299,17 @@
         ctx.strokeStyle="#5a1e1e";ctx.lineWidth=1;
         ctx.beginPath();ctx.moveTo(x,y+cpx);ctx.lineTo(x+cpx,y);ctx.stroke();
       }
+      // 🔴 البند 0: زيارة لم يُتحقَّق من حركتها — تظليل شبكي رمادي فوق اللون.
+      // لا نُبدّل لون الخطر (القراءة نفسها صحيحة) بل نطمس **الموضع**: ما هو
+      // مشكوك فيه هو مكان القراءة لا قيمتها.
+      if(cell.visited&&cell.low_confidence){
+        ctx.save();
+        ctx.beginPath();ctx.rect(x+0.5,y+0.5,cpx-1,cpx-1);ctx.clip();
+        ctx.strokeStyle="rgba(226,232,240,.6)";ctx.lineWidth=1;
+        ctx.beginPath();
+        for(let k=-cpx;k<cpx;k+=5){ctx.moveTo(x+k,y);ctx.lineTo(x+k+cpx,y+cpx);}
+        ctx.stroke();ctx.restore();
+      }
       if(cell.priority>0){ctx.strokeStyle="#ff6a3d";ctx.lineWidth=2;
         ctx.strokeRect(x+1.5,y+1.5,cpx-3,cpx-3);}
     }
@@ -311,6 +325,10 @@
       trail.forEach((p,i)=>{const [x,y]=cellXY(p[0],p[1]);
         i?ctx.lineTo(x+cpx/2,y+cpx/2):ctx.moveTo(x+cpx/2,y+cpx/2);});
       ctx.stroke();}
+    // أثر الانسحاب (breadcrumb): طريق الخروج الآمن — نقاط صغيرة على المسار
+    if(breadcrumbs.length>1){ ctx.fillStyle="rgba(125,211,252,.75)";
+      breadcrumbs.forEach(b=>{const [x,y]=cellXY(b[0],b[1]);
+        ctx.beginPath();ctx.arc(x+cpx/2,y+cpx/2,Math.max(1.5,cpx*0.07),0,7);ctx.fill();});}
     // علامات الشذوذ
     ctx.fillStyle="#fde047";ctx.font=Math.max(10,cpx*0.5)+"px sans-serif";ctx.textAlign="center";
     anomalyCells.forEach(a=>{const [x,y]=cellXY(a[0],a[1]);ctx.fillText("⚡",x+cpx/2,y+cpx*0.7);});
@@ -472,7 +490,8 @@
   function setGrid(meta){
     G=meta; cells=[];
     for(let r=0;r<meta.rows;r++){cells[r]=[];
-      for(let c=0;c<meta.cols;c++)cells[r][c]={visited:false,blocked:false,unreachable:false,priority:0,max_usvh:0,max_cpm:0};}
+      for(let c=0;c<meta.cols;c++)cells[r][c]={visited:false,blocked:false,unreachable:false,
+      low_confidence:false,priority:0,max_usvh:0,max_cpm:0};}
     (meta.cells||[]).forEach(applyCell);
     resize();
   }
@@ -492,6 +511,19 @@
     if(d.source){ SRC=d.source; renderSource(); }
     if(d.state){ state=d.state; updateButtons(); $("stState").textContent=stateAr(d.state); }
     if(d.coverage_text) $("stCov").textContent=d.coverage_text;
+    if(d.phase_ar) $("stPhase").textContent=d.phase_ar+(d.withdraw_pending?" ⚠ انسحاب معلّق":"");
+    if(d.motion){ const mo=d.motion, last=mo.last||null;
+      // الصدق أهم من التجميل: نعرض **لماذا** لا مجرد نعم/لا
+      $("stMotion").textContent = last
+        ? (last.measured_m!=null
+            ? `مقاس ${last.measured_m}م (نموذج ${last.model_m}م)`
+            : `غير متحقَّق — ${last.method||"لا مرجع"}`)
+          + (mo.unverified_cells?` · ${mo.unverified_cells} خلية بثقة منخفضة`:"")
+        : (mo.unverified_cells?`${mo.unverified_cells} خلية بثقة منخفضة`:"—");
+      $("stMotion").style.color = (last&&last.moved===false) ? "#f87171"
+        : (mo.unverified_cells ? "#fbbf24" : "");
+    }
+    if(d.breadcrumbs) breadcrumbs=d.breadcrumbs;
     if(robot){$("stPos").textContent=robot.x+" , "+robot.y+" م";
       $("stHdg").textContent=robot.heading+"°";
       $("stUnc").textContent="±"+robot.uncertainty_m+" م";}
@@ -550,7 +582,13 @@
       obstacle_removed:"إزالة عائق",unreachable:"غير قابل",wall_correction:"تصحيح جدار",
       anomaly:"شذوذ",return_home:"عودة",home:"وصل",room_configured:"غرفة",
       battery:"بطارية",speed:"سرعة",power_clamp:"قصّ قوة",turn_segmented:"تجزئة لفّ",
-      gyro_bias:"انحياز جايرو",gyro_bias_rejected:"رفض معايرة",heartbeat:"heartbeat"}[e.kind]||e.kind)
+      gyro_bias:"انحياز جايرو",gyro_bias_rejected:"رفض معايرة",heartbeat:"heartbeat",
+      no_motion:"لا حركة",motion_mismatch:"فرق مسافة",partial_motion:"حركة ناقصة",
+      stuck:"عالق",phase:"مرحلة",rescan:"إعادة مسح",rescan_done:"تأكيد",
+      retrace:"انسحاب",retrace_done:"انتهى الانسحاب",withdraw_request:"طلب انسحاب",
+      gradient:"تدرّج",gradient_stop:"توقف التدرّج",gradient_withdraw:"تراجع",
+      extend_dwell:"إطالة تجميع",documentation:"توثيق",
+      documentation_skipped:"توثيق محجوب"}[e.kind]||e.kind)
       +"</span> — "+e.msg+"</div>").join("");
   }
 

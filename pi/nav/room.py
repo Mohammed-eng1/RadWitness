@@ -38,6 +38,11 @@ class Cell:
     priority: int = 0
     timestamp: float = 0.0             # لحظة آخر تحديث (time.time())
     unreachable: bool = False          # محاصرة بعوائق — تُستثنى من مقام التغطية
+    # 🔴 البند 0: زيارة **لم يُتحقَّق من حركتها** (لا سطح مرجعي ولا حكم من
+    # التسارع). تُحتسب في التغطية لكنها تُعلَّم بلون مختلف وتُذكر في النص —
+    # خريطة تبدو مكتملة بينما بعض خلاياها مبنية على موقع غير مقيس هي بالضبط
+    # الثقة الزائفة التي عولجت في طبقة تحديد المصدر.
+    low_confidence: bool = False
 
 
 @dataclass
@@ -132,8 +137,16 @@ class OccupancyGrid:
 
     # ── التحديث أثناء المسح ───────────────────────────────────────
     def update_reading(self, x_m: float, y_m: float, cpm: float, usvh: float,
-                       mark_visited: bool = True) -> bool:
-        """يسجّل قراءة جيجر في خلية الموقع (يحتفظ بالأقصى). يُعيد نجاح التحديث."""
+                       mark_visited: bool = True,
+                       low_confidence: bool = False) -> bool:
+        """
+        يسجّل قراءة جيجر في خلية الموقع (يحتفظ بالأقصى). يُعيد نجاح التحديث.
+
+        `low_confidence`: الزيارة لم يُتحقَّق من حركتها (البند 0). القاعدة
+        **AND على كل الزيارات**: زيارة واحدة موثّقة تكفي لرفع العلم عن
+        الخلية نهائياً — التحقق إضافة لا تُنتزع، والعكس (زيارة غير موثّقة
+        بعد موثّقة) لا يُنقص ما ثبت.
+        """
         idx = self.cell_index(x_m, y_m)
         if idx is None:
             return False
@@ -141,6 +154,8 @@ class OccupancyGrid:
         c.max_cpm = max(c.max_cpm, cpm)
         c.max_usvh = max(c.max_usvh, usvh)
         if mark_visited:
+            c.low_confidence = (bool(low_confidence) if not c.visited
+                                else (c.low_confidence and bool(low_confidence)))
             c.visited = True
         c.timestamp = time.time()
         return True
@@ -192,7 +207,7 @@ class OccupancyGrid:
     # ── التغطية ───────────────────────────────────────────────────
     def counts(self) -> dict:
         total = self.rows * self.cols
-        visited = blocked = unreachable = 0
+        visited = blocked = unreachable = low_conf = 0
         for r in range(self.rows):
             for c in range(self.cols):
                 cell = self.cells[r][c]
@@ -202,9 +217,12 @@ class OccupancyGrid:
                     unreachable += 1
                 elif cell.visited:
                     visited += 1
+                    if cell.low_confidence:
+                        low_conf += 1
         reachable = total - blocked - unreachable   # المقام يستثني المحجوب وغير القابل للوصول
         return {"total": total, "visited": visited, "blocked": blocked,
-                "unreachable": unreachable, "reachable": reachable}
+                "unreachable": unreachable, "reachable": reachable,
+                "low_confidence": low_conf}
 
     def coverage_pct(self) -> float:
         """نسبة الخلايا المزارة من القابلة للوصول (المحجوبة/غير القابلة تُستبعَد)."""
@@ -212,11 +230,17 @@ class OccupancyGrid:
         return 100.0 * c["visited"] / c["reachable"] if c["reachable"] > 0 else 100.0
 
     def coverage_text(self) -> str:
-        """نص شفّاف يعرض الرقمين معاً (كما نصّ البند ب)."""
+        """
+        نص شفّاف يعرض الأرقام معاً (كما نصّ البند ب) — ومنها **الخلايا غير
+        الموثّقة الحركة**: تغطية 100% نصفها غير متحقَّق منه ليست 100%.
+        """
         c = self.counts()
-        return (f"التغطية {self.coverage_pct():.0f}% "
-                f"({c['visited']} من {c['reachable']} قابلة للوصول، "
-                f"{c['blocked']} محجوبة، {c['unreachable']} غير قابلة)")
+        txt = (f"التغطية {self.coverage_pct():.0f}% "
+               f"({c['visited']} من {c['reachable']} قابلة للوصول، "
+               f"{c['blocked']} محجوبة، {c['unreachable']} غير قابلة)")
+        if c["low_confidence"]:
+            txt += f" ⚠ منها {c['low_confidence']} بثقة منخفضة (حركة غير متحقَّقة)"
+        return txt
 
     # ── الحفظ/التحميل (للاستئناف بعد الانقطاع وللخريطة) ────────────
     def to_dict(self) -> dict:
@@ -245,6 +269,7 @@ class OccupancyGrid:
                     "row": r, "col": c, "x": round(x, 2), "y": round(y, 2),
                     "visited": cell.visited, "blocked": cell.blocked,
                     "unreachable": cell.unreachable, "priority": cell.priority,
+                    "low_confidence": cell.low_confidence,
                     "max_usvh": round(cell.max_usvh, 3), "max_cpm": round(cell.max_cpm, 1),
                 })
         return out

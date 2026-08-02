@@ -8,11 +8,15 @@ selftest.py — اختبارات sim لمعايير قبول الدفعة الأ
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 import time
 
-from pi.config import REACTIVE_SAFETY_ENABLED, REACTIVE_LOOP_S, SPEED_NO_READING
+from pi.config import (
+    REACTIVE_SAFETY_ENABLED, REACTIVE_LOOP_S, SPEED_NO_READING,
+    UNCERTAINTY_INITIAL,
+)
 from pi.nav.reactive import speed_for_distance, median, JumpFilter
 from pi.nav.room import Room, OccupancyGrid
 from pi.nav.calibration import (
@@ -535,6 +539,445 @@ def main() -> int:
     check("الجهد غير مقروء → لا يُعرض تصنيف كاذب",
           ms2.rover.check_battery()["level"] == "unknown"
           and ms2.state_dict()["battery"]["level"] == "unknown")
+
+    # ═══ (ل) 🔴 البند 0: التحقق من الحركة ═════════════════════════
+    print("\nل) التحقق من الحركة (البند 0):")
+    from pi.nav.motion_check import (
+        AccelWitness, verify_motion, tolerance_for,
+        VERIFIED, SHORT, OVERSHOOT, NO_MOTION, UNVERIFIED,
+    )
+    from pi.config import (
+        MOTION_REF_MAX_CM, MOTION_STUCK_LIMIT, MOTION_UNVERIFIED_DRIFT,
+        MOTION_CELL_ENTER_TOL_M, MOTION_VERIFY_ENABLED,
+    )
+    from pi.nav.room import CELL_SIZE_M
+
+    # ① الشاهد الثنائي: التشتت لا المقدار
+    still = AccelWitness(threshold_std=0.05, min_samples=8)
+    for _ in range(30):
+        still.add((0.01, -0.01, 9.81))
+    check("ساكن (إشارة ثابتة) → الشاهد ينفي الحركة", still.verdict is False,
+          f"σ={still.std:.4f} م/ث²")
+    # الحصانة ضد الإزاحة الثابتة: جاذبية متسرّبة بمقدار ضخم وثابت
+    tilted = AccelWitness(threshold_std=0.05, min_samples=8)
+    for _ in range(30):
+        tilted.add((9.8, 0.0, 0.0))
+    check("إزاحة ثابتة ضخمة (ميل/جاذبية) لا تُقرأ حركةً", tilted.verdict is False,
+          f"متوسط 9.8 بينما σ={tilted.std:.4f}")
+    # الانطلاق من السكون: نتوء تسارع ثم سير — لا يُنتجه روبوت عالق
+    moving = AccelWitness(threshold_std=0.05, min_samples=8)
+    for i in range(30):
+        moving.add((1.8 if i < 4 else 0.06, 0.1, 9.81))
+    check("نتوء الانطلاق من السكون → الشاهد يؤكّد الحركة", moving.verdict is True,
+          f"σ={moving.std:.3f} م/ث²")
+    few = AccelWitness(threshold_std=0.05, min_samples=8)
+    few.add((0.0, 0.0, 9.8))
+    check("عيّنات غير كافية → لا حكم (لا نفي ولا إثبات)", few.verdict is None)
+
+    # ② القياس الكمّي بالألترا سونيك
+    v_ok = verify_motion(0.5, 120.0, 70.0)
+    check("جدار مرجعي: الفرق ≈ المأمور → حركة متحقَّقة",
+          v_ok["verdict"] == VERIFIED and v_ok["confident"]
+          and abs(v_ok["measured_m"] - 0.5) < 1e-6,
+          f"مقاس={v_ok['measured_m']}م تسامح=±{v_ok['tolerance_m']}م")
+    # 🔴 الحالة المقاسة التي فجّرت البند كله: النموذج 1.8م والواقع 0.20م
+    v_9x = verify_motion(1.8, 120.0, 100.0)
+    check("خطأ الـ9 أضعاف (نموذج 1.8م / مقاس 0.20م) يُكشف ويُبلَّغ",
+          v_9x["verdict"] == SHORT and not v_9x["confident"]
+          and abs(v_9x["measured_m"] - 0.20) < 1e-6,
+          f"مقاس={v_9x['measured_m']}م مقابل مأمور {v_9x['commanded_m']}م")
+    v_none = verify_motion(0.5, 120.0, 119.0)
+    check("أُمر بـ0.5م والمسافة لم تتغيّر → **لا حركة** (نفي قاطع)",
+          v_none["verdict"] == NO_MOTION and v_none["moved"] is False
+          and v_none["confident"])
+    v_over = verify_motion(0.3, 200.0, 120.0)
+    check("تجاوز المأمور بفارق دالّ يُكشف أيضاً",
+          v_over["verdict"] == OVERSHOOT and not v_over["confident"])
+    check("التسامح ثابت + نسبة (يتّسع مع المسافة)",
+          tolerance_for(1.0) > tolerance_for(0.25) > 0)
+
+    # ③ المكمّل حين لا مرجع أمامي
+    v_far = verify_motion(0.5, MOTION_REF_MAX_CM + 50, MOTION_REF_MAX_CM + 10)
+    check("سطح أبعد من المدى الموثوق لا يُعتمد مرجعاً",
+          v_far["method"] != "ultrasonic" and not v_far["confident"],
+          f"> {MOTION_REF_MAX_CM:.0f}سم")
+    v_acc_no = verify_motion(0.5, None, None, still)
+    check("لا مرجع + تسارع ساكن → «عالق أو منزلق» (الخلية لا تُعلَّم)",
+          v_acc_no["verdict"] == NO_MOTION and v_acc_no["method"] == "accel"
+          and v_acc_no["moved"] is False, v_acc_no["reason"][:60])
+    v_acc_yes = verify_motion(0.5, None, None, moving)
+    check("لا مرجع + تسارع يؤكّد الحركة → تحرّك لكن بمسافة غير مقيسة",
+          v_acc_yes["verdict"] == UNVERIFIED and v_acc_yes["moved"] is True
+          and not v_acc_yes["confident"] and v_acc_yes["measured_m"] is None)
+    v_blind = verify_motion(0.5, None, None, None)
+    check("لا مرجع ولا تسارع → ثقة منخفضة (لا ادّعاء ولا نفي)",
+          v_blind["verdict"] == UNVERIFIED and v_blind["moved"] is None
+          and v_blind["method"] == "none" and not v_blind["confident"])
+    v_grew = verify_motion(0.5, 70.0, 120.0, still)
+    check("ازدياد المسافة أثناء أمر تقدّم لا يُحتسب حركةً للأمام",
+          v_grew["moved"] is not True and "عكس" in v_grew["reason"],
+          v_grew["reason"][:56])
+    # الرجوع (انسحاب/تراجع تدرّج) يُقاس بنفس المرجع الأمامي بإشارة معكوسة
+    v_back = verify_motion(0.5, 70.0, 120.0, still, direction=-1)
+    check("الرجوع مقيس بنفس المرجع الأمامي (الإشارة معكوسة) لا مفترضاً",
+          v_back["verdict"] == VERIFIED and abs(v_back["measured_m"] - 0.5) < 1e-6,
+          f"مقاس={v_back['measured_m']}م رجوعاً")
+    v_back_bad = verify_motion(0.5, 120.0, 70.0, still, direction=-1)
+    check("تقدّم بينما الأمر رجوع ⇒ لا يُحتسب حركةً في الجهة المأمورة",
+          v_back_bad["moved"] is not True)
+
+    # ④ الخريطة تحمل الثقة المنخفضة وتقولها
+    room_lc = Room(1.0, 1.0, "back_left")
+    grid_lc = OccupancyGrid(room_lc)
+    grid_lc.update_reading(0.25, 0.25, 20.0, 0.18, low_confidence=True)
+    grid_lc.update_reading(0.75, 0.25, 20.0, 0.18)
+    check("خلية غير متحقَّقة تُعلَّم مزارة **بثقة منخفضة**",
+          grid_lc.get(0, 0).visited and grid_lc.get(0, 0).low_confidence
+          and not grid_lc.get(0, 1).low_confidence)
+    grid_lc.update_reading(0.25, 0.25, 21.0, 0.19)          # زيارة موثّقة لاحقة
+    check("زيارة موثّقة ترفع العلم نهائياً (AND على الزيارات)",
+          not grid_lc.get(0, 0).low_confidence)
+    grid_lc.update_reading(0.75, 0.25, 22.0, 0.20, low_confidence=True)
+    check("زيارة غير موثّقة بعد موثّقة لا تُنقص ما ثبت",
+          not grid_lc.get(0, 1).low_confidence)
+    grid_lc.update_reading(0.25, 0.75, 20.0, 0.18, low_confidence=True)
+    check("نصّ التغطية **يذكر** الخلايا غير المتحقَّقة (لا خريطة تبدو مكتملة)",
+          grid_lc.counts()["low_confidence"] == 1
+          and "ثقة منخفضة" in grid_lc.coverage_text(), grid_lc.coverage_text())
+
+    # ⑤ عدم اليقين ينمو أسرع للشوط غير المتحقَّق (يصل إلى محدِّد المصدر)
+    dr_v = DeadReckoning(room, profile, 0.25, 0.25, 0.0)
+    dr_u = DeadReckoning(room, profile, 0.25, 0.25, 0.0)
+    dr_v.advance(1.0, verified=True)
+    dr_u.advance(1.0, verified=False)
+    check("شوط غير متحقَّق ⇒ σ ينمو أسرع (لا يمنح المفترض وزن المقيس)",
+          dr_u.uncertainty > dr_v.uncertainty
+          and abs((dr_u.uncertainty - UNCERTAINTY_INITIAL)
+                  / (dr_v.uncertainty - UNCERTAINTY_INITIAL)
+                  - MOTION_UNVERIFIED_DRIFT) < 1e-9,
+          f"{dr_v.uncertainty:.3f} مقابل {dr_u.uncertainty:.3f} م")
+
+    # ⑥ **اختبار تكامل** — المنفّذ يُنتج الحكم فعلاً (لا وحدة معزولة)
+    class MotionRover:
+        """جسر وهمي بوضع real (التحقق يخصّ العتاد) يسجّل ما أُرسل."""
+        mode = "real"
+        heading_source = None
+        def __init__(self):
+            self.sent, self.stops = [], 0
+        def stop(self):            self.stops += 1
+        def forward(self, p=None): self.sent.append(p)
+        def motors(self, l, r):    self.sent.append((l, r))
+
+    class MovingSensors:
+        """يقترب من جدار: القراءة تنقص مع كل استدعاء (حركة حقيقية)."""
+        def __init__(self, start_cm=100.0, step_cm=2.0):
+            self.cm, self.step, self.n = start_cm, step_cm, 0
+        def __call__(self):
+            self.n += 1
+            v = self.cm
+            self.cm -= self.step
+            return {"ultrasonic_cm": v, "ir_left": 1, "ir_right": 1}
+
+    class ShakingIMU:
+        def __init__(self, amp=0.4):
+            self.amp, self.i = amp, 0
+        def accel_mps2(self):
+            self.i += 1
+            return (self.amp if self.i % 2 else -self.amp, 0.1, 9.81)
+
+    from pi.nav.executor import DriveExecutor
+    mrov = MotionRover()
+    ex = DriveExecutor(mrov, ReactiveSafety(enabled=False), MovingSensors(),
+                       newp, imu=ShakingIMU())
+    check("التحقق يُفعَّل مع جسر real ويُعطَّل مع sim (لا عالم يُقاس)",
+          ex.verify_motion_enabled is MOTION_VERIFY_ENABLED
+          and not DriveExecutor(WaveRoverBridge(mode="sim"),
+                                ReactiveSafety(enabled=False),
+                                MovingSensors(), newp).verify_motion_enabled)
+    fwd_res = ex.forward_cell(0.2)
+    mres = fwd_res.get("motion")
+    check("forward_cell **يستدعي** التحقق ويُعيد حكمه مع كل شوط",
+          bool(mres) and mres.get("verdict") and mres["d_start_cm"] is not None
+          and mres["accel"]["samples"] > 0,
+          f"{mres['verdict']} · مقاس={mres['measured_m']}م · "
+          f"عيّنات تسارع={mres['accel']['samples']}")
+
+    # ⑦ **اختبار تكامل** — المهمة تستهلك الحكم وتغيّر سلوكها به
+    from pi.nav.mission import RUNNING, ESTOP, DONE
+
+    class FakeExec:
+        """منفّذ وهمي يُسلّم حكم حركة محدَّداً — لاختبار استهلاك المهمة له."""
+        def __init__(self, motion, covered=CELL_SIZE_M):
+            self.motion, self.covered, self.calls = motion, covered, 0
+        def turn_to(self, a, b):  return {"ok": True, "turned_deg": 0.0}
+        def forward_cell(self, d, expected_wall_end_m=None):
+            self.calls += 1
+            return {"ok": True, "covered_m": self.covered, "aborted": None,
+                    "reason": None, "motion": dict(self.motion)}
+        def maybe_wall_correct(self, *a, **k): return None
+
+    def mission_with(motion, covered=CELL_SIZE_M, length=1.0, width=0.5):
+        m = MissionSim()
+        m.configure_room(length, width)
+        m.set_calibration(newp)
+        m.dr = DeadReckoning(m.room, newp, *m.grid.cell_center(*m.current), 0.0)
+        m.executor = FakeExec(motion, covered)
+        m.state = RUNNING
+        m._visit(m.current)                 # خلية البدء (كما يفعل start)
+        m._motor_worker()
+        return m
+
+    m_stuck = mission_with({"verdict": NO_MOTION, "moved": False,
+                            "confident": True, "measured_m": 0.0,
+                            "reason": "المسافة الأمامية لم تتغيّر"})
+    check("🔴 «لا حركة» ⇒ الخلية **لا تُعلَّم مزارة** والمهمة تتوقف بعد "
+          f"{MOTION_STUCK_LIMIT} محاولات",
+          not m_stuck.grid.get(1, 0).visited and m_stuck.state == ESTOP
+          and m_stuck.executor.calls == MOTION_STUCK_LIMIT
+          and any(e["kind"] == "stuck" for e in m_stuck.events),
+          f"محاولات={m_stuck.executor.calls} · الحالة={m_stuck.state}")
+
+    m_low = mission_with({"verdict": UNVERIFIED, "moved": None,
+                          "confident": False, "measured_m": None,
+                          "reason": "لا مرجع"})
+    check("🔴 بلا مرجع ⇒ تُعلَّم مزارة **بثقة منخفضة** (لا ادّعاء اكتمال)",
+          m_low.grid.get(1, 0).visited and m_low.grid.get(1, 0).low_confidence
+          and m_low._unverified_cells >= 1
+          and "ثقة منخفضة" in m_low.grid.coverage_text(),
+          m_low.grid.coverage_text())
+
+    # 🔴 القلب: المسافة **المقاسة** تُقدَّم على المحسوبة
+    m_9x = mission_with({"verdict": SHORT, "moved": True, "confident": False,
+                         "measured_m": 0.20, "reason": "مقاس 0.20م مقابل 1.8م"},
+                        covered=1.8)
+    check("🔴 النموذج 1.8م والمقاس 0.20م ⇒ الموقع يتقدّم بالمقاس لا بالمحسوب",
+          abs(m_9x.dr.distance_total - 0.20 * m_9x.executor.calls) < 1e-6
+          and any(e["kind"] == "motion_mismatch" for e in m_9x.events),
+          f"المسافة المتراكمة={m_9x.dr.distance_total:.2f}م "
+          f"(بالنموذج كانت ستكون {1.8 * m_9x.executor.calls:.1f}م)")
+    check("حركة ناقصة ⇒ لا تُعلَّم الخلية، ويُؤمر بالمتبقّي حتى يكتمل العبور",
+          any(e["kind"] == "partial_motion" for e in m_9x.events)
+          and m_9x.executor.calls == 2 and m_9x.grid.get(1, 0).visited,
+          f"أشواط={m_9x.executor.calls} × 0.20م ≥ "
+          f"{CELL_SIZE_M - MOTION_CELL_ENTER_TOL_M:.2f}م")
+    check("الخلية المكتملة من أشواط غير موثّقة تبقى بثقة منخفضة",
+          m_9x.grid.get(1, 0).low_confidence and m_9x.state == DONE)
+
+    # ═══ (م) البنود 2-6: الدورة الكاملة ═══════════════════════════
+    print("\nم) عقد القراءات والدورة الكاملة (البنود 2-6):")
+    from pi.nav.mission import (
+        PHASE_SCREEN, PHASE_CONFIRM, PHASE_APPROACH, PHASE_DOCUMENT,
+        PHASE_REPORT, PHASE_WITHDRAW, _ang_signed as _asig,
+    )
+    from pi.config import (
+        CONFIRM_POSITIONS, CONFIRM_RADIUS_M, STAGE2_MIN_MEASUREMENTS,
+        UNCERTAINTY_INITIAL as U0,
+    )
+
+    class GoodExec:
+        """منفّذ وهمي **سليم**: يقطع ما أُمر به ويُبلّغ حركة متحقَّقة."""
+        def __init__(self):
+            self.fwd = self.back = self.turns = 0
+        def turn_to(self, a, b):
+            self.turns += 1
+            return {"ok": True, "turned_deg": _asig(a, b)}
+        @staticmethod
+        def _m(d, direction=1):
+            return {"verdict": VERIFIED, "moved": True, "confident": True,
+                    "measured_m": round(d, 3), "commanded_m": round(d, 3),
+                    "direction": direction, "reason": "مقاس ≈ مأمور"}
+        def forward_cell(self, d, expected_wall_end_m=None):
+            self.fwd += 1
+            return {"ok": True, "covered_m": d, "aborted": None,
+                    "reason": None, "motion": self._m(d)}
+        def backward_step(self, d, power=None):
+            self.back += 1
+            return {"ok": True, "covered_m": d, "aborted": None,
+                    "reason": None, "motion": self._m(d, -1)}
+        def maybe_wall_correct(self, *a, **k):
+            return None
+
+    def full_mission(length=2.0, width=2.0, src=(1.75, 1.75), a_cpm=600.0,
+                     run=True):
+        m = MissionSim()
+        m.configure_room(length, width, source_xy=src, bg_cpm=22.0)
+        m.world.source_cpm_1m = a_cpm
+        m.set_calibration(newp)
+        m.dr = DeadReckoning(m.room, newp, *m.grid.cell_center(*m.current), 0.0)
+        m.executor = GoodExec()
+        m.drive_motors = True        # ⚠ اختبار برمجي فقط (الحارس يمنعه في sim)
+        m.state = RUNNING
+        m._visit(m.current)
+        m.breadcrumb_push()          # كما يفعل start(): نقطة الدخول أولاً
+        if run:
+            m._motor_worker()
+        return m
+
+    # ① البند 2: σ إلزامية مع **كل** قراءة ولا تكون صفراً
+    ms_full = full_mission()
+    sig = [r["pos_sigma_m"] for r in ms_full.locator.readings]
+    check("🔴 كل قراءة تحمل pos_sigma_m > 0 (لا موضع يُدَّعى مؤكَّداً)",
+          bool(sig) and min(sig) >= U0 and all(s > 0 for s in sig),
+          f"{len(sig)} قراءة · أصغر σ={min(sig):.2f}م · أكبر={max(sig):.2f}م")
+    check("σ تنمو مع المسافة (لا قيمة ثابتة مُلصقة)", max(sig) > min(sig),
+          f"{min(sig):.2f} → {max(sig):.2f} م")
+
+    # ② 🔴 اختبار انحدار: العدّات من **نافذة الفترة** لا من نافذة العدّاد
+    #    المنزلقة. العدّاد الوهمي يُرجع `cpm` **مضلّلاً عمداً** (99,999): أي
+    #    مسار يعود لاشتقاق العدّات منه سيُنتج رقماً بعيداً عن فرق tally فيسقط
+    #    هذا الفحص. هذا هو الحارس الذي كان غائباً حين لُطّخت الإشارة مكانياً.
+    class TallyGeiger:
+        ok = True
+        def __init__(self, per_call=7):
+            self.n, self.per_call = 0, per_call
+        def tally(self):
+            v = self.n
+            self.n += self.per_call
+            return v
+        def state(self):
+            return {"cpm": 99999.0, "cpm_raw": 99999.0, "usvh": 900.0}
+
+    class NoTallyGeiger(TallyGeiger):
+        def tally(self):
+            return None
+
+    ms_t = full_mission(run=False)
+    ms_t.set_geiger(TallyGeiger(per_call=7))
+    mm = ms_t._measure(0.5, 0.5, 0.05)
+    check("🔴 العدّات من فرق `tally` على نافذة الفترة (لا من cpm المنزلق)",
+          mm["window"] == "exact" and abs(mm["counts"] - 7.0) < 1e-9,
+          f"عدّات={mm['counts']} · لو استُعملت النافذة لكانت "
+          f"{99999.0 * 0.05 / 60.0:.1f}")
+    ms_t._visit(ms_t.current, dwell_s=0.05)
+    last = ms_t.locator.readings[-1]
+    check("والقناة إلى المنسّق تمرّر **نفس** العدّات لا رقماً مشتقاً",
+          abs(last["counts"] - 7.0) < 1e-9 and last["duration_s"] > 0,
+          f"counts={last['counts']} · T={last['duration_s']:.3f}ث")
+    ms_r = full_mission(run=False)
+    ms_r.set_geiger(NoTallyGeiger())
+    mr = ms_r._measure(0.5, 0.5, 0.05)
+    check("تعذّر tally ⇒ تدهور **معلَن** لا صامت (وسم + تحذير في السجل)",
+          mr["window"] == "rolling"
+          and any(e["kind"] == "geiger_window" for e in ms_r.events),
+          [e["msg"] for e in ms_r.events
+           if e["kind"] == "geiger_window"][0][:70])
+
+    # ③ البند 6: الدورة الست مرّت فعلاً بمراحلها
+    phases = [p["phase"] for p in (ms_full.cycle or {}).get("phase_log", [])]
+    check("🔴 الدورة الكاملة تمرّ بالفرز ثم التأكيد (لا قفز إلى التوثيق)",
+          PHASE_SCREEN in phases and PHASE_CONFIRM in phases
+          and phases.index(PHASE_SCREEN) < phases.index(PHASE_CONFIRM),
+          " → ".join(phases))
+    check("الفرز أعلن اشتباهاً على بيانات المسح (مجاناً بلا وقت إضافي)",
+          (ms_full.cycle["screen"] or {}).get("suspect") is True,
+          f"Λ={ms_full.cycle['screen']['lambda_stat']} مقابل عتبة "
+          f"{ms_full.cycle['screen']['threshold']}")
+
+    # ④ البند 3: إعادة المسح — تتجاهل visited ولا تُنقص التغطية
+    rs = ms_full.cycle.get("rescan") or {}
+    conf_reads = [r for r in ms_full.locator.readings if r["purpose"] == "confirm"]
+    check("🔴 rescan_region ينفَّذ فعلاً ويُنتج قياسات تأكيد **جديدة**",
+          rs.get("ok") and len(conf_reads) >= STAGE2_MIN_MEASUREMENTS,
+          f"{len(conf_reads)} قياس تأكيد · مخطَّط {CONFIRM_POSITIONS}")
+    check("التغطية **لا تُطرح** بإعادة المسح (التأكيد إضافة لا تراجع)",
+          ms_full.grid.counts()["visited"] == ms_full.grid.counts()["reachable"],
+          ms_full.grid.coverage_text())
+    pts = [tuple(d["actual"]) for d in rs.get("measured", [])]
+    spread = max((math.hypot(p[0] - q[0], p[1] - q[1])
+                  for p in pts for q in pts), default=0.0)
+    check("مواضع التأكيد **متنوّعة** لا متراصّة (التنويع أهم من العدد)",
+          len(set(pts)) > 1 and spread > CONFIRM_RADIUS_M,
+          f"{len(set(pts))} موضعاً مختلفاً · أوسع تباعد {spread:.2f}م")
+    check("كل قراءة تأكيد تحمل موضعها **الفعلي** لا المخطَّط",
+          all("err_m" in d for d in rs.get("measured", []))
+          and any(d["err_m"] >= 0 for d in rs.get("measured", [])),
+          f"أكبر فارق عن المخطَّط "
+          f"{max((d['err_m'] for d in rs.get('measured', [])), default=0):.2f}م")
+
+    # ⑤ البند 5 + التوثيق: الاقتراب والتدرّج والصورة موصولة بالمهمة
+    check("🔴 الحكم بالتأكيد ثم الاقتراب ثم التوثيق — سلسلة متصلة",
+          (ms_full.cycle.get("confirm") or {}).get("confirmed") is True
+          and PHASE_APPROACH in phases and PHASE_DOCUMENT in phases
+          and phases[-1] == PHASE_REPORT,
+          f"Λ2={ms_full.cycle['confirm']['lambda_stat']}")
+    grad = ms_full.cycle.get("gradient") or {}
+    check("follow_gradient نُفِّذ بخطوات صغيرة محكومة مع قياس بينها",
+          grad.get("ok") and grad.get("steps", 0) > 0
+          and len(grad.get("history", [])) > 0,
+          f"{grad.get('steps')} خطوة · انعكاسات {grad.get('reversals')} · "
+          f"حكم={grad.get('verdict')}")
+    doc = ms_full.cycle.get("documentation") or {}
+    check("التوثيق البصري موصول بنهاية الدورة ويُخرج حكماً صريحاً",
+          "statement" in doc, doc.get("statement", "")[:80])
+
+    check("أمر الانسحاب من حارس التذبذب **يُطاع** لا يُتجاهَل",
+          grad.get("verdict") != "withdraw"
+          or any(e["kind"] == "retrace" for e in ms_full.events),
+          f"حكم التدرّج: {grad.get('verdict')}")
+
+    # ⑥ البند 4: أثر المسار موجود، والانسحاب يمشي عليه عكسياً
+    ms_w = full_mission(run=False)
+    for _ in range(6):                          # امسح بضع خلايا (بلا دورة)
+        ms_w._advance_one_cell(ms_w._next_target())
+    check("أثر المسار يُبنى ويبدأ من **نقطة الدخول** نفسها",
+          len(ms_w.breadcrumbs) >= 5
+          and tuple(ms_w.breadcrumbs[0]["cell"]) == ms_w.grid.start_cell(),
+          f"{len(ms_w.breadcrumbs)} نقطة · أولها {ms_w.breadcrumbs[0]['cell']}")
+    n_reads_before = len(ms_w.locator.readings)
+    far = ms_w.current
+    rt = ms_w.retrace_path(until_cpm=0.0)      # عتبة مستحيلة ⇒ يمشي حتى المدخل
+    check("🔴 retrace_path يعود على الأثر حتى نقطة الدخول",
+          rt["reached_entry"] and ms_w.current == ms_w.grid.start_cell()
+          and rt["steps"] > 0,
+          f"من {far} إلى {ms_w.current} في {rt['steps']} خلية")
+    check("الانسحاب **لا يقيس للتغطية** (السلامة تسبق جمع البيانات)",
+          len(ms_w.locator.readings) == n_reads_before,
+          f"قراءات المنسّق ثابتة عند {n_reads_before}")
+    ms_w2 = full_mission(run=False)
+    ms_w2._advance_one_cell(ms_w2._next_target())
+    rt2 = ms_w2.retrace_path(until_cpm=1e9)    # عتبة متساهلة ⇒ آمن فوراً
+    check("الانسحاب يتوقف فور نزول القراءة دون العتبة",
+          rt2["safe"] and rt2["steps"] == 0, f"عند {rt2['cpm']:,.0f} CPM")
+
+    # ⑦ 🔴 أولوية مطلقة: أمر الانسحاب يتجاوز أي هدف مسح
+    ms_p = full_mission(run=False)
+    for _ in range(4):                          # امسح بضع خلايا أولاً
+        ms_p._advance_one_cell(ms_p._next_target())
+    visited_before = ms_p.grid.counts()["visited"]
+    ms_p.request_withdraw(until_cpm=0.0, reason="اختبار الأولوية")
+    ms_p._motor_worker()
+    check("🔴 أمر التراجع له **أولوية مطلقة** على المسح والتغطية",
+          ms_p.grid.counts()["visited"] == visited_before
+          and ms_p.current == ms_p.grid.start_cell()
+          and ms_p.phase in (PHASE_REPORT, PHASE_WITHDRAW),
+          f"التغطية بقيت {visited_before} خلية · انسحب إلى {ms_p.current}")
+
+    # ⑦ب بلا محركات: تُرفض القدرات الحركية صراحةً ولا تتظاهر بالتنفيذ
+    ms_nm = full_mission(run=False)
+    ms_nm.drive_motors = False
+    check("بلا قيادة محركات: الانسحاب/التأكيد/التدرّج تُرفض بسبب معلَن",
+          ms_nm.request_withdraw()["ok"] is False
+          and ms_nm.rescan_region((1.0, 1.0))["ok"] is False
+          and ms_nm.follow_gradient()["ok"] is False,
+          ms_nm.rescan_region((1.0, 1.0))["reason"][:60])
+    ms_nm.state = DONE
+    cyc_nm = ms_nm._run_cycle()
+    check("الدورة بلا محركات تُخرج خطة التأكيد ولا تدّعي تنفيذها",
+          cyc_nm.get("rescan", {}).get("ok") is not True,
+          (cyc_nm.get("rescan") or {}).get("reason", "لا اشتباه")[:70])
+
+    # ⑧ بروتوكول الدخول (القسم 3): نقطة البدء تُبلَّغ للمنسّق
+    proto = ms_full.locator.protocol.status()
+    check("بروتوكول الدخول يُبلَّغ بنقطة البداية ويحكم على شرعيّتها",
+          proto["perimeter_start_ok"] is True
+          and proto["ascending_branch_valid"] is True,
+          f"أول قراءة {proto['first_cpm']:,.0f} CPM")
+    ms_bad = full_mission(src=(0.25, 0.25), a_cpm=3.0e6, run=False)
+    ms_bad._visit(ms_bad.current)                # يبدأ ملاصقاً لمصدر قوي
+    check("بداية غير قانونية ⇒ ضمانة الفرع باطلة ولا يُبنى موقع",
+          ms_bad.locator.protocol.status()["perimeter_start_ok"] is False
+          and ms_bad.locator.report()["position"] is None,
+          ms_bad.locator.report()["position_blockers"][0][:60])
 
     # الخلاصة
     passed = sum(_results)

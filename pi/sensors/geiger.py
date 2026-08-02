@@ -84,6 +84,22 @@ class GeigerReader:
         self._cpm = _correct_dead_time(self._cpm_raw)     # المصحَّح يغذّي الجرعة
         self._usvh = self._cpm / CPM_PER_USVH
 
+    def tally(self):
+        """
+        العدّ التراكمي **الخام واللحظي** (لا نافذة منزلقة)، أو None بلا عتاد.
+
+        🔴 يلزم لقياس عدّات **فترة محدَّدة** بطرح قراءتين. وهذا ليس تحسيناً
+        تجميلياً: `cpm` نافذته 30ث منزلقة، فاشتقاق «عدّات هذه الخلية» منها
+        يخلط عدّ الخلية بعدّ العشر خلايا السابقة — أي **يلطّخ الإشارة مكانياً**
+        وهي المعلومة الوحيدة التي تبني عليها طبقة تحديد المصدر تقديرها.
+        """
+        if not self.ok or self._cb is None:
+            return None
+        try:
+            return int(self._cb.tally())
+        except Exception:                 # noqa: BLE001
+            return None
+
     def state(self) -> dict:
         return {
             "ok": self.ok,

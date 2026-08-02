@@ -26,9 +26,11 @@ from pi.config import (
     WALL_ALIGN_TOL_DEG, MAX_MOTOR_POWER, SPEED_LADDER,
     KNOWN_WALL_TOL_M, HARD_STOP_CM, IR_RANGE_CM,
     HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE, SPEED_RAMP_UP_PER_S,
+    MOTION_VERIFY_ENABLED, MOTION_SETTLE_S, MOTION_BACKWARD_MAX_M,
 )
 from pi.nav.room import CELL_SIZE_M
 from pi.nav.heading_hold import HeadingController, signed_error
+from pi.nav.motion_check import AccelWitness, verify_motion
 
 # أقصى زمن لعبور خلية واحدة قبل اعتبار الخطوة فاشلة (حماية من الانحشار)
 MAX_CELL_TRAVEL_S = 12.0
@@ -47,7 +49,7 @@ class DriveExecutor:
     - `profile`  : CalibrationProfile (لتحويل القوة → م/ث المعايرة)
     """
 
-    def __init__(self, rover, reactive, sensors, profile):
+    def __init__(self, rover, reactive, sensors, profile, imu=None):
         self.rover = rover
         self.reactive = reactive
         self.sensors = sensors
@@ -55,6 +57,15 @@ class DriveExecutor:
         self.log = []
         # **نفس المتحكّم لا نسخة ثانية** — ثوابته معايرة على العتاد.
         self.heading_ctl = HeadingController()
+        # مقياس التسارع للشاهد الثنائي (البند 0). يُؤخذ من مصدر الاتجاه —
+        # **نفس نسخة IMUReader** لا ثانية: فتحُ I2C مرتين يتسابق على الناقل.
+        self.imu = imu if imu is not None else getattr(
+            getattr(rover, "heading_source", None), "imu", None)
+        # ⚠ التحقق يخصّ **العتاد**: في وضع sim لا عالم فيزيائي يُقاس، والقراءة
+        #    الأمامية مشتقّة من نفس الموقع المحسوب الذي نريد التحقق منه — فلا
+        #    تُثبت شيئاً وتُنتج «لا حركة» كاذبة توقف المهمة.
+        self.verify_motion_enabled = (MOTION_VERIFY_ENABLED
+                                      and getattr(rover, "mode", "sim") == "real")
 
     # ── اللفّ نحو اتجاه مطلوب ────────────────────────────────────
     def turn_to(self, current_heading: float, target_heading: float) -> dict:
@@ -67,6 +78,29 @@ class DriveExecutor:
         return {"ok": not res["timed_out"] and not res.get("aborted"),
                 "turned_deg": res["turned_deg"], "aborted": res.get("aborted"),
                 "segments": res.get("segments", 1), "timed_out": res["timed_out"]}
+
+    # ── قراءتا التحقق من الحركة (البند 0) ────────────────────────
+    def _settled_front_cm(self):
+        """
+        المسافة الأمامية **بعد استقرار المرشّح**. مرشّح الألترا سونيك وسيط 5
+        ثم EMA، وكل قياس ~60ms ⇒ نافذته لا تتبدّل قبل ~0.3ث. القراءة الفورية
+        تخلط ما قبل الحركة بما بعدها فتُنتج فرقاً مصغَّراً — أي تحقّقاً يمرّ
+        على أخطاء حقيقية. `None` تُمرَّر كما هي (لا سطح مرجعي).
+        """
+        time.sleep(MOTION_SETTLE_S)
+        try:
+            return self.sensors().get("ultrasonic_cm")
+        except Exception:                          # noqa: BLE001
+            return None
+
+    def _read_accel(self):
+        """(ax, ay, az) م/ث² أو None — غياب الحسّاس **ليس خطأً** هنا."""
+        if self.imu is None:
+            return None
+        try:
+            return self.imu.accel_mps2()
+        except Exception:                          # noqa: BLE001 — I2C عابر
+            return None
 
     # ── التقدّم خلية واحدة تحت إشراف السلامة ─────────────────────
     def forward_cell(self, distance_m: float = CELL_SIZE_M,
@@ -86,6 +120,12 @@ class DriveExecutor:
         aborted = None
         last_decision = None
         crawl_power = SPEED_LADDER[-1][1]
+
+        # ── 🔴 مرجع التحقق من الحركة: المسافة الأمامية **قبل** التحرّك ──
+        # تُؤخذ بعد استقرار المرشّح: اللفّة السابقة تُمرّر الحسّاس على الغرفة
+        # كلها، فقراءة فورية بعدها خليط من أسطح لم نعد نواجهها.
+        witness = AccelWitness() if self.verify_motion_enabled else None
+        d_start = self._settled_front_cm() if self.verify_motion_enabled else None
 
         # ── تثبيت الاتجاه: الهدف هو الاتجاه **لحظة بدء العبور** ──────
         # يُلتقط من الحسّاس لا من إطار الغرفة: مرجع مصدر الاتجاه يُصفَّر
@@ -110,6 +150,8 @@ class DriveExecutor:
                     break
                 s = self.sensors()
                 front_cm = s.get("ultrasonic_cm")
+                if witness is not None:
+                    witness.add(self._read_accel())
                 d = self.reactive.decide(front_cm,
                                          s.get("ir_left", 1), s.get("ir_right", 1))
                 last_decision = d
@@ -178,6 +220,13 @@ class DriveExecutor:
                "aborted": aborted,
                "reason": (last_decision or {}).get("reason"),
                "elapsed_s": round(time.time() - started, 2)}
+        # ── 🔴 الحكم: هل تحرّك فعلاً بالقدر المأمور؟ ─────────────────
+        # ⚠ يُحسب على `covered` (ما أُمر به فعلاً قبل أي إجهاض) لا على
+        #    `distance_m`: خطوة أُجهضت بعد 0.1م ليست «حركة ناقصة» بل أمر أقصر.
+        if self.verify_motion_enabled:
+            d_end = self._settled_front_cm()
+            out["motion"] = verify_motion(max(covered, 0.0), d_start, d_end,
+                                          witness)
         if hold is not None:
             s = self.heading_ctl.summary()
             out["heading_hold"] = {
@@ -189,6 +238,44 @@ class DriveExecutor:
             }
         elif HEADING_HOLD_IN_MISSION:
             out["heading_hold"] = {"lost": "مصدر الاتجاه غير متاح عند بدء العبور"}
+        self.log.append(out)
+        return out
+
+    # ── رجوع قصير محكوم (انسحاب / تراجع التدرّج) ─────────────────
+    def backward_step(self, distance_m: float, power: float = None) -> dict:
+        """
+        شوط رجوع قصير — للانسحاب على أثر المسار ولتراجع تتبّع التدرّج.
+
+        ⚠ **لا حسّاس خلفي في العتاد**: هذا الاتجاه بلا إشراف سلامة، فلا يُسمح
+           به إلا على أرض عبرها الروبوت للتوّ وبمسافة مقصوصة عند
+           `MOTION_BACKWARD_MAX_M`. هذا قيد عتاد لا تفضيل — والبديل (لفّة
+           180° لتوجيه الحسّاس) يستهلك وقتاً وبطارية في أسوأ لحظة، ويفقد
+           اتجاه الأثر الذي نتراجع عليه.
+        ⚠ التحقق من الحركة يعمل هنا بإشارة معكوسة: المسافة الأمامية **تزداد**
+           بالرجوع، فالانسحاب مقيس لا مفترض.
+        """
+        dist = min(abs(float(distance_m)), MOTION_BACKWARD_MAX_M)
+        p = min(abs(power if power is not None else SPEED_LADDER[-1][1]),
+                MAX_MOTOR_POWER)
+        witness = AccelWitness() if self.verify_motion_enabled else None
+        d_start = self._settled_front_cm() if self.verify_motion_enabled else None
+        covered, started = 0.0, time.time()
+        try:
+            while covered < dist and (time.time() - started) <= MAX_CELL_TRAVEL_S:
+                if witness is not None:
+                    witness.add(self._read_accel())
+                self.rover.backward(p)
+                time.sleep(REACTIVE_LOOP_S)
+                covered += self.profile.speed_for_power(p) * REACTIVE_LOOP_S
+        finally:
+            self.rover.stop()                      # ⚠ إيقاف مضمون
+        out = {"ok": True, "covered_m": round(covered, 3), "aborted": None,
+               "reason": "رجوع قصير (بلا إشراف خلفي)", "direction": -1,
+               "elapsed_s": round(time.time() - started, 2)}
+        if self.verify_motion_enabled:
+            out["motion"] = verify_motion(max(covered, 0.0), d_start,
+                                          self._settled_front_cm(), witness,
+                                          direction=-1)
         self.log.append(out)
         return out
 

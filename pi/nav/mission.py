@@ -24,12 +24,22 @@ from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
+    GEIGER_WINDOW_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
-    MISSION_HARD_LIMIT_S,
+    MISSION_HARD_LIMIT_S, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
+    MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S,
+    CONFIRM_RADIUS_M, CONFIRM_DWELL_S, CONFIRM_POSITIONS,
+    APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
+    BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
+    RESCAN_MAX_CELLS_PER_POINT, GRADIENT_TRANSIT_STOP_M,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
-from pi.ai.source_locator import SourceLocator
-from pi.ai.approach_document import run_documentation, approach_blockers
+from pi.ai.source_locator import SourceLocator, SURVEY, CONFIRM
+from pi.ai.approach_document import (
+    run_documentation, approach_blockers, GradientApproach, source_bearing_deg,
+    MOVE, STOP, WITHDRAW,
+)
+from pi.ai.dynamic_range import dead_time_correct
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
 from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
@@ -37,6 +47,7 @@ from pi.nav.calibration import CalibrationProfile
 from pi.nav.sim_world import SimWorld
 from pi.nav.reactive import ReactiveSafety
 from pi.nav.executor import DriveExecutor
+from pi.nav.motion_check import SHORT, OVERSHOOT, NO_MOTION
 from pi.ai.risk import classify
 from pi.rover.bridge import WaveRoverBridge
 from pi.rover import battery as batt
@@ -49,6 +60,17 @@ MEASURE_NOISE_M = 0.03          # ضجيج قياس الألترا سونيك ا
 # حالات المهمة
 IDLE, RUNNING, PAUSED, DONE, RETURNING, ESTOP = (
     "idle", "running", "paused", "done", "returning", "estop")
+
+# ── مراحل الدورة الكاملة (البند 6): مسح → فرز → تأكيد → اقتراب →
+#    توقف → توثيق. كل انتقال بحكم **المنسّق** لا برغبة الملاحة.
+PHASE_SURVEY, PHASE_SCREEN, PHASE_CONFIRM = "survey", "screen", "confirm"
+PHASE_APPROACH, PHASE_STOP, PHASE_DOCUMENT = "approach", "stop", "document"
+PHASE_WITHDRAW, PHASE_REPORT = "withdraw", "report"
+PHASE_AR = {
+    PHASE_SURVEY: "١ مسح", PHASE_SCREEN: "٢ فرز", PHASE_CONFIRM: "٣ تأكيد",
+    PHASE_APPROACH: "٤ اقتراب", PHASE_STOP: "٥ توقف",
+    PHASE_DOCUMENT: "٦ توثيق", PHASE_WITHDRAW: "انسحاب", PHASE_REPORT: "تقرير",
+}
 
 
 def default_sim_profile(battery_v: float = 0.0) -> CalibrationProfile:
@@ -129,6 +151,19 @@ class MissionSim:
         self._clamp_seen = 0
         self._base_cap_logged = False
         self._last_rung = None
+        # ── البند 0: تتبّع الحركة المتحقَّق منها ──────────────────
+        self._stuck = 0               # انعدامات حركة متتالية (→ إيقاف)
+        self._progress_cell = None    # الخلية التي نتقدّم نحوها جزئياً
+        self._cell_progress = 0.0     # ما قُطع منها فعلاً (متر)
+        self._unverified_cells = 0    # خلايا عُلّمت بثقة منخفضة
+        self._last_motion = None      # آخر حكم تحقّق (للبثّ في الواجهة)
+        # ── البنود 3-6: الأثر والمراحل ───────────────────────────
+        self.breadcrumbs = []         # أثر المسار (البند 4)
+        self._retracing = False       # داخل انسحاب (لا تُضاف نقاط أثر)
+        self._withdraw_req = None     # طلب انسحاب معلّق (أولوية مطلقة)
+        self.phase = PHASE_SURVEY
+        self.cycle = None             # حصيلة الدورة الكاملة (للبثّ والتقرير)
+        self._rolling_warned = False  # حُذّر من نافذة العدّاد المنزلقة مرة
         self.last_reactive = None
         self.drive_motors = False
         self.executor = None
@@ -166,6 +201,7 @@ class MissionSim:
         self.dirty = set()
         self.mission_time_s = 0.0
         self._returning = False
+        self._reset_motion_state()
         cx, cy = self.grid.cell_center(*self.current)
         self._log("room_configured",
                   f"غرفة {length_m}×{width_m}م، ركن {start_corner}")
@@ -203,11 +239,15 @@ class MissionSim:
         self.heading = 0.0
         self.trail = [self.current]
         self._returning = False
+        self._reset_motion_state()
         self.state = RUNNING
         self._started_ts = time.time()      # ساعة الحدّ الزمني (القسم 9)
         self._time_warned = False
         self._time_rth = False
         self._visit(self.current)
+        # 🔴 **نقطة الدخول أول نقطة في الأثر وأهمّها**: بدونها ينتهي الانسحاب
+        #    عند الخلية التالية لها ويُعلن «بلغت المدخل» وهو لم يبلغه.
+        self.breadcrumb_push()
         self._log("mission_start",
                   "بدء المسح الذاتي" + (" — قيادة محركات ⚠" if self.drive_motors else " (منطقي)"))
         if not BATTERY_MONITOR_ENABLED:
@@ -454,102 +494,36 @@ class MissionSim:
                     self.rover.stop()
                     time.sleep(0.2)
                     continue
+                # 🔴 **أولوية مطلقة**: أمر الانسحاب يتجاوز أي هدف مسح أو تغطية
+                if self._withdraw_req is not None:
+                    self._serve_withdraw()
+                    continue
                 target = self._current_start() if self._returning else self._next_target()
                 if target is None:
                     self._finish()
                     break
-                path = find_path(self.grid, self.current, target)
-                if path is None or len(path) < 2:
+                r = self._advance_one_cell(target)
+                if r.get("fatal"):
+                    break
+                if r.get("no_path"):
                     if self._returning:
                         self._finish()
                         break
                     self.grid.mark_unreachable(*target)
                     self.dirty.add(target)
-                    self._log("unreachable", f"هدف غير قابل للوصول ({target[0]},{target[1]})")
+                    self._log("unreachable",
+                              f"هدف غير قابل للوصول ({target[0]},{target[1]})")
                     continue
-                self.planned_path = path
-                nxt = path[1]
-                target_heading = _heading_between(self.current, nxt)
-
-                # ⚠ اللفّ أولاً ثم **تحديث الاتجاه فوراً** قبل التقدّم: قراءة
-                # الحساسات تعتمد self.heading، فلو بقي قديماً لقاس الروبوت
-                # المسافة في الاتجاه الخاطئ وأجهض الخطوة بعائق وهمي.
-                t = self.executor.turn_to(self.heading, target_heading)
-                turned = t.get("turned_deg", 0.0)
-                if self.dr and turned:
-                    self.dr.turn(turned)
-                    self.heading = self.dr.heading
-                if not t["ok"]:
-                    why = ("مهلة اللفّ" if t.get("timed_out")
-                           else f"إجهاض ({t.get('aborted')})")
-                    self._log("turn_failed",
-                              f"فشل اللفّ نحو {target_heading:.0f}° — {why}")
-                    continue
-
-                # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
-                tx, ty = self.grid.cell_center(*nxt)
-                exp_wall = self._wall_distance_from(tx, ty, self.heading)
-                fwd = self.executor.forward_cell(CELL_SIZE_M, expected_wall_end_m=exp_wall)
-                covered = fwd.get("covered_m", 0.0)
-                if self.dr and covered:
-                    self.dr.advance(covered)
-                # تثبيت الاتجاه: يُبلَّغ عطله **دائماً**، وجودته عند تدهورها
-                # فقط (وإلا أغرق السجل بسطر لكل خلية).
-                hh = fwd.get("heading_hold") or {}
-                if hh.get("base_capped") and not self._base_cap_logged:
-                    self._base_cap_logged = True     # مرة واحدة لا كل خلية
-                    want, got = hh["base_capped"]
-                    self._log("speed_cap",
-                              f"سلّم السلامة يطلب {want} والمطبَّق {got} — "
-                              f"تثبيت الاتجاه يحتاج فراغاً للتصحيح "
-                              f"(0.50 تترك فراغاً صفراً). السرعة ≈{got * 1.5:.2f} م/ث")
-                if hh.get("lost"):
-                    self._log("heading_hold",
-                              f"⚠ تعذّر تثبيت الاتجاه — {hh['lost']} "
-                              f"(تقدّم بحلقة مفتوحة)")
-                elif hh.get("max_abs_error_deg", 0) > 5.0:
-                    self._log("heading_hold",
-                              f"⚠ خطأ اتجاه {hh['max_abs_error_deg']:.1f}° "
-                              f"(متوسط {hh['mean_abs_error_deg']:.1f}°، "
-                              f"إشباع {hh['saturated_pct']}%)")
-                res = {"ok": fwd["ok"], "turn": t, "forward": fwd,
-                       "reason": fwd.get("reason")}
-
-                if not res["ok"]:
-                    # أُجهضت الخطوة. إن كان السبب IR بينما الألترا سونيك يرى
-                    # الطريق خالياً، فالأرجح حسّاس معطوب لا عائق — نقولها صراحة
-                    # بدل اتهام خلية سليمة (وتلويث الخريطة).
-                    s_now = self.sensors()
-                    us_now = s_now.get("ultrasonic_cm")
-                    ir_fired = (s_now.get("ir_left") == 0 or s_now.get("ir_right") == 0)
-                    if ir_fired and (us_now is None or us_now > IR_RANGE_CM * 2):
-                        self._log("sensor_fault",
-                                  f"⚠ IR يقول «عائق» والألترا سونيك يرى {us_now}سم — "
-                                  f"تحقّق من توصيل IR (BCM25/BCM16) ومقاومة المدى")
-                    if covered < 0.05:
-                        self._log("no_motion",
-                                  f"لم يتحرك الروبوت ({covered:.2f}م) — أُجهضت الخطوة فوراً")
-                    self.grid.mark_blocked(*nxt)
-                    self.dirty.add(nxt)
-                    self._log("obstacle_detected",
-                              f"عائق ({nxt[0]},{nxt[1]}) — {res.get('reason') or fwd.get('aborted')}")
+                if r.get("blocked_cell"):
                     self.replans[target] = self.replans.get(target, 0) + 1
                     if self.replans[target] > MAX_REPLANS_PER_TARGET:
                         self.grid.mark_unreachable(*target)
                         self.dirty.add(target)
-                        self._log("unreachable", f"هدف محاصر ({target[0]},{target[1]})")
+                        self._log("unreachable",
+                                  f"هدف محاصر ({target[0]},{target[1]})")
                     continue
-
-                self.current = nxt
-                self.trail.append(self.current)
-                self.mission_time_s += CELL_DWELL_S
-                time.sleep(CELL_DWELL_S)        # توقّف لتجميع عدّ إحصائي كافٍ
-                self._visit(self.current)
-                s = self.sensors()
-                self.executor.maybe_wall_correct(self.dr, self.heading,
-                                                 s.get("ultrasonic_cm"))
-                self._check_battery()
-                if self._returning and self.current == self.grid.start_cell():
+                if (r.get("entered") and self._returning
+                        and self.current == self.grid.start_cell()):
                     self._finish()
                     break
         except Exception as e:                  # noqa: BLE001
@@ -557,6 +531,161 @@ class MissionSim:
             self.estop()
         finally:
             self.rover.stop()                   # ⚠ إيقاف مضمون
+
+    # ══ الأوّلية الحركية: خطوة خلية واحدة (يستعملها الجميع) ══════
+    def _advance_one_cell(self, target, measure: bool = True) -> dict:
+        """
+        خطوة خلية واحدة نحو `target`: تخطيط → لفّ → عبور → **تحقّق من الحركة**
+        → دخول وقياس. هذه **الأوّلية الوحيدة** للحركة الشبكية: يستعملها المسح
+        وإعادة المسح والانسحاب والاقتراب معاً، فلا يوجد مسار حركة ثانٍ يفلت
+        من التحقق أو من السلامة.
+
+        `measure=False` أثناء الانسحاب: السلامة تسبق جمع البيانات، ولا نتوقف
+        3ث في كل خلية ونحن نخرج من حقل إشعاعي.
+        """
+        path = find_path(self.grid, self.current, target)
+        if path is None or len(path) < 2:
+            return {"ok": False, "no_path": True, "entered": False}
+        self.planned_path = path
+        nxt = path[1]
+        target_heading = _heading_between(self.current, nxt)
+
+        # ⚠ اللفّ أولاً ثم **تحديث الاتجاه فوراً** قبل التقدّم: قراءة
+        # الحساسات تعتمد self.heading، فلو بقي قديماً لقاس الروبوت
+        # المسافة في الاتجاه الخاطئ وأجهض الخطوة بعائق وهمي.
+        if not self._face(target_heading):
+            return {"ok": False, "entered": False, "turn_failed": True}
+
+        # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
+        tx, ty = self.grid.cell_center(*nxt)
+        exp_wall = self._wall_distance_from(tx, ty, self.heading)
+        # ⚠ **المتبقّي** لا الخلية كاملة: محاولة سابقة قطعت جزءاً من
+        #    المسافة (تحقّق قاسها)، فالأمر بخلية كاملة يتجاوز الهدف.
+        done = self._progress_toward(nxt)
+        fwd = self.executor.forward_cell(CELL_SIZE_M - done,
+                                         expected_wall_end_m=exp_wall)
+        covered = fwd.get("covered_m", 0.0)
+        mv = fwd.get("motion") or {}
+        if mv:
+            self._last_motion = dict(mv, model_m=round(covered, 3))
+        # 🔴 المسافة المقاسة تُقدَّم على المحسوبة (البند 0)
+        step_m = self._motion_step_m(covered, mv)
+        if self.dr and step_m:
+            self.dr.advance(step_m, verified=mv.get("confident", True))
+        self._log_heading_hold(fwd)
+
+        if not fwd["ok"]:
+            # أُجهضت الخطوة. إن كان السبب IR بينما الألترا سونيك يرى
+            # الطريق خالياً، فالأرجح حسّاس معطوب لا عائق — نقولها صراحة
+            # بدل اتهام خلية سليمة (وتلويث الخريطة).
+            s_now = self.sensors()
+            us_now = s_now.get("ultrasonic_cm")
+            ir_fired = (s_now.get("ir_left") == 0 or s_now.get("ir_right") == 0)
+            if ir_fired and (us_now is None or us_now > IR_RANGE_CM * 2):
+                self._log("sensor_fault",
+                          f"⚠ IR يقول «عائق» والألترا سونيك يرى {us_now}سم — "
+                          f"تحقّق من توصيل IR (BCM25/BCM16) ومقاومة المدى")
+            if covered < 0.05 or mv.get("moved") is False:
+                self._log("no_motion",
+                          f"لم يتحرك الروبوت ({step_m:.2f}م) — أُجهضت الخطوة فوراً"
+                          + (f" · {mv['reason']}" if mv.get("reason") else ""))
+            # الإجهاض بعائق **ليس انحشاراً**: التوقف أمام عائق هو
+            # السلوك الصحيح فلا يُحتسب في عدّاد العلوق. ويُصفَّر التقدّم
+            # الجزئي لأن العبور **مهجور** لا مؤجَّل (الخلية تُحجب الآن)،
+            # وبقاؤه يقصّر شوطاً لاحقاً نحوها لو رُفع الحجب.
+            self._set_progress(None, 0.0)
+            self.grid.mark_blocked(*nxt)
+            self.dirty.add(nxt)
+            self._log("obstacle_detected",
+                      f"عائق ({nxt[0]},{nxt[1]}) — "
+                      f"{fwd.get('reason') or fwd.get('aborted')}")
+            return {"ok": False, "entered": False, "blocked_cell": nxt}
+
+        # ══ 🔴 البند 0: هل تحرّك الروبوت فعلاً؟ ═══════════════
+        # الأمر نُفّذ بلا إجهاض — وهذا **لا يعني** أن الروبوت تحرّك.
+        # بلا هذا الفحص تُعلَّم الخلية من الموقع المحسوب وحده، وهو ما
+        # أنتج ادّعاء 1.8م لشوط قطع 0.20م.
+        if mv.get("verdict") in (SHORT, OVERSHOOT):
+            self._log("motion_mismatch",
+                      f"⚠ {mv.get('reason', 'فرق بين المقاس والمحسوب')} — "
+                      f"اعتُمدت المسافة المقاسة لا المحسوبة")
+        if mv.get("moved") is False:
+            self._stuck += 1
+            self._log("no_motion",
+                      f"⛔ {mv.get('reason', 'لا حركة')} — الخلية "
+                      f"({nxt[0]},{nxt[1]}) **لا تُعلَّم مزارة** "
+                      f"(محاولة {self._stuck}/{MOTION_STUCK_LIMIT})")
+            if self._stuck >= MOTION_STUCK_LIMIT:
+                self._log("stuck",
+                          f"⛔ لا حركة في {self._stuck} محاولات متتالية — "
+                          f"الروبوت عالق أو منزلق. إيقاف المهمة بدل "
+                          f"استنزاف البطارية بلا تقدّم.")
+                self.estop()
+                return {"ok": False, "entered": False, "fatal": True}
+            return {"ok": False, "entered": False, "no_motion": True}
+        self._stuck = 0
+
+        # حركة ناقصة: تقدّم لكنه لم يبلغ الخلية ⇒ لا تُعلَّم، ويُؤمر
+        # بالمتبقّي في الدورة التالية (لا بخلية كاملة تتجاوزها).
+        prog = self._progress_toward(nxt) + max(step_m, 0.0)
+        if prog < CELL_SIZE_M - MOTION_CELL_ENTER_TOL_M:
+            self._set_progress(nxt, prog)
+            self._log("partial_motion",
+                      f"تقدّم {prog:.2f}م من {CELL_SIZE_M:.2f}م نحو "
+                      f"({nxt[0]},{nxt[1]}) — يُستكمل المتبقّي")
+            return {"ok": True, "entered": False, "partial_m": round(prog, 2)}
+        self._set_progress(None, 0.0)
+
+        self.current = nxt
+        self.trail.append(self.current)
+        self.breadcrumb_push()              # أثر الدخول (للانسحاب الآمن)
+        low_conf = not mv.get("confident", True)
+        if measure:
+            # القاعدة الثالثة: بلا مرجع لا تُدَّعى ثقة كاملة
+            self._visit(self.current, low_confidence=low_conf)
+        else:
+            # انسحاب: لا وقت للقياس، والخلية مزارة أصلاً على الأثر
+            self.dirty.add(self.current)
+        s = self.sensors()
+        self.executor.maybe_wall_correct(self.dr, self.heading,
+                                         s.get("ultrasonic_cm"))
+        self._check_battery()
+        return {"ok": True, "entered": True, "cell": nxt,
+                "low_confidence": low_conf}
+
+    def _face(self, target_heading: float) -> bool:
+        """يلفّ نحو اتجاه مطلوب ويحدّث الاتجاه فوراً. False عند فشل اللفّة."""
+        t = self.executor.turn_to(self.heading, target_heading)
+        turned = t.get("turned_deg", 0.0)
+        if self.dr and turned:
+            self.dr.turn(turned)
+            self.heading = self.dr.heading
+        if not t["ok"]:
+            why = ("مهلة اللفّ" if t.get("timed_out")
+                   else f"إجهاض ({t.get('aborted')})")
+            self._log("turn_failed",
+                      f"فشل اللفّ نحو {target_heading:.0f}° — {why}")
+            return False
+        return True
+
+    def _log_heading_hold(self, fwd: dict) -> None:
+        """تثبيت الاتجاه: عطله يُبلَّغ **دائماً**، وجودته عند تدهورها فقط."""
+        hh = fwd.get("heading_hold") or {}
+        if hh.get("base_capped") and not self._base_cap_logged:
+            self._base_cap_logged = True     # مرة واحدة لا كل خلية
+            want, got = hh["base_capped"]
+            self._log("speed_cap",
+                      f"سلّم السلامة يطلب {want} والمطبَّق {got} — "
+                      f"تثبيت الاتجاه يحتاج فراغاً للتصحيح "
+                      f"(0.50 تترك فراغاً صفراً). السرعة ≈{got * 1.5:.2f} م/ث")
+        if hh.get("lost"):
+            self._log("heading_hold",
+                      f"⚠ تعذّر تثبيت الاتجاه — {hh['lost']} (تقدّم بحلقة مفتوحة)")
+        elif hh.get("max_abs_error_deg", 0) > 5.0:
+            self._log("heading_hold",
+                      f"⚠ خطأ اتجاه {hh['max_abs_error_deg']:.1f}° "
+                      f"(متوسط {hh['mean_abs_error_deg']:.1f}°، "
+                      f"إشباع {hh['saturated_pct']}%)")
 
     def tick(self):
         self._check_battery()
@@ -603,8 +732,8 @@ class MissionSim:
         self.dr.move("F", DEFAULT_POWER, CELL_SIZE_M / max(0.05, speed))  # ينمّي شك المسافة
         self.current = nxt
         self.trail.append(self.current)
-        self.mission_time_s += CELL_DWELL_S
-        self._visit(self.current)
+        self.breadcrumb_push()
+        self._visit(self.current)       # ← يحتسب زمن القياس بنفسه
         self._try_wall_correction()
         if self._returning and self.current == self.grid.start_cell():
             self._finish()
@@ -612,6 +741,345 @@ class MissionSim:
     def _current_start(self):
         s = self.grid.start_cell()
         return None if self.current == s else s
+
+    # ── البند 0: المسافة المعتمدة والتقدّم الجزئي ────────────────
+    def _reset_motion_state(self) -> None:
+        self._stuck = 0
+        self._progress_cell = None
+        self._cell_progress = 0.0
+        self._unverified_cells = 0
+        self._last_motion = None
+        self.breadcrumbs = []
+        self._retracing = False
+        self._withdraw_req = None
+        self.phase = PHASE_SURVEY
+        self.cycle = None
+        self._rolling_warned = False
+
+    def _motion_step_m(self, covered: float, motion: dict) -> float:
+        """
+        المسافة التي يتقدّم بها `deadreckoning`.
+
+        🔴 **المقاسة تسبق المحسوبة**: `covered` تكامل نظري (سرعة معايرة ×
+        زمن) لا يعرف انزلاقاً ولا انحشاراً — وهو مصدر خطأ الـ9 أضعاف. متى
+        قِيست الإزاحة بالألترا سونيك اعتُمدت هي، ويبقى `covered` احتياطاً
+        حين لا مرجع (وهو حينها معلَن بثقة منخفضة لا مسكوتاً عنه).
+        """
+        measured = motion.get("measured_m") if motion else None
+        if measured is None or not MOTION_TRUST_MEASURED:
+            return max(float(covered), 0.0)
+        return max(float(measured), 0.0)
+
+    def _progress_toward(self, cell) -> float:
+        """ما قُطع فعلاً نحو هذه الخلية في محاولات سابقة (0 لخلية جديدة)."""
+        return self._cell_progress if self._progress_cell == cell else 0.0
+
+    def _set_progress(self, cell, meters: float) -> None:
+        self._progress_cell = cell
+        self._cell_progress = max(0.0, float(meters)) if cell else 0.0
+
+    # ══════════════════════════════════════════════════════════════
+    # البند 4: أثر المسار والانسحاب الآمن
+    # ══════════════════════════════════════════════════════════════
+    def breadcrumb_push(self) -> None:
+        """
+        نقطة على أثر المسار (خلية + موضع + اتجاه).
+
+        🔴 لماذا نحتفظ بالأثر أصلاً: حين يصير الموقع **غير قابل للتحديد**
+        (عدّاد مشلول، بداية غير قانونية) يأمر النظام بالانسحاب وهو **لا يعرف
+        أين المصدر** — فأي اتجاه قد يكون نحوه. الاتجاه الآمن الوحيد هو الطريق
+        الذي دخل منه: قِيس فعلاً وكان آمناً حين عُبر.
+        """
+        if self.dr is None or self._retracing:
+            return
+        pt = {"cell": tuple(self.current), "x": round(self.dr.x, 3),
+              "y": round(self.dr.y, 3), "heading": round(self.heading, 1),
+              "t": round(self.mission_time_s, 1)}
+        if self.breadcrumbs and self.breadcrumbs[-1]["cell"] == pt["cell"]:
+            return                       # لا تكرار لنفس الخلية
+        self.breadcrumbs.append(pt)
+        if len(self.breadcrumbs) > BREADCRUMB_MAX:
+            # ⚠ **لا نحذف الأقدم**: أقدم النقاط هي طريق **الخروج** وأهمّها.
+            #    نُخفّف دقّة النصف الأقدم بدل بتره — والتخطيط (A*) يملأ ما
+            #    بين النقاط المتباعدة فيبقى المسار سالكاً.
+            self.breadcrumbs = (self.breadcrumbs[:BREADCRUMB_MAX // 2:2]
+                                + self.breadcrumbs[BREADCRUMB_MAX // 2:])
+
+    def request_withdraw(self, until_cpm=None, reason: str = "") -> dict:
+        """
+        يطلب انسحاباً. 🔴 **أولوية مطلقة**: يتجاوز أي هدف مسح أو تغطية،
+        ويُخدَم في رأس حلقة التنفيذ قبل اختيار أي هدف.
+
+        ⚠ يُرفض صراحةً بلا قيادة محركات بدل أن يُقبل ويُهمَل بصمت: أمر سلامة
+           «مقبول» لا يُنفَّذ أسوأ من أمر مرفوض بوضوح.
+        """
+        if not self._can_drive():
+            msg = "طلب انسحاب بلا قيادة محركات — لا حركة تُنفَّذ"
+            self._log("withdraw_request", f"⚠ {msg}")
+            return {"ok": False, "error": msg}
+        self._withdraw_req = {"until_cpm": until_cpm, "reason": reason or "أمر انسحاب"}
+        self._log("withdraw_request", f"🔴 طلب انسحاب — {self._withdraw_req['reason']}")
+        return {"ok": True, **self._withdraw_req}
+
+    def _serve_withdraw(self) -> None:
+        """يُنفّذ الطلب المعلّق ثم ينهي المهمة (لا استئناف مسح بعد انسحاب)."""
+        req = self._withdraw_req or {}
+        self._withdraw_req = None
+        res = self.retrace_path(until_cpm=req.get("until_cpm"),
+                                reason=req.get("reason", ""))
+        self.cycle = dict(self.cycle or {}, withdraw=res)
+        if self.state == RUNNING:
+            self.state = DONE
+            self._set_phase(PHASE_REPORT)
+
+    def _safe_cpm_threshold(self) -> float:
+        bg = self.locator.background_cpm if self.locator else 0.0
+        return max(RETRACE_SAFE_CPM_FACTOR * float(bg), 1.0)
+
+    def retrace_path(self, until_cpm=None, reason: str = "") -> dict:
+        """
+        الانسحاب **على أثر الدخول عكسياً** حتى تنخفض القراءة دون العتبة.
+
+        ⚠ لا قياس تغطية أثناء الانسحاب (`measure=False`): السلامة تسبق جمع
+           البيانات، والتوقف 3ث في كل خلية داخل حقل إشعاعي خطأ لا دقّة.
+        ⚠ الرجوع هنا **بالتقدّم على الأثر** لا بالقهقرى: الحساسات تنظر لجهة
+           السير، فالدوران ومتابعة الأثر أأمن من رجوع أعمى طويل.
+        """
+        thr = float(until_cpm) if until_cpm is not None else self._safe_cpm_threshold()
+        self._set_phase(PHASE_WITHDRAW)
+        self._log("retrace",
+                  f"🔴 انسحاب على أثر المسار حتى < {thr:,.0f} CPM"
+                  + (f" — {reason}" if reason else ""))
+        self._retracing = True
+        steps, reached_entry = 0, False
+        try:
+            while steps < RETRACE_MAX_CELLS:
+                if self.state in (ESTOP, IDLE):
+                    break
+                x, y = ((self.dr.x, self.dr.y) if self.dr
+                        else self.grid.cell_center(*self.current))
+                # قياس قصير: نريد «هل صرنا آمنين؟» لا تقديراً دقيقاً
+                m = self._measure(x, y, min(CELL_DWELL_S, 2.0))
+                self.last_reading = {"cpm": round(m["cpm"], 1),
+                                     "usvh": round(m["usvh"], 3),
+                                     **{k: v for k, v in classify(m["usvh"]).items()
+                                        if k in ("risk", "color")}}
+                if m["cpm"] <= thr:
+                    self._log("retrace_done",
+                              f"✅ القراءة {m['cpm']:,.0f} CPM دون العتبة "
+                              f"{thr:,.0f} — توقف الانسحاب هنا")
+                    return {"ok": True, "safe": True, "steps": steps,
+                            "cpm": round(m["cpm"], 1), "threshold_cpm": thr,
+                            "reached_entry": reached_entry}
+                # آخر نقطة أثر تختلف عن الخلية الحالية
+                while self.breadcrumbs and self.breadcrumbs[-1]["cell"] == self.current:
+                    self.breadcrumbs.pop()
+                if not self.breadcrumbs:
+                    reached_entry = True
+                    self._log("retrace_done",
+                              f"⚠ بلغ نقطة الدخول والقراءة ما زالت "
+                              f"{m['cpm']:,.0f} CPM — لا أثر أبعد منه")
+                    return {"ok": True, "safe": False, "steps": steps,
+                            "cpm": round(m["cpm"], 1), "threshold_cpm": thr,
+                            "reached_entry": True}
+                tgt = self.breadcrumbs[-1]["cell"]
+                r = self._advance_one_cell(tgt, measure=False)
+                steps += 1
+                if r.get("fatal"):
+                    return {"ok": False, "safe": False, "steps": steps,
+                            "reason": "توقف الانسحاب: الروبوت عالق"}
+                if r.get("no_path"):
+                    self.breadcrumbs.pop()      # نقطة غير قابلة للوصول — تخطَّها
+        finally:
+            self._retracing = False
+        return {"ok": False, "safe": False, "steps": steps,
+                "reason": f"بلغ سقف {RETRACE_MAX_CELLS} خلية انسحاب"}
+
+    # ══════════════════════════════════════════════════════════════
+    # البند 3: إعادة مسح منطقة (التأكيد على مرحلتين)
+    # ══════════════════════════════════════════════════════════════
+    def _drive_to_cell(self, target, max_cells: int = 40,
+                       measure: bool = False) -> dict:
+        """يكرّر الأوّلية الحركية حتى بلوغ الخلية أو تعذّره."""
+        for _ in range(max(1, int(max_cells))):
+            if self.current == tuple(target):
+                return {"ok": True, "arrived": True}
+            if self.state in (ESTOP, IDLE) or self._withdraw_req is not None:
+                return {"ok": False, "arrived": False, "reason": "أُلغي"}
+            r = self._advance_one_cell(target, measure=measure)
+            if r.get("fatal"):
+                return {"ok": False, "arrived": False, "reason": "عالق"}
+            if r.get("no_path"):
+                return {"ok": False, "arrived": False, "reason": "لا مسار"}
+        return {"ok": False, "arrived": self.current == tuple(target),
+                "reason": "بلغ سقف الخلايا"}
+
+    def rescan_region(self, center_xy, radius_m: float = None,
+                      positions: int = None, dwell_s: float = None) -> dict:
+        """
+        إعادة مسح **منطقة** حول موقع مشتبه بقياسات جديدة مستقلة (البند 3).
+
+        🔴 **تتجاهل علم `visited` عمداً**: `_next_target` يرفض الخلايا المزارة،
+        والتأكيد يحتاج بالضبط **إعادة زيارة** خلايا مُعلَّمة. هذه الدالة تقود
+        الروبوت إلى مواضع محدَّدة بلا المرور بمخطّط التغطية أصلاً.
+
+        🔴 **والخلايا المُعاد مسحها تبقى محسوبة في التغطية ولا تُطرح منها** —
+        التأكيد إضافة لا تراجع. (لا سطر هنا يُنقص `visited` ولا يُعيد ضبطها.)
+
+        **منطقة لا نقطة**: بلا إنكودرات تنحرف العودة عشرات السنتيمترات، فبدل
+        اشتراط بلوغ نقطة نقيس عند **عدة مواضع متفرقة الزوايا** حولها ونقبل
+        القراءة أينما وقعت داخل المنطقة — والتنويع **أهم من العدد** لأنه
+        يُثلّث المصدر. وكل قياس بزمن أطول من المسح العادي: ننفق الوقت حيث يفيد.
+        """
+        if self.grid is None or self.locator is None:
+            return {"ok": False, "reason": "لا غرفة/منسّق"}
+        if not self._can_drive():
+            return {"ok": False, "reason": "إعادة المسح تحتاج قيادة محركات "
+                                           "فعلية (قياسات جديدة لا محاكاة)"}
+        r = float(radius_m if radius_m is not None else CONFIRM_RADIUS_M)
+        dwell = float(dwell_s if dwell_s is not None else CONFIRM_DWELL_S)
+        n = int(positions if positions is not None else CONFIRM_POSITIONS)
+        # الخطة من المنسّق نفسه (حلقة زوايا متفرقة) — مصدر واحد للحقيقة
+        plan = self.locator.confirmation_plan(tuple(center_xy), r)[:max(1, n)]
+        self._log("rescan",
+                  f"إعادة مسح منطقة حول ({center_xy[0]:.2f},{center_xy[1]:.2f}) "
+                  f"نصف قطر {r:.2f}م — {len(plan)} موضعاً × {dwell:.0f}ث")
+        done, skipped = [], []
+        for (px, py) in plan:
+            if self.state in (ESTOP, IDLE) or self._withdraw_req is not None:
+                break
+            cell = self.grid.cell_index(px, py)
+            if cell is None or not self.grid.passable(*cell):
+                skipped.append({"xy": [px, py], "why": "خارج الغرفة أو محجوبة"})
+                continue
+            nav = self._drive_to_cell(cell, RESCAN_MAX_CELLS_PER_POINT)
+            # ⚠ نقيس عند الموضع **الفعلي** لا المخطَّط: هذا جوهر «منطقة لا
+            #    نقطة» — نقبل حيث وصلنا ونُبلّغ موضعه الحقيقي مع σ الخاصة به،
+            #    بدل تسجيل قراءة على إحداثيات لم يقف عندها الروبوت.
+            ax, ay = ((self.dr.x, self.dr.y) if self.dr
+                      else self.grid.cell_center(*self.current))
+            m = self._measure(ax, ay, dwell)
+            self._feed_locator(ax, ay, m, purpose=CONFIRM)
+            # القراءة الجديدة تُحدّث الخريطة أيضاً (إضافة لا تراجع)
+            self.grid.update_reading(ax, ay, m["cpm"], m["usvh"])
+            self.dirty.add(tuple(self.current))
+            self.last_reading = {"cpm": round(m["cpm"], 1),
+                                 "usvh": round(m["usvh"], 3),
+                                 **{k: v for k, v in classify(m["usvh"]).items()
+                                    if k in ("risk", "color")}}
+            done.append({"planned": [px, py], "actual": [round(ax, 3), round(ay, 3)],
+                         "cpm": round(m["cpm"], 1), "arrived": nav.get("arrived"),
+                         "err_m": round(math.hypot(ax - px, ay - py), 2)})
+        self._log("rescan_done",
+                  f"إعادة المسح: {len(done)} قياس تأكيد جديد"
+                  + (f" · تُخطّي {len(skipped)}" if skipped else ""))
+        return {"ok": bool(done), "measured": done, "skipped": skipped,
+                "center": list(center_xy), "radius_m": r, "dwell_s": dwell}
+
+    # ══════════════════════════════════════════════════════════════
+    # البند 5: تتبّع التدرّج في المتر الأخير
+    # ══════════════════════════════════════════════════════════════
+    def _move_meters(self, dist_m: float, direction: int = +1) -> dict:
+        """
+        شوط حرّ بالمتر خارج شبكة الخلايا — للاقتراب والتراجع القصير.
+        يمرّ بنفس التحقق من الحركة، ويحدّث الموقع بالمسافة **المقاسة**.
+        """
+        d = abs(float(dist_m))
+        if direction >= 0:
+            wall = (self._wall_distance_from(self.dr.x, self.dr.y, self.heading)
+                    if self.dr else None)
+            exp = max(0.0, wall - d) if wall is not None else None
+            fwd = self.executor.forward_cell(d, expected_wall_end_m=exp)
+        else:
+            fwd = self.executor.backward_step(d)
+        mv = fwd.get("motion") or {}
+        if mv:
+            self._last_motion = dict(mv, model_m=fwd.get("covered_m", 0.0))
+        step = self._motion_step_m(fwd.get("covered_m", 0.0), mv)
+        if self.dr and step:
+            self.dr.advance(step if direction >= 0 else -step,
+                            verified=mv.get("confident", True))
+        # الخلية الحالية تُشتقّ من الموقع (الحركة الحرّة تعبر الحدود)
+        idx = (self.grid.cell_index(self.dr.x, self.dr.y) if self.dr else None)
+        if idx is not None and idx != self.current:
+            self.current = idx
+            self.trail.append(idx)
+            self.dirty.add(idx)
+            self.breadcrumb_push()
+        # ⚠ حارس البطارية/الزمن يجب أن يبقى يعمل في **أخطر** الأطوار: الحركة
+        #    الحرّة تجري خارج حلقة الخلايا، فلولا هذا السطر لتوقّف الحارس أثناء
+        #    الاقتراب من المصدر تحديداً.
+        self._check_battery()
+        return {"ok": fwd.get("ok", False), "moved_m": round(step, 3),
+                "direction": direction, "motion": mv}
+
+    def follow_gradient(self, target_xy=None, max_steps: int = None) -> dict:
+        """
+        المتر الأخير: **توقّف عن الملاحة بالإحداثيات واتبع الإشارة** (البند 5).
+        قِس → تحرّك قليلاً → قِس ثانيةً؛ العدّ يزيد = تقترب.
+
+        ⚠ **حارس التذبذب مبني في الطبقة الأخرى** (`GradientApproach`) ولا
+           يُكرَّر هنا — لكنه **يُطاع**: أمر `withdraw` يُنفَّذ فوراً بالانسحاب
+           على الأثر، وأمر التراجع ينفَّذ خطوةً للخلف بلا نقاش.
+        """
+        if not self._can_drive():
+            return {"ok": False, "reason": "تتبّع التدرّج يحتاج قيادة محركات"}
+        bg = self.locator.background_cpm if self.locator else 0.0
+        ga = GradientApproach(background_cpm=bg, step_m=APPROACH_STEP_M,
+                              max_steps=max_steps or APPROACH_MAX_STEPS)
+        # آخر استعمال للإحداثيات: التوجّه نحو الهدف مرة واحدة، ثم الإشارة تقود
+        if target_xy is not None and self.dr is not None:
+            self._face(source_bearing_deg((self.dr.x, self.dr.y), target_xy))
+        self._log("gradient",
+                  f"تتبّع التدرّج — خطوة {APPROACH_STEP_M:.2f}م وقياس "
+                  f"{APPROACH_DWELL_S:.0f}ث بينها")
+        history, verdict = [], None
+        for _ in range(ga.max_steps):
+            if self.state in (ESTOP, IDLE) or self._withdraw_req is not None:
+                verdict = "أُلغي"
+                break
+            x, y = ((self.dr.x, self.dr.y) if self.dr
+                    else self.grid.cell_center(*self.current))
+            m = self._measure(x, y, APPROACH_DWELL_S)
+            # `approaching` **معلوم يقيناً** في هذا الطور — وهو مورد حارس
+            # الانخفاض-أثناء-الاقتراب الطبيعي (لا تخمين).
+            self._feed_locator(x, y, m, purpose=SURVEY,
+                               approaching=(ga.direction > 0))
+            self.last_reading = {"cpm": round(m["cpm"], 1),
+                                 "usvh": round(m["usvh"], 3),
+                                 **{k: v for k, v in classify(m["usvh"]).items()
+                                    if k in ("risk", "color")}}
+            cmd = ga.step(x, y, m["counts"], duration_s=m["duration_s"],
+                          heading_deg=self.heading)
+            history.append({"xy": [round(x, 2), round(y, 2)],
+                            "cpm": cmd["cpm"], "command": cmd["command"]})
+            if cmd["command"] == STOP:
+                verdict = "stop"
+                self._log("gradient_stop", cmd["reason"][:150])
+                break
+            if cmd["command"] == WITHDRAW:
+                verdict = "withdraw"
+                self._log("gradient_withdraw", cmd["reason"][:150])
+                self.retrace_path(reason="أمر تراجع من حارس التذبذب")
+                break
+            if cmd["command"] == MOVE:
+                self._move_meters(cmd["step_m"], direction=cmd["direction"])
+        else:
+            verdict = "max_steps"
+        return {"ok": True, "verdict": verdict, "steps": ga.n_steps,
+                "reversals": ga.reversals, "history": history,
+                "stopped": ga.stopped}
+
+    # ══════════════════════════════════════════════════════════════
+    # البند 6: تنسيق المراحل الست
+    # ══════════════════════════════════════════════════════════════
+    def _can_drive(self) -> bool:
+        return bool(self.drive_motors and self.executor is not None)
+
+    def _set_phase(self, phase: str) -> None:
+        if phase != self.phase:
+            self.phase = phase
+            self._log("phase", f"المرحلة: {PHASE_AR.get(phase, phase)}")
 
     # ── مساعدات داخلية ───────────────────────────────────────────
     def _base_order(self):
@@ -626,6 +1094,102 @@ class MissionSim:
         if prioritized:
             return max(prioritized, key=lambda rc: self.grid.get(*rc).priority)
         return rem[0]
+
+    # ══ عقد القراءات: قياس على نافذة زمنية **محدَّدة** (القسم 1) ══
+    def _measure(self, x: float, y: float, duration_s: float) -> dict:
+        """
+        قياس واحد عند الموضع الحالي — يتوقّف ويعدّ **فعلاً**.
+
+        🔴 مع عدّاد حقيقي تُطرح قراءتا `tally` قبل/بعد فتكون العدّات عدّات
+        **هذه الفترة وهذا الموضع**. اشتقاقها من `cpm` (نافذة 30ث منزلقة) يخلط
+        عدّ الخلية بعدّ ~عشر خلايا سابقة، أي **يلطّخ الإشارة مكانياً** — وهي
+        المعلومة الوحيدة التي يبني عليها محدِّد المصدر تقديره.
+        وحين يتعذّر `tally` نسقط إلى النافذة المنزلقة **ونُعلن ذلك** في
+        `window` بدل تمريرها كأنها قياس فترة.
+
+        بلا عتاد (ويندوز/محاكاة): نموذج SimWorld فوراً بلا انتظار — لا معلومة
+        في الانتظار حين تكون القيمة محسوبة.
+        """
+        dur = max(0.0, float(duration_s))
+        g = getattr(self, "geiger", None)
+        if g is not None and getattr(g, "ok", False):
+            t0 = g.tally() if hasattr(g, "tally") else None
+            if t0 is not None:
+                started = time.time()
+                time.sleep(dur)
+                t1 = g.tally()
+                actual = max(time.time() - started, 1e-6)
+                if t1 is not None and t1 >= t0:
+                    counts = float(t1 - t0)
+                    cpm_raw = counts * 60.0 / actual
+                    corr = dead_time_correct(cpm_raw)
+                    return {"counts": counts, "duration_s": actual,
+                            "cpm": corr["cpm_true"], "usvh": corr["usvh"],
+                            "cpm_raw": cpm_raw, "window": "exact"}
+            # ⚠ **تدهور معلَن لا صامت**: هذا المسار يشتقّ العدّات من النافذة
+            #    المنزلقة (30ث) — أي العلّة نفسها التي عولجت بـ`tally`. يبقى
+            #    كاحتياط لأن قراءة بلا عدّات أسوأ من قراءة ملطَّخة موسومة،
+            #    لكنه يُصرَّح به مرة واحدة في السجل ويُوسم في كل قراءة.
+            if not self._rolling_warned:
+                self._rolling_warned = True
+                self._log("geiger_window",
+                          f"⚠ تعذّر `tally` — العدّات مشتقّة من نافذة "
+                          f"{GEIGER_WINDOW_S:.0f}ث المنزلقة، فالإشارة **ملطَّخة "
+                          f"مكانياً** عبر الخلايا السابقة. تحقّق من العدّاد.")
+            st = g.state()
+            return {"counts": st["cpm_raw"] * dur / 60.0, "duration_s": dur,
+                    "cpm": st["cpm"], "usvh": st["usvh"],
+                    "cpm_raw": st["cpm_raw"], "window": "rolling"}
+        cpm, usvh = self.world.reading_at(x, y)
+        return {"counts": cpm * dur / 60.0, "duration_s": dur,
+                "cpm": cpm, "usvh": usvh, "cpm_raw": cpm, "window": "sim"}
+
+    def _pos_sigma(self) -> float:
+        """
+        🔴 عدم يقين الموضع — **إلزامي مع كل قراءة، ولا يكون صفراً أبداً**.
+
+        الصفر يعني «موضع مؤكَّد» والروبوت بلا إنكودرات. أثره مقاس: عند انحراف
+        0.8م يُبلَّغ عدم يقين 0.21م بينما الخطأ الفعلي 0.63م — أضيق 2.9×،
+        ومع الترجيح الصحيح صار خطأ التقدير 0.14م بدل 0.46م.
+        الأرضية `UNCERTAINTY_INITIAL` لأن أدقّ حالاتنا (تصحيح جدار مباشر)
+        لا تنزل تحتها أصلاً — فادّعاء ما دونها اختراع.
+        """
+        u = self.dr.uncertainty if self.dr is not None else 0.0
+        return max(float(u), UNCERTAINTY_INITIAL)
+
+    def _feed_locator(self, x, y, m: dict, purpose: str = SURVEY,
+                      approaching=None) -> dict:
+        """
+        القناة **الوحيدة** إلى محدِّد المصدر — فلا مسار يفلت من `pos_sigma_m`.
+        الاستثناء يُسجَّل ولا يُسقط المهمة (طبقة أعلى لا تتحكّم بالأدنى).
+        """
+        if self.locator is None:
+            return {}
+        try:
+            return self.locator.add_reading(
+                float(x), float(y), self.heading,
+                counts_L=m["counts"], duration_s=m["duration_s"],
+                pos_uncertainty_m=self._pos_sigma(),
+                purpose=purpose, approaching=approaching) or {}
+        except Exception as e:                 # noqa: BLE001
+            self._log("locator_error", f"⚠ تعذّرت تغذية المنسّق: {e}"[:140])
+            return {}
+
+    def _inconclusive_extension_s(self, info: dict) -> float:
+        """
+        كم يُطال التجميع. **فقط للقراءة الغامضة** — أي انحراف نزولي دالّ لم
+        يبلغ حدّ الحسم، وهي وحدها التي تحتمل تفسيرين: منطقة نظيفة أم شلل زمن
+        ميت. ⚠ الإطالة لكل قراءة قليلة العدّات كارثة زمنية: في غرفة نظيفة
+        كل قراءة دون `DWELL_MIN_COUNTS`، فتصير كل خلية 60ث.
+        المصدر هو وسم المنسّق نفسه على آخر قراءة (`inconclusive`) — لا نُعيد
+        اشتقاق المعيار هنا فيصير مصدرا حقيقة متناقضان.
+        """
+        if not info or self.locator is None or not self.locator.readings:
+            return 0.0
+        if not self.locator.readings[-1].get("inconclusive"):
+            return 0.0
+        extra = info.get("extend_dwell_s") or 0.0
+        return min(float(extra), DWELL_MAX_S)
 
     def _wall_distance_from(self, x: float, y: float, heading: float):
         """مسافة جدار الغرفة أمام نقطة باتجاه معيّن (من الخريطة لا الحساس)."""
@@ -683,42 +1247,48 @@ class MissionSim:
                 "ir_left_hits": left_hits, "ir_right_hits": right_hits,
                 "samples": samples}
 
-    def _read_radiation(self, x: float, y: float):
+    def _visit(self, cell, low_confidence: bool = False, dwell_s=None,
+               purpose: str = SURVEY):
         """
-        قراءة الإشعاع: **العدّاد الحقيقي** متى توفّر (مسح حقيقي)، وإلا نموذج
-        SimWorld. الإشعاع لا يُحاكى أبداً حين يكون العتاد متصلاً.
-        """
-        g = getattr(self, "geiger", None)
-        if g is not None and getattr(g, "ok", False):
-            st = g.state()
-            return st["cpm"], st["usvh"]
-        return self.world.reading_at(x, y)
+        **يقيس** الخلية (يتوقّف ويعدّ) ثم يسجّلها ويغذّي محدِّد المصدر.
 
-    def _visit(self, cell):
+        `low_confidence`: لم يُتحقَّق من حركة الوصول إليها (البند 0) — تُحتسب
+        في التغطية لكن بلون مختلف وذكرٍ صريح في النص والتقرير.
+        """
         r, c = cell
         gc = self.grid.get(r, c)
         already = gc.visited
         x, y = self.grid.cell_center(r, c)
-        cpm, usvh = self._read_radiation(x, y)
+        # الموضع المقاس أصدق من مركز الخلية حين يتوفّر تتبّع فعلي
+        px, py = (self.dr.x, self.dr.y) if self.dr is not None else (x, y)
+        m = self._measure(px, py, CELL_DWELL_S if dwell_s is None else dwell_s)
+        self.mission_time_s += m["duration_s"]
+        cpm, usvh = m["cpm"], m["usvh"]
         anomaly = (not already) and self.stats.is_anomaly(cpm)
         if not already:
             self.stats.add(cpm)
-        self.grid.update_reading(x, y, cpm, usvh)
+        self.grid.update_reading(x, y, cpm, usvh, low_confidence=low_confidence)
+        if low_confidence and not already:
+            self._unverified_cells += 1
         self.dirty.add(cell)
         risk = classify(usvh)
         # ── تغذية محدِّد المصدر — **مجاناً بلا وقت إضافي** ────────
         # كل قراءة مسح تدخل الشبكة البايزية أصلاً؛ لا توقف إضافي ولا مسار
-        # منفصل. وعدم يقين الموقع يُمرَّر من deadreckoning كما هو (البند 3):
-        # تركه صفراً يعني ادعاء موضع مؤكد والروبوت بلا إنكودرات.
-        if self.locator is not None:
-            try:
-                self.locator.add_reading(
-                    x, y, self.heading,
-                    counts_L=cpm * CELL_DWELL_S / 60.0,   # معدّل → عدّات الفترة
-                    duration_s=CELL_DWELL_S,
-                    pos_uncertainty_m=(self.dr.uncertainty if self.dr else 0.0))
-            except Exception:                  # noqa: BLE001 — لا يُسقط المهمة
-                pass
+        # منفصل. وعدم يقين الموقع **إلزامي** مع كل قراءة (القسم 1).
+        info = self._feed_locator(px, py, m, purpose=purpose)
+        # التجميع التكيّفي: يُطال الزمن **فقط** للقراءة الغامضة (نظيفة أم شلل؟)
+        extra = self._inconclusive_extension_s(info)
+        if extra > 0:
+            self._log("extend_dwell",
+                      f"قراءة غامضة عند ({px:.2f},{py:.2f}) — إطالة التجميع "
+                      f"{extra:.0f}ث للحسم بين «نظيفة» و«شلل زمن ميت»")
+            m2 = self._measure(px, py, extra)
+            self.mission_time_s += m2["duration_s"]
+            self._feed_locator(px, py, m2, purpose=purpose)
+            cpm, usvh = m2["cpm"], m2["usvh"]     # الأطول أدقّ إحصائياً
+            self.grid.update_reading(x, y, cpm, usvh,
+                                     low_confidence=low_confidence)
+            risk = classify(usvh)
         self.last_reading = {"cpm": round(cpm, 1), "usvh": round(usvh, 3),
                              "risk": risk["risk"], "color": risk["color"]}
         self.records.append({
@@ -728,6 +1298,8 @@ class MissionSim:
             "heading": round(self.heading, 0),
             "uncertainty_m": round(self.dr.uncertainty, 2) if self.dr else 0.0,
             "anomaly": 1 if anomaly else 0,
+            # البند 0: هل تحقّقنا من حركة الوصول إلى هذا الموضع؟
+            "motion_verified": 0 if low_confidence else 1,
         })
         if anomaly:
             self.anomalies.append({"cell": cell, "cpm": round(cpm, 1), "usvh": round(usvh, 3)})
@@ -759,11 +1331,132 @@ class MissionSim:
             self.state = DONE
             self._log("mission_end",
                       f"انتهى المسح — {self.grid.coverage_text()}")
-            self._document_source()          # ← يكمل حلقة المشروع
+            self._run_cycle()                # ← الدورة الكاملة لا التوثيق وحده
         self.planned_path = []
 
+    # ── الدورة الكاملة: مسح → فرز → تأكيد → اقتراب → توقف → توثيق ──
+    def _run_cycle(self) -> dict:
+        """
+        تنسيق المراحل الست (البند 6). كل انتقال **بحكم المنسّق** لا برغبة
+        الملاحة — تدرّج الطبقات في CLAUDE.md §5: الملاحة تنفّذ والمنسّق يحكم.
+
+        ⚠ المراحل الحركية (تأكيد/اقتراب) تحتاج **قيادة محركات فعلية**: التأكيد
+           معناه قياسات **جديدة مستقلة**، ومحاكاتها على نفس نموذج البيانات
+           السابق ليست تأكيداً بل ترديداً. في المسح المنطقي نُخرج الحكم
+           والخطة ونقول صراحةً إن الحركة لم تُنفَّذ.
+        """
+        out = {"phase_log": []}
+        self.cycle = out
+
+        def mark(ph, note=""):
+            self._set_phase(ph)
+            out["phase_log"].append({"phase": ph, "note": note})
+
+        if self.locator is None:
+            return out
+        try:
+            # ── ٢ فرز: عتبة متسامحة على بيانات المسح (بلا وقت إضافي) ──
+            mark(PHASE_SCREEN)
+            s = self.locator.screen()
+            out["screen"] = {k: s.get(k) for k in
+                             ("suspect", "lambda_stat", "threshold", "position",
+                              "verdict", "reason")}
+            hz = self.locator.hazard()
+            out["hazard_level"] = hz["hazard_level"]
+            if hz.get("withdraw"):
+                # 🔴 السلامة تسبق كل شيء: لا تأكيد ولا اقتراب
+                mark(PHASE_WITHDRAW, hz.get("alarm"))
+                out["withdraw"] = self.retrace_path(
+                    reason=hz.get("alarm") or "تقييم خطر يأمر بالانسحاب") \
+                    if self._can_drive() else {"ok": False,
+                                               "reason": "بلا محركات"}
+                out["documentation"] = self._document_source()
+                mark(PHASE_REPORT)
+                return out
+
+            if not s.get("suspect"):
+                # لا اشتباه ⇒ لا تأكيد ولا اقتراب. التوثيق يُحجب بسببه صراحةً.
+                out["documentation"] = self._document_source()
+                mark(PHASE_REPORT, "لا اشتباه — لا تأكيد ولا اقتراب")
+                return out
+
+            # ── ٣ تأكيد: قياسات جديدة مستقلة على **منطقة** ──────────
+            center = self.locator.detector.suspect
+            mark(PHASE_CONFIRM, f"منطقة مشتبهة عند {center}")
+            if self._can_drive():
+                out["rescan"] = self.rescan_region(center)
+            else:
+                out["rescan"] = {"ok": False, "plan": self.locator
+                                 .confirmation_plan(center, CONFIRM_RADIUS_M),
+                                 "reason": "المسح المنطقي لا يُنتج قياسات جديدة "
+                                           "— خطة التأكيد جاهزة للتنفيذ بالمحركات"}
+            v = self.locator.confirm_region(center)
+            out["confirm"] = {k: v.get(k) for k in
+                              ("ready", "confirmed", "lambda_stat", "position",
+                               "uncertainty_m", "n_in_region", "reason")}
+            if not v.get("confirmed"):
+                out["documentation"] = self._document_source()
+                mark(PHASE_REPORT, v.get("reason", "لم يُؤكَّد"))
+                return out
+
+            # ── ٤ اقتراب: إحداثيات حتى المتر الأخير ثم التدرّج ───────
+            rep = self.locator.report()
+            blockers = approach_blockers(rep)
+            out["approach_blockers"] = blockers
+            if blockers:
+                # الموانع تحجب الاقتراب **والصورة** معاً
+                out["documentation"] = self._document_source()
+                mark(PHASE_REPORT, " · ".join(blockers)[:120])
+                return out
+            mark(PHASE_APPROACH)
+            pos = rep.get("position")
+            if self._can_drive() and pos:
+                out["transit"] = self._transit_toward(pos)
+                out["gradient"] = self.follow_gradient(target_xy=pos)
+            else:
+                out["approach"] = {"ok": False,
+                                   "reason": "الاقتراب يحتاج قيادة محركات"}
+
+            # ── ٥ توقف (قرار المنسّق داخل follow_gradient) ثم ٦ توثيق ──
+            mark(PHASE_STOP)
+            mark(PHASE_DOCUMENT)
+            out["documentation"] = self._document_source()
+            mark(PHASE_REPORT)
+        except Exception as e:                # noqa: BLE001 — لا تُسقط المهمة
+            self._log("cycle_error", f"⚠ خطأ في دورة المراحل: {e}"[:160])
+            out["error"] = str(e)[:200]
+        finally:
+            try:
+                self.rover.stop()             # ⚠ إيقاف مضمون بعد أي مرحلة
+            except Exception:                 # noqa: BLE001
+                pass
+        return out
+
+    def _transit_toward(self, pos) -> dict:
+        """
+        الانتقال بالإحداثيات حتى `GRADIENT_TRANSIT_STOP_M` من الموقع المقدَّر.
+        دقّة ±50سم كافية هنا — يكفي بلوغ المنطقة، والمتر الأخير للتدرّج.
+        """
+        cell = self.grid.cell_index(*pos)
+        if cell is None:
+            return {"ok": False, "reason": "الموقع المقدَّر خارج الغرفة"}
+        for _ in range(RETRACE_MAX_CELLS):
+            if self.state in (ESTOP, IDLE) or self._withdraw_req is not None:
+                return {"ok": False, "reason": "أُلغي"}
+            x, y = ((self.dr.x, self.dr.y) if self.dr
+                    else self.grid.cell_center(*self.current))
+            if math.hypot(x - pos[0], y - pos[1]) <= GRADIENT_TRANSIT_STOP_M:
+                return {"ok": True, "arrived": True,
+                        "distance_m": round(math.hypot(x - pos[0], y - pos[1]), 2)}
+            if self.current == cell:
+                return {"ok": True, "arrived": True, "distance_m": None}
+            r = self._advance_one_cell(cell, measure=False)
+            if r.get("fatal") or r.get("no_path"):
+                return {"ok": False, "reason": r.get("reason", "تعذّر الوصول")}
+        return {"ok": False, "reason": "بلغ سقف خلايا الانتقال"}
+
     # ── التوثيق البصري بعد المسح (يكمل حلقة المشروع) ─────────────
-    def _document_source(self) -> None:
+    def _document_source(self) -> dict:
         """
         بعد انتهاء المسح: **اذهب إلى الموقع المقدَّر وصوّره**.
 
@@ -780,7 +1473,7 @@ class MissionSim:
         """
         self.documentation = None
         if self.locator is None:
-            return
+            return {"documented": False, "statement": "لا منسّق"}
         try:
             rep = self.locator.report()
             blockers = approach_blockers(rep)
@@ -789,7 +1482,7 @@ class MissionSim:
                                       "statement": "🔴 لم يُنفَّذ التوثيق البصري: "
                                                    + " · ".join(blockers)}
                 self._log("documentation_skipped", self.documentation["statement"])
-                return
+                return self.documentation
             # الكاميرا والدوران **اختياريان**: غيابهما يُبلَّغ ولا يُسقط المهمة
             x = self.dr.x if self.dr else 0.0
             y = self.dr.y if self.dr else 0.0
@@ -808,6 +1501,7 @@ class MissionSim:
                 self.rover.stop()
             except Exception:                 # noqa: BLE001
                 pass
+        return self.documentation
 
     def _doc_turn_fn(self):
         """
@@ -818,7 +1512,9 @@ class MissionSim:
         دوران هناك يجعل التقرير يدّعي «زوايا مختلفة» بلا دوران — نفس العلّة
         المقاسة على العتاد.
         """
-        if not self.drive_motors:
+        # ⚠ ولا بعد إيقاف الطوارئ: التوثيق قد يُستدعى بعد توقّف قسري، وتدوير
+        #    الروبوت حينها يخالف أمر الإيقاف نفسه.
+        if not self.drive_motors or self.state in (ESTOP, IDLE):
             return None
 
         def _turn(deg):
@@ -844,6 +1540,7 @@ class MissionSim:
         cell = self.grid.get(r, c)
         return {"row": r, "col": c, "visited": cell.visited, "blocked": cell.blocked,
                 "unreachable": cell.unreachable, "priority": cell.priority,
+                "low_confidence": cell.low_confidence,
                 "max_usvh": round(cell.max_usvh, 3), "max_cpm": round(cell.max_cpm, 1)}
 
     def grid_meta(self):
@@ -914,6 +1611,18 @@ class MissionSim:
             "speed_mult": self.speed_mult,
             "events": self.events[-40:],
             "anomaly_cells": [list(a["cell"]) for a in self.anomalies],
+            # البند 0: حالة التحقق من الحركة — تُعرض دائماً، فخريطة كاملة
+            # نصفها غير متحقَّق منه يجب أن تقول ذلك لا أن تبدو مكتملة.
+            "motion": {"unverified_cells": self._unverified_cells,
+                       "stuck_streak": self._stuck,
+                       "partial_m": round(self._cell_progress, 2),
+                       "last": self._last_motion},
+            # المراحل الست + أثر المسار (البنود 4 و6)
+            "phase": self.phase,
+            "phase_ar": PHASE_AR.get(self.phase, self.phase),
+            "cycle": self.cycle,
+            "breadcrumbs": [list(b["cell"]) for b in self.breadcrumbs[-200:]],
+            "withdraw_pending": bool(self._withdraw_req),
             "source": self._source_state(),
             "documentation": self._doc_state(),
             "battery": batt.classify(
@@ -945,7 +1654,7 @@ class MissionSim:
     def csv_bytes(self) -> bytes:
         buf = io.StringIO()
         cols = ["time", "row", "col", "x", "y", "cpm", "usvh", "risk",
-                "heading", "uncertainty_m", "anomaly"]
+                "heading", "uncertainty_m", "anomaly", "motion_verified"]
         w = csv.DictWriter(buf, fieldnames=cols)
         w.writeheader()
         for row in self.records:
@@ -963,6 +1672,11 @@ class MissionSim:
             "coverage_text": self.grid.coverage_text() if self.grid else None,
             "duration_s": round(self.mission_time_s, 1),
             "max_reading": max_rec,
+            "unverified_cells": self._unverified_cells,
+            "phase": self.phase,
+            "cycle": self.cycle,
+            "documentation": self._doc_state(),
+            "source": (self.locator.report() if self.locator else None),
             "anomalies": self.anomalies,
             "corrections": len(self.dr.corrections) if self.dr else 0,
             "events": self.events,

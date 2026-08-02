@@ -25,6 +25,7 @@ from pi.config import (
     DRIFT_PER_METER, DRIFT_PER_TURN, UNCERTAINTY_INITIAL,
     UNCERTAINTY_RESET_FLOOR, WALL_CORRECTION_SHRINK,
     WALL_ALIGN_TOL_DEG, WALL_CORRECTION_MAX_DELTA_M,
+    MOTION_UNVERIFIED_DRIFT,
 )
 
 # محاور الجدران الأربعة: (زاوية الغرفة، المحور، جهة الجدار)
@@ -67,16 +68,22 @@ class DeadReckoning:
         self.heading = (self.heading + degrees) % 360.0
         self.uncertainty += DRIFT_PER_TURN * (abs(degrees) / 90.0)
 
-    def advance(self, dist_m: float) -> None:
+    def advance(self, dist_m: float, verified: bool = True) -> None:
         """
         يقدّم الموقع بمسافة **مقطوعة فعلياً** (من التنفيذ الحقيقي على المحركات)
         بدل اشتقاقها من زمن×سرعة مفترضة، وينمّي الشك بنفس النموذج.
+
+        `verified=False` (البند 0): الشوط لم يُقَس بمرجع — لا ألترا سونيك ولا
+        حكم من التسارع — فالمسافة اشتُقّت من نموذج مفتوح الحلقة. الشك ينمو
+        عندها **أسرع** (`MOTION_UNVERIFIED_DRIFT`): تمرير نفس σ لموضع مقيس
+        وآخر مفترض يمنح المفترضَ وزن المقيس في شبكة تحديد المصدر.
         """
         hd = math.radians(self.heading)
         self.x += dist_m * math.sin(hd)
         self.y += dist_m * math.cos(hd)
         self.distance_total += abs(dist_m)
-        self.uncertainty += DRIFT_PER_METER * abs(dist_m)
+        drift = DRIFT_PER_METER * (1.0 if verified else MOTION_UNVERIFIED_DRIFT)
+        self.uncertainty += drift * abs(dist_m)
 
     def set_pose(self, x: float, y: float, heading: float) -> None:
         self.x, self.y, self.heading = float(x), float(y), heading % 360.0
