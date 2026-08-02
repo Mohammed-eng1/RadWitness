@@ -143,6 +143,7 @@ class MissionSim:
         self.last_reading = {"cpm": 0.0, "usvh": 0.0, "risk": "Safe", "color": "#22c55e"}
         self._returning = False
         self._batt_level = None
+        self._batt_source = None       # مصدر الحماية الفاعل (يُسجَّل عند تغيّره)
         self._rth_triggered = False
         # الحدّ الزمني (بديل حماية الجهد المعطّلة — القسم 9)
         self._started_ts = None
@@ -250,11 +251,22 @@ class MissionSim:
         self.breadcrumb_push()
         self._log("mission_start",
                   "بدء المسح الذاتي" + (" — قيادة محركات ⚠" if self.drive_motors else " (منطقي)"))
-        if not BATTERY_MONITOR_ENABLED:
-            self._log("time_limit",
-                      f"⚠ مراقبة الجهد معطّلة — الحماية البديلة زمنية: "
-                      f"عودة إجبارية عند {MISSION_TIME_LIMIT_S:.0f}ث، "
-                      f"إيقاف عند {MISSION_HARD_LIMIT_S:.0f}ث. ابدأ ببطارية مشحونة.")
+        # الحارسان يُعلَنان عند البدء — لا يُترك المشغّل يخمّن ما يحميه
+        v0 = self.rover.voltage() if BATTERY_MONITOR_ENABLED else None
+        self._log_battery_source(
+            self.rover.voltage_source if BATTERY_MONITOR_ENABLED else "disabled",
+            self.rover.voltage_reason if BATTERY_MONITOR_ENABLED else None)
+        if v0 is not None:
+            b0 = batt.classify(v0)
+            self._log("battery",
+                      f"جهد البدء {b0['v']}V ({b0['cell_v']}V/خلية · "
+                      f"~{b0['percent']}%) — {b0['text']}")
+        self._log("time_limit",
+                  f"الحاجز الزمني مسلَّح كطبقة ثانية: عودة إجبارية عند "
+                  f"{MISSION_TIME_LIMIT_S:.0f}ث، إيقاف عند "
+                  f"{MISSION_HARD_LIMIT_S:.0f}ث"
+                  + ("" if v0 is not None else
+                     " — ⚠ **وهو الحارس الوحيد الآن** (لا قراءة جهد)"))
         if self.drive_motors:
             self.executor = DriveExecutor(self.rover, self.reactive,
                                           self.sensors, self.profile)
@@ -339,8 +351,6 @@ class MissionSim:
     # ── الحدّ الزمني: بديل مؤقت عن حماية الجهد (القسم 9) ──────────
     def time_limit_info(self) -> dict:
         """قراءة **بلا أثر جانبي** للبثّ في الواجهة (الإنفاذ في _check_time_limit)."""
-        if BATTERY_MONITOR_ENABLED:
-            return {"enabled": False, "reason": "مراقبة الجهد مفعّلة"}
         elapsed = 0.0 if self._started_ts is None else time.time() - self._started_ts
         return {"enabled": True, "running": self.state == RUNNING,
                 "elapsed_s": round(elapsed, 1),
@@ -351,14 +361,17 @@ class MissionSim:
 
     def _check_time_limit(self) -> dict:
         """
-        مراقبة الجهد معطّلة الآن، فالحماية من استنزاف البطارية **زمنية**:
-            تحذير → عودة إجبارية (RTH) → إيقاف محركات صلب.
-        ⚠ الزمن حاجز خام: لا يعرف حالة الشحن الابتدائية، فابدأ كل مهمة
-          ببطارية مشحونة. يُستبدل بالجهد لحظة عودة قراءته.
+        الحاجز الزمني: تحذير → عودة إجبارية (RTH) → إيقاف محركات صلب.
+
+        🔴 **طبقة ثانية باقية بعد عودة قراءة الجهد** لا بديل مؤقت: أي حارس
+        واحد نقطة فشل واحدة. لو تعذّرت قراءة INA219 (ناقل مشغول، عنوان
+        تغيّر، OVF متكرر) يبقى الزمن حارساً يعمل — والحارسان مسلَّحان معاً
+        وأيّهما بلغ حدّه أولاً يُنفَّذ.
+        ⚠ الزمن حاجز خام: لا يعرف حالة الشحن الابتدائية، فابدأ ببطارية مشحونة.
         الساعة تعمل **من بدء المهمة** بزمن الحائط (لا `mission_time_s` الذي
         يتقدّم بخطوات منطقية ويتجمّد أثناء الإيقاف المؤقت).
         """
-        if BATTERY_MONITOR_ENABLED or self._started_ts is None:
+        if self._started_ts is None:
             return {"enabled": False}
         info = self.time_limit_info()
         elapsed = info["elapsed_s"]
@@ -386,14 +399,20 @@ class MissionSim:
         return info
 
     def _check_battery(self):
-        """يطبّق عتبات الجهد الإلزامية (أ-3) على مسار المهمة."""
-        if not BATTERY_MONITOR_ENABLED:
-            # الجهد غير مقروء → الحماية الزمنية هي الفاعلة (لا حماية = مرفوض)
-            self.rover.sim_set_moving(self.state == RUNNING)
-            self._check_time_limit()
-            return self.rover.check_battery()
+        """
+        يطبّق عتبات الجهد الإلزامية (أ-3) — و**الحاجز الزمني معها دائماً**
+        كطبقة ثانية: أي حارس واحد نقطة فشل واحدة.
+        """
         self.rover.sim_set_moving(self.state == RUNNING)
+        # 🔴 الطبقة الثانية تعمل **مهما كانت حالة الجهد** (البند 4)
+        self._check_time_limit()
+        if not BATTERY_MONITOR_ENABLED:
+            self._log_battery_source("disabled", "مراقبة الجهد معطّلة في config")
+            return self.rover.check_battery()
         info = self.rover.check_battery()
+        # البند 5: مصدر الحماية يُسجَّل عند كل تغيّر — خلط المصدرين يجعل
+        # تشخيص أي حادثة مستحيلاً («هبط الجهد أم نفد الزمن؟»).
+        self._log_battery_source(info.get("source"), info.get("source_reason"))
         if info["action"] == batt.ACTION_STOP:
             if self.state == RUNNING:
                 self._log("battery", f"⚠ جهد حرج {info['v']}V — إيقاف المحركات فوراً")
@@ -404,9 +423,30 @@ class MissionSim:
                 self._log("battery", f"⚠ جهد منخفض {info['v']}V — عودة إجبارية")
                 self.return_home()
         elif info["level"] == "good" and self._batt_level != "good":
-            self._log("battery", f"تنبيه: جهد {info['v']}V (جيد)")
+            self._log("battery",
+                      f"تنبيه: جهد {info['v']}V ({info.get('cell_v')}V/خلية) — جيد")
         self._batt_level = info["level"]
         return info
+
+    def _log_battery_source(self, source, reason=None) -> None:
+        """
+        (البند 5) يسجّل **مصدر الحماية الفاعل** عند تغيّره فقط:
+        `ina219` قراءة جهد حقيقية · `rover_serial` حقل v من الروفر ·
+        `sim_override` تجاوز اختبار · `unavailable` لا جهد ⇒ الزمن هو الحارس.
+        سطر واحد عند التبديل يكفي لتفسير أي إيقاف لاحق.
+        """
+        if source == self._batt_source:
+            return
+        self._batt_source = source
+        names = {
+            "ina219": "✅ الجهد من INA219 (حماية جهدية فاعلة + الحاجز الزمني)",
+            "rover_serial": "⚠ الجهد من رسالة الروفر — INA219 غير متاح",
+            "sim_override": "⚠ جهد محاكاة (تجاوز اختبار) — ليس قراءة عتاد",
+            "unavailable": "🔴 **لا قراءة جهد** — الحارس الفاعل هو الحدّ الزمني وحده",
+            "disabled": "⚠ مراقبة الجهد معطّلة — الحدّ الزمني وحده",
+        }
+        msg = names.get(source, f"مصدر جهد غير معروف: {source}")
+        self._log("battery_source", msg + (f" · {reason}" if reason else ""))
 
     # ── مصادر حقيقية (تُحقن من السيرفر على الراسبري) ──────────────
     def set_proximity(self, ultrasonic=None, ir=None):
@@ -1625,9 +1665,10 @@ class MissionSim:
             "withdraw_pending": bool(self._withdraw_req),
             "source": self._source_state(),
             "documentation": self._doc_state(),
-            "battery": batt.classify(
-                self.rover.voltage() if BATTERY_MONITOR_ENABLED else None),
-            "time_limit": self.time_limit_info(),     # بديل حماية الجهد (القسم 9)
+            "battery": (self.rover.battery_state() if BATTERY_MONITOR_ENABLED
+                        else batt.classify(None)),
+            # الحارسان **معاً**: الجهد أدقّ، والزمن طبقة ثانية لا تُحذف
+            "time_limit": self.time_limit_info(),
             "sensors": self.sensors(),
             "reactive": self.last_reactive,
             "reactive_enabled": self.reactive.enabled,

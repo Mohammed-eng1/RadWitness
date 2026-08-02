@@ -143,6 +143,11 @@ class WaveRoverBridge:
         self.clamp_count = 0            # مرات قصّ القوة (تُبثّ في سجل الواجهة)
         self.last_clamp_msg = None
         self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
+        # الجهد: المصدر يُعلَن دائماً (البند 5)
+        self._ina_reader = None         # None=لم يُجرَّب · False=غير متاح
+        self.voltage_source = self.VSRC_NONE
+        self.voltage_reason = None
+        self._sim_v_override = False
         # محاكاة
         self._sim_v = 12.40
         self._sim_turn_rate = 0.0
@@ -325,14 +330,75 @@ class WaveRoverBridge:
             self.last_status = d
         return d
 
+    # ── الجهد: INA219 أولاً، ثم رسالة الروفر، ثم لا شيء ──────────
+    # ⚠ المصدر **يُعلَن دائماً** في `voltage_source`: خلط مصدرَي حماية يجعل
+    #    تشخيص أي حادثة مستحيلاً («هل توقّف لأن الجهد هبط أم لأن الزمن نفد؟»).
+    VSRC_INA, VSRC_ROVER, VSRC_SIM, VSRC_NONE = (
+        "ina219", "rover_serial", "sim_override", "unavailable")
+
     def voltage(self):
-        return self.last_status.get("v")
+        """أحدث جهد صالح أو `None`. يضبط `voltage_source` و`voltage_reason`."""
+        # تجاوز المحاكاة له الأسبقية **صراحةً**: أداة اختبار العتبات في
+        # الواجهة يجب أن تبقى عاملة على العتاد أيضاً، وإلا تعطّلت بصمت.
+        if self._sim_v_override:
+            self.voltage_source, self.voltage_reason = self.VSRC_SIM, None
+            return self._sim_v
+        ina = self._ina()
+        if ina is not None:
+            r = ina.read()
+            if r["v"] is not None:
+                self.voltage_source, self.voltage_reason = self.VSRC_INA, None
+                return r["v"]
+            self.voltage_reason = r["reason"]
+        v = self.last_status.get("v")
+        if v is not None:
+            self.voltage_source = self.VSRC_ROVER
+            return v
+        self.voltage_source = self.VSRC_NONE
+        if self.voltage_reason is None:
+            self.voltage_reason = "لا INA219 ولا حقل v في رسالة الروفر"
+        return None
+
+    def _ina(self):
+        """قارئ INA219 المشترك — يُهيَّأ كسولاً ولا يُسقط الجسر إن غاب."""
+        if self._ina_reader is False:
+            return None
+        if self._ina_reader is None:
+            try:
+                from pi.sensors.ina219 import get_ina219
+                r = get_ina219()
+                self._ina_reader = r if r.ok else False
+                if not r.ok:
+                    self.voltage_reason = r.error
+                    self._event("battery_source",
+                                f"⚠ INA219 غير متاح: {r.error}")
+                    return None
+            except Exception as e:              # noqa: BLE001
+                self._ina_reader = False
+                self.voltage_reason = str(e)
+                return None
+        return self._ina_reader or None
+
+    def battery_state(self) -> dict:
+        """تصنيف الجهد **مع مصدره وسببه** — لا رقم عارٍ (البند 5)."""
+        v = self.voltage()
+        info = batt.classify(v)
+        info["source"] = self.voltage_source
+        info["source_reason"] = self.voltage_reason
+        ina = self._ina_reader if self._ina_reader not in (None, False) else None
+        info["ina219"] = ina.state() if ina is not None else None
+        return info
 
     # ── أدوات المحاكاة (لاختبار العتبات في الواجهة) ─────────────
     def sim_set_voltage(self, v: float) -> None:
         self._sim_v = float(v)
+        self._sim_v_override = True      # يتقدّم على INA219 عمداً (أداة اختبار)
         self.battery_alarm = False
         self.rth_requested = False
+
+    def sim_clear_voltage_override(self) -> None:
+        """يُعيد مصدر الجهد إلى العتاد الحقيقي بعد اختبار العتبات."""
+        self._sim_v_override = False
 
     def sim_set_moving(self, moving: bool) -> None:
         """
@@ -488,7 +554,7 @@ class WaveRoverBridge:
         if not BATTERY_MONITOR_ENABLED:
             return batt.classify(None)
         self.read_status()
-        info = batt.classify(self.voltage())
+        info = self.battery_state()
         if info["action"] == batt.ACTION_STOP:
             self.stop()
             self.battery_alarm = True
@@ -503,7 +569,8 @@ class WaveRoverBridge:
             "gyro_bias": round(self.gyro_bias, 4),
             "bias_calibrated": self.bias_calibrated,
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
-            "battery": batt.classify(self.voltage() if BATTERY_MONITOR_ENABLED else None),
+            "battery": (self.battery_state() if BATTERY_MONITOR_ENABLED
+                        else batt.classify(None)),
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
             "max_motor_power": MAX_MOTOR_POWER,
             "clamp_count": self.clamp_count, "last_clamp_msg": self.last_clamp_msg,

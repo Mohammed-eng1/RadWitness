@@ -180,6 +180,8 @@
         <div class="stat"><span>الشذوذات</span><b id="stAnom">0</b></div>
         <div class="stat"><span>القراءة</span><b id="stRead">—</b></div>
         <div class="stat"><span>🔋 البطارية</span><b id="stBatt">—</b></div>
+        <div class="stat"><span>مصدر الجهد</span><b id="stBattSrc">—</b></div>
+        <div class="stat"><span>الحارس الثاني</span><b id="stGuard">—</b></div>
         <div class="stat"><span>زمن المهمة</span><b id="stTime">—</b></div>
         <div class="hint" id="calibWarn" style="color:var(--warn)"></div>
       </div>
@@ -534,8 +536,24 @@
       cpmHist.push(rd.cpm); if(cpmHist.length>120)cpmHist.shift(); drawCpm();}
     if(d.mission_time_s!==undefined)$("stTime").textContent=d.mission_time_s+" ث";
     if(d.battery){const b=d.battery;
-      $("stBatt").innerHTML=(b.v!==null?b.v+"V ":"—")+
-        "<span class='pill' style='background:"+b.color+"'>"+b.text+" "+b.percent+"%</span>";}
+      // الجهد + جهد الخلية + النسبة التقديرية. جهد الخلية هو المؤشّر الأصدق
+      // على صحة حزمة ليثيوم، والنسبة تقديرية (منحنى التفريغ ليس خطياً).
+      $("stBatt").innerHTML=(b.v!==null?b.v+"V":"—")+
+        (b.cell_v?" · "+b.cell_v+"V/خلية ":" ")+
+        "<span class='pill' style='background:"+b.color+"'>"+b.text+" ~"+b.percent+"%</span>";
+      // 🔴 مصدر الحماية معروض دائماً: خلط المصدرين يجعل تفسير أي إيقاف مستحيلاً
+      const srcAr={ina219:"INA219",rover_serial:"رسالة الروفر",
+                   sim_override:"محاكاة",unavailable:"لا قراءة"};
+      const el=$("stBattSrc");
+      if(el){ el.textContent=(srcAr[b.source]||b.source||"—")
+                + (b.source_reason?" — "+b.source_reason:"");
+        el.style.color=(b.source==="ina219")?"var(--ok)"
+          :(b.source==="unavailable"?"var(--bad)":"var(--warn)"); }}
+    if(d.time_limit&&d.time_limit.enabled){const t=d.time_limit;
+      const el=$("stGuard");
+      if(el){ el.textContent=`زمني: ${t.elapsed_s}/${t.limit_s}ث`
+          +(t.rth_triggered?" ⚠ عودة إجبارية":"");
+        el.style.color=t.rth_triggered?"var(--bad)":""; }}
     $("calibWarn").textContent=d.calib_warning||"";
     if(d.sensors){const s=d.sensors;
       $("snUs").textContent=(s.ultrasonic_cm!==null?s.ultrasonic_cm+" سم":"—");
@@ -583,6 +601,7 @@
       anomaly:"شذوذ",return_home:"عودة",home:"وصل",room_configured:"غرفة",
       battery:"بطارية",speed:"سرعة",power_clamp:"قصّ قوة",turn_segmented:"تجزئة لفّ",
       gyro_bias:"انحياز جايرو",gyro_bias_rejected:"رفض معايرة",heartbeat:"heartbeat",
+      battery_source:"مصدر الجهد",time_limit:"حدّ زمني",
       no_motion:"لا حركة",motion_mismatch:"فرق مسافة",partial_motion:"حركة ناقصة",
       stuck:"عالق",phase:"مرحلة",rescan:"إعادة مسح",rescan_done:"تأكيد",
       retrace:"انسحاب",retrace_done:"انتهى الانسحاب",withdraw_request:"طلب انسحاب",

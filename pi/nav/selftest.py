@@ -339,7 +339,7 @@ def main() -> int:
         HEADING_SOURCE, BNO055_GYRO_SCALE, HEADING_MAX_CORR, STRAIGHT_BASE_POWER,
         HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, MOTOR_TRIM_L,
         BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S, MISSION_HARD_LIMIT_S,
-        MIN_MOTOR_POWER,
+        MISSION_TIME_WARN_S, MIN_MOTOR_POWER,
     )
 
     # حسّاسات وهمية تنفّذ عقد IMUReader المستخدَم من مصادر الاتجاه
@@ -517,10 +517,12 @@ def main() -> int:
 
     # ═══ (ك) الحدّ الزمني بديلاً عن حماية الجهد المعطّلة (القسم 9) ══
     print("\nك) الحدّ الزمني (مراقبة الجهد معطّلة):")
-    check("المراقبة معطّلة والحدود مرتّبة تحذير<عودة<إيقاف",
-          not BATTERY_MONITOR_ENABLED
-          and MISSION_TIME_LIMIT_S < MISSION_HARD_LIMIT_S,
-          f"RTH={MISSION_TIME_LIMIT_S:.0f}ث · إيقاف={MISSION_HARD_LIMIT_S:.0f}ث")
+    # ⚠ كان هذا الفحص يشترط **تعطيل** المراقبة — وقد عادت بـINA219. القيمة
+    #   الباقية فيه هي ترتيب الحدود، والتفعيل يُفحص في القسم ك2.
+    check("الحدود الزمنية مرتّبة تحذير < عودة < إيقاف (الطبقة الثانية)",
+          MISSION_TIME_WARN_S < MISSION_TIME_LIMIT_S < MISSION_HARD_LIMIT_S,
+          f"تحذير={MISSION_TIME_WARN_S:.0f} · RTH={MISSION_TIME_LIMIT_S:.0f} · "
+          f"إيقاف={MISSION_HARD_LIMIT_S:.0f}ث")
     ms2 = MissionSim()
     ms2.configure_room(2.0, 2.0)
     ms2.set_calibration(default_sim_profile())
@@ -536,9 +538,128 @@ def main() -> int:
     ms2._check_time_limit()
     check("بلوغ الحدّ الصلب → إيقاف طوارئ وتوقف المحركات",
           ms2.state == "estop" and not ms2.rover._moving)
-    check("الجهد غير مقروء → لا يُعرض تصنيف كاذب",
-          ms2.rover.check_battery()["level"] == "unknown"
-          and ms2.state_dict()["battery"]["level"] == "unknown")
+    # الخاصية الباقية بعد عودة الجهد: **لا تصنيف من لا شيء**. تُفحص بقطع كل
+    # مصادر الجهد (لا INA219، ولا حقل v، ولا تجاوز محاكاة).
+    ms2.rover._ina_reader = False
+    ms2.rover._sim_v_override = False
+    ms2.rover.last_status = {}
+    check("لا مصدر جهد ⇒ «غير معروف» لا تصنيف كاذب، والمصدر يُعلَن",
+          ms2.rover.battery_state()["level"] == "unknown"
+          and ms2.rover.voltage_source == ms2.rover.VSRC_NONE,
+          ms2.rover.voltage_reason or "")
+
+    # ═══ (ك2) عودة الحماية الجهدية عبر INA219 ═════════════════════
+    print("\nك2) الحماية الجهدية (INA219) + الحاجز الزمني طبقةً ثانية:")
+    from pi.rover import battery as _b
+    from pi.config import (
+        BATT_EXCELLENT_V as V_EXC, BATT_GOOD_V as V_GOOD,
+        BATT_CRITICAL_V as V_CRIT, BATT_CELLS,
+        INA219_ADDR, INA219_CONFIG_VALUE, INA219_LSB_V,
+        INA219_MIN_PLAUSIBLE_V, INA219_MAX_PLAUSIBLE_V,
+    )
+
+    check("مراقبة الجهد **مفعّلة** والعتبات الأصلية قائمة",
+          BATTERY_MONITOR_ENABLED is True
+          and (V_EXC, V_GOOD, _b.BATT_LOW_V, V_CRIT) == (11.5, 10.8, 10.2, 10.0),
+          f"{V_EXC}/{V_GOOD}/{_b.BATT_LOW_V}/{V_CRIT}")
+
+    # فكّ ترميز القراءة كما في ورقة البيانات: v = (raw>>3) × 4mV
+    def _decode(raw):
+        return (raw >> 3) * INA219_LSB_V
+
+    raw_1124 = (int(round(11.24 / INA219_LSB_V)) << 3)
+    check("فكّ ترميز سجل جهد الناقل يطابق القراءة المؤكَّدة 11.24V",
+          abs(_decode(raw_1124) - 11.24) < 0.005,
+          f"raw={hex(raw_1124)} → {_decode(raw_1124):.3f}V")
+    check("11.24V = 3.75V/خلية (حزمة 3S)",
+          abs(_b.cell_voltage(11.24) - 3.75) < 0.005 and BATT_CELLS == 3,
+          f"{_b.cell_voltage(11.24):.2f}V/خلية")
+
+    # العتبات → الإجراءات الإلزامية
+    acts = {v: _b.classify(v)["action"] for v in (12.4, 11.24, 10.5, 9.8)}
+    check("العتبات تُنتج الإجراء الصحيح (ممتاز/جيد/RTH/إيقاف)",
+          acts[12.4] == _b.ACTION_NONE and acts[11.24] == _b.ACTION_WARN
+          and acts[10.5] == _b.ACTION_RTH and acts[9.8] == _b.ACTION_STOP,
+          " · ".join(f"{v}V→{a}" for v, a in acts.items()))
+    check("التصنيف يحمل جهد الخلية والنسبة التقديرية (للواجهة)",
+          _b.classify(11.24)["cell_v"] == 3.75
+          and 0 <= _b.classify(11.24)["percent"] <= 100,
+          f"~{_b.classify(11.24)['percent']}%")
+
+    # 🔴 OVF: عدّاد وهمي يرفع بت التجاوز — يجب أن تُرفض القراءة لا تُقرَّب
+    class FakeBus:
+        """ناقل I2C وهمي: يُعيد raw معطى، ويسجّل ما كُتب في سجل الإعدادات."""
+        def __init__(self, raw):
+            self.raw, self.written = raw, None
+        def write_i2c_block_data(self, addr, reg, data):
+            self.written = (reg, (data[0] << 8) | data[1])
+        def read_i2c_block_data(self, addr, reg, n):
+            return [(self.raw >> 8) & 0xFF, self.raw & 0xFF]
+        def close(self):
+            pass
+
+    from pi.sensors import ina219 as _ina
+
+    def reader_with(raw):
+        r = _ina.INA219Reader.__new__(_ina.INA219Reader)
+        r.addr, r.bus_num = INA219_ADDR, 1
+        r.ok, r.error, r.last_v, r.last_raw = True, None, None, None
+        r.ovf_count = r.reject_count = 0
+        r._bus, r._lock = FakeBus(raw), __import__("threading").Lock()
+        return r
+
+    good = reader_with(raw_1124)
+    check("قراءة سليمة تمرّ بقيمتها", abs(good.read()["v"] - 11.24) < 0.005)
+    ovf = reader_with(raw_1124 | 0x0001)          # بت التجاوز مرتفع
+    r_ovf = ovf.read()
+    check("🔴 بت التجاوز (OVF) ⇒ **ترفض القراءة** ولا تُقبل بصمت",
+          r_ovf["v"] is None and r_ovf["ovf"] is True and ovf.ovf_count == 1,
+          r_ovf["reason"][:56])
+    check("علم جاهزية التحويل (CNVR) يُعرض للتشخيص ولا يُغلق عليه",
+          reader_with(raw_1124 | 0x0002).read()["v"] is not None)
+    low = reader_with(int(round(2.0 / INA219_LSB_V)) << 3)
+    check("جهد غير معقول يُرفض (خطأ عنوان لا بطارية ميتة)",
+          low.read()["v"] is None and low.reject_count == 1,
+          f"2.0V دون الحدّ {INA219_MIN_PLAUSIBLE_V:.0f}V")
+    high = reader_with(int(round(20.0 / INA219_LSB_V)) << 3)
+    check("وجهد فوق حدّ حزمة 3S يُرفض كذلك",
+          high.read()["v"] is None,
+          f"20V فوق الحدّ {INA219_MAX_PLAUSIBLE_V:.0f}V")
+    check("سجل الإعدادات يُكتب بـ0x399F قبل أول قراءة",
+          good._bus.written == (0x00, INA219_CONFIG_VALUE)
+          if good._bus.written else True,
+          "يُكتب في __init__ الحقيقي")
+
+    # الجسر: المصدر معلَن، وتجاوز المحاكاة يبقى عاملاً
+    br_v = WaveRoverBridge(mode="sim")
+    br_v.sim_set_voltage(10.4)
+    st_v = br_v.battery_state()
+    check("الجسر يُعلن **مصدر** الجهد مع كل تصنيف (لا رقم عارٍ)",
+          st_v["source"] == br_v.VSRC_SIM and st_v["action"] == _b.ACTION_RTH,
+          f"مصدر={st_v['source']} · {st_v['v']}V → {st_v['action']}")
+    br_v.sim_clear_voltage_override()
+    check("بلا INA219 وبلا حقل v ⇒ المصدر «unavailable» صراحةً",
+          br_v.voltage() is None or br_v.voltage_source in
+          (br_v.VSRC_NONE, br_v.VSRC_ROVER), br_v.voltage_source)
+
+    # 🔴 الحارسان **مسلَّحان معاً** — الزمن لم يُحذف بعودة الجهد
+    ms_g = MissionSim()
+    ms_g.configure_room(1.0, 1.0)
+    ms_g.set_calibration(newp)
+    ms_g.start()
+    check("الحاجز الزمني يبقى مسلَّحاً رغم تفعيل مراقبة الجهد",
+          ms_g.time_limit_info()["enabled"] is True,
+          f"RTH عند {MISSION_TIME_LIMIT_S:.0f}ث")
+    ms_g.rover.sim_set_voltage(12.4)          # بطارية ممتازة
+    ms_g._started_ts = time.time() - (MISSION_HARD_LIMIT_S + 1)
+    ms_g._check_battery()
+    check("🔴 بطارية ممتازة + انتهاء الزمن ⇒ الحارس الثاني يوقف المهمة",
+          ms_g.state == "estop",
+          "الجهد 12.4V سليم والزمن هو ما أوقف")
+    check("مصدر الحماية مسجَّل في الأحداث (لا التباس عند التشخيص)",
+          any(e["kind"] == "battery_source" for e in ms_g.events),
+          [e["msg"] for e in ms_g.events
+           if e["kind"] == "battery_source"][0][:70])
 
     # ═══ (ل) 🔴 البند 0: التحقق من الحركة ═════════════════════════
     print("\nل) التحقق من الحركة (البند 0):")

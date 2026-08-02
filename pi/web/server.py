@@ -321,11 +321,21 @@ async def api_drive_mode(req: Request):
 
 @app.post("/api/sim/battery")
 async def api_sim_battery(req: Request):
-    """أداة اختبار: ضبط جهد البطارية الوهمي لتجربة العتبات (RTH/إيقاف)."""
+    """
+    أداة اختبار: ضبط جهد البطارية الوهمي لتجربة العتبات (RTH/إيقاف).
+
+    ⚠ التجاوز يتقدّم على قراءة INA219 الحقيقية عمداً — ولهذا يجب أن يكون
+    **الرجوع عنه ممكناً**: `{"clear": true}` يُعيد المصدر إلى العتاد. وبلا
+    هذا يبقى النظام على جهد وهمي بعد الاختبار ويظنّه حقيقياً.
+    """
     d = await req.json()
-    mission.rover.sim_set_voltage(float(d["v"]))
+    if d.get("clear"):
+        mission.rover.sim_clear_voltage_override()
+    else:
+        mission.rover.sim_set_voltage(float(d["v"]))
     mission._rth_triggered = False
-    return {"ok": True, "battery": mission.rover.state()["battery"]}
+    mission._batt_source = None            # يُعاد تسجيل المصدر بعد التبديل
+    return {"ok": True, "battery": mission.rover.battery_state()}
 
 
 @app.post("/api/calibration/select")
