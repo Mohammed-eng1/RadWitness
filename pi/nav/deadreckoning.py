@@ -25,7 +25,8 @@ from pi.config import (
     DRIFT_PER_METER, DRIFT_PER_TURN, UNCERTAINTY_INITIAL,
     UNCERTAINTY_RESET_FLOOR, WALL_CORRECTION_SHRINK,
     WALL_ALIGN_TOL_DEG, WALL_CORRECTION_MAX_DELTA_M,
-    MOTION_UNVERIFIED_DRIFT,
+    MOTION_UNVERIFIED_DRIFT, HEADING_SIGMA_INITIAL_DEG,
+    HEADING_DRIFT_PER_S_DEG, HEADING_SIGMA_PER_TURN_DEG,
 )
 
 # محاور الجدران الأربعة: (زاوية الغرفة، المحور، جهة الجدار)
@@ -49,6 +50,11 @@ class DeadReckoning:
         self.uncertainty = UNCERTAINTY_INITIAL
         self.distance_total = 0.0
         self.corrections: list = []         # سجل التصحيحات للشفافية
+        # ── 🔴 عدم يقين **الاتجاه** (بعد استبدال BNO055 بـMPU-6050) ──
+        # ينمو مع **الزمن** لا المسافة، ولا شيء في العتاد الحالي يصحّحه.
+        self.heading_sigma_deg = HEADING_SIGMA_INITIAL_DEG
+        self._sigma_ts = time.time()
+        self._gate_lost_announced = False
 
     # ── الحركة ────────────────────────────────────────────────────
     def move(self, direction: str, power: int, dt: float) -> None:
@@ -63,10 +69,39 @@ class DeadReckoning:
         self.distance_total += abs(dist)
         self.uncertainty += DRIFT_PER_METER * abs(dist)
 
+    # ── عدم يقين الاتجاه: ينمو بالزمن ولا شيء يصحّحه ──────────────
+    def sync_time(self) -> float:
+        """
+        ينمّي شكّ الاتجاه بما مضى من **زمن حائط** منذ آخر مزامنة.
+
+        يُستدعى عند كل حركة وعند كل قياس. حسابه من الساعة يجعله يشمل الوقوف
+        والسير واللفّ بلا احتساب مزدوج — والوقوف هو أطول أطوار المهمة
+        (3ث لكل خلية، 10ث × 8 في التأكيد، حتى 60ث في التجميع التكيّفي).
+        """
+        now = time.time()
+        dt = max(0.0, now - self._sigma_ts)
+        self._sigma_ts = now
+        self.heading_sigma_deg += HEADING_DRIFT_PER_S_DEG * dt
+        return dt
+
+    @property
+    def alignment_gate_lost(self) -> bool:
+        """
+        🔴 **الحلقة المفرغة**: تصحيح الجدار مشروط بمحاذاة الاتجاه ضمن
+        `WALL_ALIGN_TOL_DEG`. فحين يتجاوز شكّ الاتجاه هذا الحدّ يصير التصحيح
+        مرفوضاً بنيوياً ⇒ لا تصحيح موضع ⇒ الشك يكبر ⇒ يُرفض أكثر…
+
+        ⚠ وتصحيح الجدار **لا يصحّح الاتجاه أصلاً** (يضبط x أو y فقط)، فلا
+           شيء في العتاد الحالي يعكس هذا النمو. الخاصية تُعلنه بدل إخفائه.
+        """
+        return self.heading_sigma_deg > WALL_ALIGN_TOL_DEG
+
     def turn(self, degrees: float) -> None:
         """يلفّ بالمكان (+يمين، −يسار) ويُنمّي الشك حسب مقدار الدوران."""
+        self.sync_time()
         self.heading = (self.heading + degrees) % 360.0
         self.uncertainty += DRIFT_PER_TURN * (abs(degrees) / 90.0)
+        self.heading_sigma_deg += HEADING_SIGMA_PER_TURN_DEG * (abs(degrees) / 90.0)
 
     def advance(self, dist_m: float, verified: bool = True) -> None:
         """
@@ -78,12 +113,18 @@ class DeadReckoning:
         عندها **أسرع** (`MOTION_UNVERIFIED_DRIFT`): تمرير نفس σ لموضع مقيس
         وآخر مفترض يمنح المفترضَ وزن المقيس في شبكة تحديد المصدر.
         """
+        self.sync_time()
         hd = math.radians(self.heading)
         self.x += dist_m * math.sin(hd)
         self.y += dist_m * math.cos(hd)
         self.distance_total += abs(dist_m)
         drift = DRIFT_PER_METER * (1.0 if verified else MOTION_UNVERIFIED_DRIFT)
-        self.uncertainty += drift * abs(dist_m)
+        # 🔴 مساهمة **خطأ الاتجاه** في خطأ الموضع — اقتران ضربي لا جمعي:
+        #    الاتجاه المنحرف لا يزيح الروبوت وهو واقف، بل عند أول حركة بعده
+        #    بمقدار (المسافة × الخطأ الزاوي). ولهذا يُضرب هنا لا يُجمع في
+        #    حدّ زمني مسطّح على σ الموضع.
+        lateral = abs(dist_m) * math.radians(self.heading_sigma_deg)
+        self.uncertainty += drift * abs(dist_m) + lateral
 
     def set_pose(self, x: float, y: float, heading: float) -> None:
         self.x, self.y, self.heading = float(x), float(y), heading % 360.0
@@ -128,6 +169,10 @@ class DeadReckoning:
             self.x = new_val
         self.uncertainty = max(UNCERTAINTY_RESET_FLOOR,
                                self.uncertainty * WALL_CORRECTION_SHRINK)
+        # ⚠ **لا يُصغَّر شكّ الاتجاه هنا عمداً**: هذا التصحيح يضبط إحداثياً
+        #    واحداً (x أو y) من مسافة أمامية، ولا يحمل أي معلومة عن الزاوية —
+        #    بل يفترضها صحيحة أصلاً (شرط المحاذاة أعلاه). ادّعاء تصغيره يخلق
+        #    ثقة اتجاهية لا مصدر لها، وهي أخطر من الشك المعلَن.
         record = {"time": time.time(), "axis": axis,
                   "old_value": round(old_val, 3), "new_value": round(new_val, 3),
                   "delta": round(delta, 3), "sensor": sensor}
@@ -140,6 +185,9 @@ class DeadReckoning:
             "x": round(self.x, 3), "y": round(self.y, 3),
             "heading": round(self.heading, 1),
             "uncertainty_m": round(self.uncertainty, 3),
+            "heading_sigma_deg": round(self.heading_sigma_deg, 2),
+            "alignment_gate_lost": self.alignment_gate_lost,
+            "align_tol_deg": WALL_ALIGN_TOL_DEG,
             "distance_total_m": round(self.distance_total, 2),
             "corrections": len(self.corrections),
         }

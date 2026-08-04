@@ -152,8 +152,8 @@ class DriveExecutor:
                 front_cm = s.get("ultrasonic_cm")
                 if witness is not None:
                     witness.add(self._read_accel())
-                d = self.reactive.decide(front_cm,
-                                         s.get("ir_left", 1), s.get("ir_right", 1))
+                d = self.reactive.decide(front_cm, s.get("ir_left", 1),
+                                         s.get("ir_right", 1), s.get("ir_mid"))
                 last_decision = d
                 if d["action"] != "go":
                     # هل يفسّره جدار معروف من الخريطة؟

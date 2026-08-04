@@ -80,6 +80,7 @@ async def _sim_loop() -> None:
             if (now - last_bcast) >= 0.2:
                 last_bcast = now
                 mission.poll_battery()     # الجهد يُعرض دائماً لا أثناء المسح فقط
+                mission.poll_ground_echo()  # اشتباه صدى الأرض (إعلان لا معالجة)
                 mission.poll_power_clamp() # أحداث الجسر + heartbeat → السجل
                 mission.poll_reactive()    # بثّ السرعة وسببها (البند 3)
                 if _sim_clients:

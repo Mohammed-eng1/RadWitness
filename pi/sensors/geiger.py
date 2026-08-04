@@ -11,7 +11,7 @@ from collections import deque
 
 from pi.config import (
     GEIGER_GPIO, CPM_PER_USVH, DEADTIME_TAU_S,
-    GEIGER_WINDOW_S, GEIGER_EMA_ALPHA, HIGH_RATE_WARNING_CPM,
+    GEIGER_WINDOW_S, GEIGER_EMA_ALPHA, HIGH_RATE_WARNING_CPM, GEIGER_PRESENT,
 )
 
 try:
@@ -46,6 +46,11 @@ class GeigerReader:
         self._usvh = 0.0
         self._total = 0
 
+        # 🔴 معلَن غائباً ⇒ لا يُحجز المنفذ ولا يُقرأ (منفذ طافٍ يعدّ ضجيجاً
+        #    فيبدو إشعاعاً — وهو أخطر فشل ممكن في عدّاد إشعاع).
+        if not GEIGER_PRESENT:
+            self.error = "الجيجر معلَن غائباً (GEIGER_PRESENT=False)"
+            return
         if not _LGPIO_OK:
             self.error = "lgpio غير مثبّت"
             return

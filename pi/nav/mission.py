@@ -26,8 +26,9 @@ from pi.config import (
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
     GEIGER_WINDOW_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
-    MISSION_HARD_LIMIT_S, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
-    MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S,
+    MISSION_HARD_LIMIT_S, BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
+    BATT_SHUTDOWN_ENABLED, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
+    MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S, IR_PRESENT,
     CONFIRM_RADIUS_M, CONFIRM_DWELL_S, CONFIRM_POSITIONS,
     APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
     BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
@@ -144,6 +145,7 @@ class MissionSim:
         self._returning = False
         self._batt_level = None
         self._batt_source = None       # مصدر الحماية الفاعل (يُسجَّل عند تغيّره)
+        self._shutdown_streak = 0      # قراءات متتالية دون حدّ الإطفاء
         self._rth_triggered = False
         # الحدّ الزمني (بديل حماية الجهد المعطّلة — القسم 9)
         self._started_ts = None
@@ -165,6 +167,9 @@ class MissionSim:
         self.phase = PHASE_SURVEY
         self.cycle = None             # حصيلة الدورة الكاملة (للبثّ والتقرير)
         self._rolling_warned = False  # حُذّر من نافذة العدّاد المنزلقة مرة
+        self._gate_lost_logged = False  # أُعلن انهيار بوابة المحاذاة مرة
+        self._wall_corrections = 0    # تصحيحات جدار ناجحة (لتقرير الانسحاب)
+        self._ground_echo_logged = False  # أُعلن اشتباه صدى الأرض مرة
         self.last_reactive = None
         self.drive_motors = False
         self.executor = None
@@ -227,6 +232,17 @@ class MissionSim:
         if self.profile is None:
             return {"ok": False, "error": "لا يوجد ملف معايرة — عايِر أولاً"}
         if self.drive_motors:
+            # 🔴 الجاهزية أولاً: اتجاه + استشعار أمامي + معايرة. الرفض هنا
+            #    **بسبب مقروء** يظهر في الواجهة والسجل معاً.
+            rd = self.mission_readiness()
+            if not rd["ready"]:
+                for b in rd["blockers"]:
+                    self._log("not_ready", "⛔ " + b)
+                return {"ok": False,
+                        "error": "تعذّر بدء المسح: " + " · ".join(rd["blockers"]),
+                        "readiness": rd}
+            for w in rd["warnings"]:
+                self._log("readiness_warn", w)
             # ⚠ لا تبدأ قيادة محركات بحسّاس قرب معطوب — يُجهض كل خطوة ويلوّث الخريطة
             pf = self.preflight_check()
             if not pf["ok"]:
@@ -326,13 +342,32 @@ class MissionSim:
         if self.rover.check_heartbeat():
             self._log("heartbeat", "⚠ انقطاع أوامر > 1.5ث — أوقفت المحركات")
 
+    def poll_ground_echo(self) -> None:
+        """
+        يصرّف اشتباه **صدى الأرض** إلى السجل — مرة واحدة عند ظهوره.
+        ⚠ إعلان لا معالجة: الحل تثبيت الحسّاس أعلى، وأي مرشّح برمجي يتجاهل
+           ما دون 30سم يُعمي طبقة السلامة عن أخطر ما تحرسه.
+        """
+        us = getattr(self, "ultrasonic", None)
+        det = getattr(us, "ground_echo", None) if us is not None else None
+        if det is None:
+            return
+        # الحركة تجعل تغيّر المسافة حقيقياً — الكاشف يعمل على السكون فقط
+        us.moving_hint = (self.state == RUNNING and self.drive_motors)
+        if det.suspect and not self._ground_echo_logged:
+            self._ground_echo_logged = True
+            self._log("ground_echo", det.detail or "اشتباه صدى أرضي")
+        elif not det.suspect:
+            self._ground_echo_logged = False
+
     def poll_reactive(self):
         """
         (البند 3) يبثّ قرار طبقة السلامة: السرعة **وسببها** ودرجة السلّم.
         يُسجَّل عند تغيّر الدرجة فقط (لا يُغرق السجل).
         """
         s = self.sensors()
-        dec = self.reactive.decide(s["ultrasonic_cm"], s["ir_left"], s["ir_right"])
+        dec = self.reactive.decide(s["ultrasonic_cm"], s["ir_left"], s["ir_right"],
+                                   s.get("ir_mid"))
         self.last_reactive = dec
         if dec["rung"] != self._last_rung:
             self._last_rung = dec["rung"]
@@ -413,7 +448,8 @@ class MissionSim:
         # البند 5: مصدر الحماية يُسجَّل عند كل تغيّر — خلط المصدرين يجعل
         # تشخيص أي حادثة مستحيلاً («هبط الجهد أم نفد الزمن؟»).
         self._log_battery_source(info.get("source"), info.get("source_reason"))
-        if info["action"] == batt.ACTION_STOP:
+        self._check_shutdown(info)
+        if info["action"] in (batt.ACTION_STOP, batt.ACTION_SHUTDOWN):
             if self.state == RUNNING:
                 self._log("battery", f"⚠ جهد حرج {info['v']}V — إيقاف المحركات فوراً")
                 self.estop()
@@ -427,6 +463,75 @@ class MissionSim:
                       f"تنبيه: جهد {info['v']}V ({info.get('cell_v')}V/خلية) — جيد")
         self._batt_level = info["level"]
         return info
+
+    def _check_shutdown(self, info: dict) -> bool:
+        """
+        🔴 الطبقة الأخيرة: إطفاء منظَّم لنظام التشغيل عند بلوغ
+        `BATT_SHUTDOWN_V` — **تحت** إيقاف المحركات لا بدلاً منه.
+
+        السبب: تحت هذا الحدّ يقترب قطع الحماية (~8.4V) الذي يفصل التغذية
+        **فجأة**، وانقطاعها أثناء كتابة بطاقة SD يفسدها. الإطفاء المنظَّم
+        يسبق الانقطاع المفاجئ.
+
+        ⚠ **أربعة شروط مجتمعة** — أيّها سقط فلا إطفاء:
+          1) `BATT_SHUTDOWN_ENABLED` (يُطفأ للاختبار على الطاولة)
+          2) المصدر **INA219 حقيقي** — لا تجاوز محاكاة ولا حقل روفر:
+             إطفاء الجهاز بناءً على رقم غير مقيس غير مقبول إطلاقاً.
+          3) **ليست قيد الشحن** — الجهد أثناء الشحن مضلّل.
+          4) **5 قراءات متتالية** — تيار المحركات يُنتج هبوطاً لحظياً
+             (0.3–0.5V مقاسة) لا يستحق إطفاء الروبوت. وأي قراءة سليمة
+             تُصفّر العدّاد.
+        """
+        if info.get("action") != batt.ACTION_SHUTDOWN:
+            if self._shutdown_streak:
+                self._shutdown_streak = 0
+            return False
+        if info.get("charging"):
+            self._shutdown_streak = 0
+            return False
+        if info.get("source") != self.rover.VSRC_INA:
+            # لا نُطفئ الجهاز على رقم غير مقيس — نكتفي بإيقاف المحركات
+            self._log("battery",
+                      f"⚠ جهد {info.get('v')}V دون حدّ الإطفاء لكن المصدر "
+                      f"«{info.get('source')}» ليس INA219 — لا إطفاء")
+            return False
+        self._shutdown_streak += 1
+        self._log("battery",
+                  f"🔴 {info['v']}V < {BATT_SHUTDOWN_V}V "
+                  f"({info.get('cell_v')}V/خلية) — قراءة "
+                  f"{self._shutdown_streak}/{BATT_SHUTDOWN_CONSECUTIVE}")
+        if self._shutdown_streak < BATT_SHUTDOWN_CONSECUTIVE:
+            return False
+        # 🔴 السبب يُسجَّل **قبل** التنفيذ: بعد الإطفاء لا سجل يُكتب
+        self._log("shutdown",
+                  f"⛔ إطفاء منظَّم: {BATT_SHUTDOWN_CONSECUTIVE} قراءات متتالية "
+                  f"دون {BATT_SHUTDOWN_V}V وغير شاحنة (المصدر INA219). "
+                  f"المحركات أُوقفت، ثم إطفاء النظام قبل قطع الحماية المفاجئ.")
+        try:
+            self.rover.stop()
+        except Exception:                 # noqa: BLE001
+            pass
+        self.estop()
+        if not BATT_SHUTDOWN_ENABLED:
+            self._log("shutdown", "⚠ التنفيذ معطّل بـBATT_SHUTDOWN_ENABLED=False")
+            return False
+        self._do_shutdown()
+        return True
+
+    def _do_shutdown(self) -> None:
+        """
+        ينفّذ إطفاء النظام. معزول في دالة **ليكون قابلاً للاستبدال في
+        الاختبار** بلا إطفاء فعلي، ومحصور بمنصّة لينكس.
+        """
+        import platform
+        import subprocess
+        if platform.system() != "Linux":
+            self._log("shutdown", "⚠ ليست لينكس — لا إطفاء (محاكاة)")
+            return
+        try:
+            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+        except Exception as e:            # noqa: BLE001
+            self._log("shutdown", f"⚠ تعذّر تنفيذ الإطفاء: {e}")
 
     def _log_battery_source(self, source, reason=None) -> None:
         """
@@ -486,13 +591,30 @@ class MissionSim:
         """
         real_us = getattr(self, "ultrasonic", None)
         real_ir = getattr(self, "ir", None)
-        if (real_us is not None and real_us.ok) or (real_ir is not None and real_ir.ok):
-            us = real_us.distance_cm if (real_us and real_us.ok) else None
-            l, r = real_ir.read() if (real_ir and real_ir.ok) else (1, 1)
-            q = getattr(real_us, "quality", None) if (real_us and real_us.ok) else None
-            return {"ultrasonic_cm": us, "ir_left": l, "ir_right": r,
+        us_ok = bool(real_us is not None and real_us.ok)
+        ir_ok = bool(real_ir is not None and real_ir.ok)
+        if us_ok or ir_ok:
+            us = real_us.distance_cm if us_ok else None
+            vals = real_ir.read_all() if (ir_ok and hasattr(real_ir, "read_all")) \
+                else {"front_left": None, "front_right": None, "front_mid": None,
+                      "side_left": None, "side_right": None}
+            q = getattr(real_us, "quality", None) if us_ok else None
+            return {"ultrasonic_cm": us,
+                    # 🔴 `None` = **مجهول** لا «خالٍ» (البند: الغائب لا يُفترض سالماً)
+                    "ir_left": vals["front_left"], "ir_right": vals["front_right"],
+                    "ir_mid": vals["front_mid"],
+                    "ir_side_left": vals["side_left"],
+                    "ir_side_right": vals["side_right"],
                     "cpm": self.last_reading["cpm"], "source": "real",
                     "quality": q}
+        # 🔴 **لا سقوط إلى نموذج المحاكاة على عتاد حقيقي**: كان الفشل الكامل
+        #    لقراءة الحساسات يُسقط المسار إلى `SimWorld` — أي **مسافات
+        #    مُختلَقة تقود محركات حقيقية**. الآن نُعلن الجهل صراحةً.
+        if self.rover.mode == "real":
+            return {"ultrasonic_cm": None, "ir_left": None, "ir_right": None,
+                    "ir_mid": None, "ir_side_left": None, "ir_side_right": None,
+                    "cpm": self.last_reading["cpm"], "source": "unavailable",
+                    "quality": 0}
         if self.grid is None or self.dr is None:
             return {"ultrasonic_cm": None, "ir_left": 1, "ir_right": 1,
                     "cpm": self.last_reading["cpm"]}
@@ -687,11 +809,35 @@ class MissionSim:
             # انسحاب: لا وقت للقياس، والخلية مزارة أصلاً على الأثر
             self.dirty.add(self.current)
         s = self.sensors()
-        self.executor.maybe_wall_correct(self.dr, self.heading,
-                                         s.get("ultrasonic_cm"))
+        corr = self.executor.maybe_wall_correct(self.dr, self.heading,
+                                                s.get("ultrasonic_cm"))
+        if corr and corr.get("corrected"):
+            self._wall_corrections += 1
+        self._check_alignment_gate()
         self._check_battery()
         return {"ok": True, "entered": True, "cell": nxt,
                 "low_confidence": low_conf}
+
+    def _check_alignment_gate(self) -> None:
+        """
+        🔴 يُعلن **مرة واحدة** انهيار بوابة محاذاة تصحيح الجدران.
+
+        بعد استبدال BNO055 بـMPU-6050 لا شيء يصحّح الاتجاه (تصحيح الجدار
+        يضبط الموضع لا الزاوية)، فشكّ الاتجاه ينمو بلا سقف. وحين يتجاوز
+        `WALL_ALIGN_TOL_DEG` يصير التصحيح مرفوضاً بنيوياً ⇒ **حلقة مفرغة**:
+        الأداة الوحيدة المتبقية تتعطّل بالضبط حين تشتدّ الحاجة إليها.
+        نعلنها بدل تركها تعمل صامتة.
+        """
+        if self.dr is None or self._gate_lost_logged:
+            return
+        if self.dr.alignment_gate_lost:
+            self._gate_lost_logged = True
+            self._log("alignment_gate",
+                      f"🔴 شكّ الاتجاه {self.dr.heading_sigma_deg:.1f}° تجاوز "
+                      f"تسامح المحاذاة {WALL_ALIGN_TOL_DEG:.0f}° — **تصحيح "
+                      f"الجدران صار غير متاح بنيوياً**، ولا مرجع آخر للاتجاه "
+                      f"في العتاد الحالي. الموقع من الآن تقدير مفتوح الحلقة "
+                      f"كلياً (σ تعكس ذلك).")
 
     def _face(self, target_heading: float) -> bool:
         """يلفّ نحو اتجاه مطلوب ويحدّث الاتجاه فوراً. False عند فشل اللفّة."""
@@ -795,6 +941,8 @@ class MissionSim:
         self.phase = PHASE_SURVEY
         self.cycle = None
         self._rolling_warned = False
+        self._gate_lost_logged = False
+        self._wall_corrections = 0
 
     def _motion_step_m(self, covered: float, motion: dict) -> float:
         """
@@ -892,6 +1040,7 @@ class MissionSim:
                   + (f" — {reason}" if reason else ""))
         self._retracing = True
         steps, reached_entry = 0, False
+        corr_before = self._wall_corrections
         try:
             while steps < RETRACE_MAX_CELLS:
                 if self.state in (ESTOP, IDLE):
@@ -932,6 +1081,16 @@ class MissionSim:
                     self.breadcrumbs.pop()      # نقطة غير قابلة للوصول — تخطَّها
         finally:
             self._retracing = False
+            # 🔴 الانسحاب يمشي على اتجاه محسوب ينحرف بلا مرجع. تصحيح الجدران
+            #    يعمل داخل `_advance_one_cell` أصلاً — لكن **نجاحه ليس
+            #    مضموناً** (يحتاج جداراً مواجهاً ومحاذاة سليمة). نُبلّغ ماذا
+            #    حدث فعلاً بدل افتراض أن الانسحاب كان مصحَّحاً.
+            gained = self._wall_corrections - corr_before
+            self._log("retrace_refs",
+                      (f"تصحيحات جدار أثناء الانسحاب: {gained}"
+                       if gained else
+                       "⚠ **انسحاب بلا أي تصحيح جدار** — الموضع النهائي "
+                       "مبنيّ على اتجاه غير مصحَّح، فاعتبره تقديرياً"))
         return {"ok": False, "safe": False, "steps": steps,
                 "reason": f"بلغ سقف {RETRACE_MAX_CELLS} خلية انسحاب"}
 
@@ -1247,6 +1406,61 @@ class MissionSim:
         if axis == 90.0:
             return max(0.0, self.room.width_m - x)
         return max(0.0, x)
+
+    # ══ جاهزية المهمة: الرفض **بسبب معلَن** لا بصمت ══════════════
+    def mission_readiness(self) -> dict:
+        """
+        هل يجوز بدء **مسح ذاتي**؟ استعلام خالص (بلا أثر جانبي) يُبثّ في
+        الواجهة دائماً، ويُفرض في `start()` حين تكون المحركات مفعّلة.
+
+        🔴 الرفض عند النقص **سلوك صحيح لا عطل** — الناقص كان تفسيره. وقبله
+        كان زر «بدء مسح» يفشل بلا سبب مقروء، أو (أسوأ) تبدأ المهمة منطقياً
+        فتتقدّم الخريطة إلى 100% والروبوت ساكن.
+        """
+        blockers, warnings = [], []
+
+        # ① مصدر اتجاه صالح — بلا اتجاه لا ملاحة أصلاً
+        src = getattr(self.rover, "heading_source", None)
+        if src is None or not getattr(src, "ok", False):
+            why = (getattr(src, "error", None) or "غير متاح") if src else "غير مُنشأ"
+            blockers.append(f"لا مصدر اتجاه صالح ({why}) — "
+                            f"المسح الذاتي يتطلب اتجاهاً موثوقاً")
+
+        # ② استشعار أمامي — الروبوت بلا مدى أمامي يصطدم
+        s = self.sensors()
+        us = s.get("ultrasonic_cm")
+        us_live = bool(getattr(self.ultrasonic, "ok", False)) if self.ultrasonic else False
+        front_ir = [s.get("ir_left"), s.get("ir_right"), s.get("ir_mid")]
+        ir_live = any(v is not None for v in front_ir)
+        if not (us_live or ir_live):
+            blockers.append("لا استشعار أمامي (لا ألترا سونيك ولا IR أمامي) — "
+                            "المسح الذاتي مرفوض كلياً، لا بسرعة زحف")
+        elif not us_live:
+            warnings.append("⚠ بلا ألترا سونيك: التحقق من الحركة يفقد مرجعه "
+                            "الكمّي، وكل خلية ستُعلَّم بثقة منخفضة")
+        elif not ir_live:
+            warnings.append("⚠ بلا IR أمامي: الألترا سونيك يعمى عن الأسطح "
+                            "المائلة والمواد الماصّة والأجسام المنخفضة")
+        if us_live and us is None:
+            warnings.append("⚠ الألترا سونيك لا يُرجع قراءة الآن (جودة "
+                            f"{s.get('quality')}%)")
+
+        # ③ معايرة — المسافة تُشتق من السرعة المعايرة
+        if self.profile is None:
+            blockers.append("لا ملف معايرة — المسافة تُشتق من السرعة المعايرة")
+
+        # ④ غرفة
+        if self.grid is None:
+            blockers.append("لم تُعرَّف الغرفة بعد")
+
+        missing_ir = [n for n, p in IR_PRESENT.items() if not p]
+        if missing_ir:
+            warnings.append("حسّاسات IR معلَنة غائبة: " + "، ".join(missing_ir))
+        return {"ready": not blockers, "blockers": blockers,
+                "warnings": warnings,
+                "heading_ok": bool(src and getattr(src, "ok", False)),
+                "heading_source": getattr(src, "name", None),
+                "forward_sensing": bool(us_live or ir_live)}
 
     def preflight_check(self, samples: int = 8, gap: float = 0.15) -> dict:
         """
@@ -1672,6 +1886,9 @@ class MissionSim:
             "sensors": self.sensors(),
             "reactive": self.last_reactive,
             "reactive_enabled": self.reactive.enabled,
+            # جاهزية المسح الذاتي — تُبثّ دائماً ليعرف المشغّل **قبل** الضغط
+            "readiness": self.mission_readiness(),
+            "ir_present": IR_PRESENT,
             "drive_motors": self.drive_motors,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),

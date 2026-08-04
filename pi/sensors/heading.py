@@ -12,12 +12,18 @@ heading.py — **مصدر الاتجاه خلف واجهة واحدة** (الب�
     src.total_deg                        # تراكمي غير ملفوف (للفّات والمقارنات)
 
 المصادر:
-| الاسم | الحسّاس | المعادلة |
+| الاسم | الحسّاس | الحالة |
 |---|---|---|
-| `bno055_gyro`   | BNO055 gz (I2C) | تكامل: `h += (gz−bias)·dt·scale` |
-| `bno055_fusion` | BNO055 yaw (IMUPLUS) | فرق الزاوية المطلقة النسبية |
-| `rover_gyro`    | T=126 gz (سيريال) | تكامل — **الحسّاس مات، للتوثيق** |
+| `mpu6050`       | MPU-6050 gz (i2c-4 @0x68) | ✅ **الحالي** — تكامل `h += (gz−bias)·dt·scale` |
+| `bno055_gyro`   | BNO055 gz | 🔴 **تالفة** (5.40V على حدّ 3.6V) |
+| `bno055_fusion` | BNO055 yaw | 🔴 نفس السبب |
+| `rover_gyro`    | T=126 gz (سيريال) | 🔴 **ميت** — I2C الروفر الداخلي معطّل |
 | `sim`           | جسر المحاكاة | تكامل من أمر الدوران الوهمي |
+
+🔴 **لا مصدر ميت يُقبل بديلاً**: كان فشل BNO055 يُسقط النظام إلى `rover_gyro`
+   الميت وهو يدّعي `ok=True` (يُكتشف موته بعد عشرات القراءات داخل حلقة اللفّ).
+   الآن المصدر الميت يخرج `ok=False` فوراً بسبب مقروء، و**انعدام المصدر
+   يُعلَن صراحةً** بدل أن يُخفى خلف بديل لا يقرأ.
 
 ⚠ القاعدة الحاكمة باقية (CLAUDE.md §1): الاتجاه من **الجايرو** لا من البوصلة.
    `bno055_fusion` مسموح **فقط** لأن وضع IMUPLUS يُقصي المغنيتومتر كلياً؛ لو
@@ -38,7 +44,8 @@ from pi.config import (
     HEADING_SPIKE_DPS, HEADING_LPF_ALPHA, HEADING_DEADBAND_DPS,
     HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN,
     HEADING_LPF_ALPHA_DRIVE, HEADING_LPF_ALPHA_TURN,
-    BNO055_READ_PERIOD_S,
+    BNO055_READ_PERIOD_S, MPU6050_GYRO_SCALE, MPU6050_GYRO_Z_SIGN,
+    BNO055_DEAD, ROVER_GYRO_DEAD,
 )
 
 # ── أطوار الحركة: عتبة القفزة والتنعيم يختلفان بينها (انظر config) ──
@@ -361,6 +368,47 @@ class BNO055FusionHeading(HeadingSource):
         return self.imu.euler_yaw()
 
 
+# ═══ 2.5) MPU-6050 — **مصدر الاتجاه الحالي** ═════════════════════
+class MPU6050GyroHeading(HeadingSource):
+    """
+    تكامل gz من MPU-6050 — بديل BNO055 التالفة، خلف **نفس الواجهة تماماً**.
+
+    ⚠ لا شيء تغيّر في المبدأ: المشروع كان يكامل معدّل الجايرو أصلاً (BNO055
+       في وضع IMUPLUS بلا مغنيتومتر — CLAUDE.md §1)، فالاتجاه كان وما زال
+       **نسبياً ينحرف بلا حد**. ما تغيّر هو **جودة الحسّاس**: معدل قراءة
+       أبطأ (39.7 مقابل 45.3 Hz)، وأرضية ضجيج غير مقاسة بعد، ولا مؤشّر
+       معايرة ذاتية. ⇒ إعادة **معايرة** لا إعادة تصميم.
+
+    ⚠ الثوابت `MPU6050_GYRO_SCALE` و`MPU6050_GYRO_Z_SIGN` و
+       `HEADING_DEADBAND_DPS` **غير معايرة لهذا الحسّاس** — انظر config.
+    """
+    name = "mpu6050"
+    kind = "rate"
+
+    def __init__(self, mpu, scale: float = MPU6050_GYRO_SCALE,
+                 sign: int = MPU6050_GYRO_Z_SIGN):
+        super().__init__(scale=scale, max_bias_std=GYRO_BIAS_MAX_STD_BNO)
+        self.mpu = mpu
+        self.sign = -1 if int(sign) < 0 else 1
+        if mpu is None or not getattr(mpu, "ok", False):
+            self.ok = False
+            self.error = (getattr(mpu, "error", None)
+                          or "MPU-6050 غير متاح")
+
+    def _read_rate_dps(self):
+        v = self.mpu.gyro_z_dps()
+        return None if v is None else self.sign * float(v)
+
+    def state(self) -> dict:
+        st = super().state()
+        st["sensor"] = self.mpu.state() if self.mpu else None
+        # لا مغنيتومتر في MPU-6050 أصلاً — والقاعدة تمنع البوصلة على أي حال
+        st["mag_used"] = False
+        st["z_sign"] = self.sign
+        st["calibrated"] = False        # ⚠ ثوابت هذا المصدر غير معايرة بعد
+        return st
+
+
 # ═══ 3) جايرو الروفر عبر T=126 — **معطّل عتادياً** ════════════════
 class RoverGyroHeading(HeadingSource):
     """
@@ -402,10 +450,28 @@ def make_heading_source(bridge=None, imu=None, source: str = None) -> HeadingSou
                 (حتى لا يُفتح I2C على ويندوز بلا سبب).
     """
     req = (source or HEADING_SOURCE or "").strip().lower()
+    real = getattr(bridge, "mode", "sim") == "real"
     if req == "sim":
         return SimHeading(bridge)
 
+    # ── المصدر الحالي: MPU-6050 ──────────────────────────────────
+    if req.startswith("mpu6050"):
+        if imu is None:
+            imu = _shared_mpu()
+        src = MPU6050GyroHeading(imu)
+        if src.ok:
+            src.fallback_reason = None
+            return src
+        return _no_source(bridge, real, src.error or "MPU-6050 غير متاح")
+
+    # ── BNO055: تالفة عتادياً ────────────────────────────────────
     if req.startswith("bno055"):
+        if BNO055_DEAD:
+            return _no_source(
+                bridge, real,
+                "🔴 BNO055 **تالفة** (تعرّضت لـ5.40V وحدّها 3.6V فشدّت "
+                "SDA/SCL للأرضي) — استُبدلت بـMPU-6050. "
+                "استعمل RMS_HEADING_SOURCE=mpu6050")
         if imu is None:
             imu = _shared_imu()
         cls = BNO055FusionHeading if req == "bno055_fusion" else BNO055GyroHeading
@@ -413,34 +479,66 @@ def make_heading_source(bridge=None, imu=None, source: str = None) -> HeadingSou
         if src.ok:
             src.fallback_reason = None
             return src
-        reason = src.error
-        # BNO055 مفقود → لا نتظاهر بالسلامة: نسقط إلى المحاكاة/الروفر بسبب معلن
-        alt = SimHeading(bridge) if getattr(bridge, "mode", "sim") != "real" \
-            else RoverGyroHeading(bridge)
-        alt.fallback_reason = f"⚠ {reason} → البديل: {alt.name}"
-        return alt
+        return _no_source(bridge, real, src.error)
 
+    # ── جايرو الروفر: ميت عتادياً ────────────────────────────────
     if req == "rover_gyro":
+        if ROVER_GYRO_DEAD:
+            return _no_source(
+                bridge, real,
+                "🔴 rover_gyro: I2C الروفر الداخلي **معطّل** — لا يقرأ، "
+                "وكل معايرة أُخذت عبره باطلة")
         src = RoverGyroHeading(bridge)
-        src.fallback_reason = ("⚠ rover_gyro: جايرو الروفر الداخلي معطّل عتادياً — "
-                               "المعايرات المأخوذة عبره باطلة")
         return src
 
-    src = SimHeading(bridge)
-    src.fallback_reason = f"⚠ مصدر اتجاه غير معروف «{req}» → مصدر محاكاة"
-    return src
+    return _no_source(bridge, real, f"مصدر اتجاه غير معروف «{req}»")
+
+
+def _no_source(bridge, real: bool, reason: str):
+    """
+    🔴 **لا مصدر اتجاه صالح**.
+
+    على العتاد الحقيقي **لا يوجد بديل**: كل المصادر الأخرى ميتة، والسقوط إلى
+    مصدر محاكاة هناك أخطر من الإعلان — يجعل الروبوت يلفّ على أرقام مخترعة.
+    فنُعيد مصدراً **يعلن `ok=False`** ويترك الطبقة الأعلى ترفض بدء المهمة
+    برسالة صريحة. في المحاكاة (ويندوز) البديل الوهمي مشروع ومعلَن.
+    """
+    if not real:
+        alt = SimHeading(bridge)
+        alt.fallback_reason = f"⚠ {reason} → البديل: مصدر محاكاة (بلا عتاد)"
+        return alt
+    dead = SimHeading(bridge)
+    dead.ok = False
+    dead.error = reason
+    dead.fallback_reason = (f"🔴 **لا مصدر اتجاه صالح على العتاد**: {reason}. "
+                            f"الملاحة الذاتية تتطلب اتجاهاً موثوقاً.")
+    return dead
+
+
+class _Missing:
+    """بديل لقارئ تعذّر استيراده — يعلن الخلل ولا يتظاهر بالسلامة."""
+
+    def __init__(self, error):
+        self.ok = False
+        self.error = str(error)
+
+    def state(self):
+        return {"ok": False, "error": self.error}
 
 
 def _shared_imu():
-    """القارئ المشترك — يُستورد متأخراً حتى لا يُفتح I2C إلا عند الطلب."""
+    """القارئ المشترك لـBNO055 — يُستورد متأخراً (لا يُفتح I2C بلا طلب)."""
     try:
         from pi.sensors.imu import get_imu
         return get_imu()
     except Exception as e:                    # noqa: BLE001
-        class _Missing:
-            ok = False
-            error = str(e)
+        return _Missing(e)
 
-            def state(self):
-                return {"ok": False, "error": self.error}
-        return _Missing()
+
+def _shared_mpu():
+    """القارئ المشترك لـMPU-6050 — نفس المبدأ."""
+    try:
+        from pi.sensors.mpu6050 import get_mpu
+        return get_mpu()
+    except Exception as e:                    # noqa: BLE001
+        return _Missing(e)

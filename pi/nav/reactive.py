@@ -143,35 +143,57 @@ class ReactiveSafety:
         return self.jump.feed(med) if filtered else med
 
     # ── البندان 2+4: القرار اللحظي ──────────────────────────────
-    def decide(self, front_cm, ir_left: int, ir_right: int) -> dict:
+    def decide(self, front_cm, ir_left, ir_right, ir_mid=None) -> dict:
         """
         أولوية مطلقة لـIR (خط الدفاع الأخير — الوقت لا يسمح بمسح دوراني)،
         ثم الألترا سونيك (توقف + مسح دوراني)، وإلا سِر بسرعة السلّم.
+
+        🔴 **`None` تعني «مجهول» لا «خالٍ»**: حسّاس غائب أو تعذّرت قراءته لا
+        يُطلق تفادياً (لا معلومة عنده) و**لا يُحسب شهادةً بخلوّ الطريق**.
+        الحماية من العمى ليست هنا بل في `mission_readiness` التي **ترفض بدء
+        المسح الذاتي** بلا استشعار أمامي — وهو الموضع الصحيح للقرار: طبقة
+        السلامة تتفاعل مع ما تراه، والملاحة تقرّر ألّا تنطلق عمياء.
+        ⚠ والمجهول يُذكر في `unknown` فيظهر في الواجهة بدل أن يمرّ صامتاً.
         """
+        unknown = [n for n, v in (("front_left", ir_left),
+                                  ("front_right", ir_right),
+                                  ("front_mid", ir_mid)) if v is None]
         left_obs = (ir_left == IR_OBSTACLE_LEVEL)
         right_obs = (ir_right == IR_OBSTACLE_LEVEL)
+        mid_obs = (ir_mid == IR_OBSTACLE_LEVEL)
 
         # (البند 4) IR في الركنين الأماميين — استجابة فورية بلا مسح
-        if left_obs and right_obs:
+        if mid_obs and not (left_obs or right_obs):
+            # منتصف المقدمة يسدّ العمى المركزي بين حسّاسي الركنين
             return {"action": "backup_turn", "speed": 0.0, "priority": "ir",
-                    "rung": "ir_both", "turn_deg": 90.0,
+                    "rung": "ir_mid", "turn_deg": 90.0, "unknown": unknown,
+                    "reason": "عائق مركزي على IR الأوسط → رجوع + لفّ 90°"}
+        if (left_obs and right_obs) or (mid_obs and left_obs and right_obs):
+            return {"action": "backup_turn", "speed": 0.0, "priority": "ir",
+                    "rung": "ir_both", "turn_deg": 90.0, "unknown": unknown,
                     "reason": "عائق عريض على IR الجهتين → رجوع + لفّ 90°"}
         if left_obs:
             return {"action": "turn_right", "speed": 0.0, "priority": "ir",
-                    "rung": "ir_left", "reason": "IR أمام-يسار → لفّ يميناً"}
+                    "rung": "ir_left", "unknown": unknown,
+                    "reason": "IR أمام-يسار → لفّ يميناً"}
         if right_obs:
             return {"action": "turn_left", "speed": 0.0, "priority": "ir",
-                    "rung": "ir_right", "reason": "IR أمام-يمين → لفّ يساراً"}
+                    "rung": "ir_right", "unknown": unknown,
+                    "reason": "IR أمام-يمين → لفّ يساراً"}
 
         # (البند 2) الألترا سونيك: سرعة متدرّجة أو توقف
         lad = speed_for_distance(front_cm)
         if lad["rung"] == "stop":
             return {"action": "stop", "speed": 0.0, "priority": "ultrasonic",
-                    "rung": "stop", "reason": lad["reason"],
+                    "rung": "stop", "reason": lad["reason"], "unknown": unknown,
                     # (البند 3) الخطوة التالية بعد التوقف
                     "next": "smart_avoid" if self.smart_avoid_enabled else "simple"}
         return {"action": "go", "speed": lad["speed"], "priority": "clear",
-                "rung": lad["rung"], "reason": lad["reason"]}
+                "rung": lad["rung"], "unknown": unknown,
+                # ⚠ «خالٍ» هنا تعني «لم يرَ أحدٌ عائقاً»، لا «كل الحساسات
+                #   شهدت بالخلوّ» — والفرق مذكور في `unknown`.
+                "reason": lad["reason"] + (f" ⚠ مجهول: {'، '.join(unknown)}"
+                                           if unknown else "")}
 
     # ── البند 3: المسح الدوراني (الحساس ثابت والجسم يدور) ───────
     def smart_avoid(self, rover, sampler) -> dict:

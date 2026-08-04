@@ -27,6 +27,7 @@ from pi.config import (
     ULTRASONIC_TRIG_GPIO, ULTRASONIC_ECHO_GPIO,
     ULTRASONIC_MEDIAN_N, ULTRASONIC_EMA_ALPHA, ULTRASONIC_QUALITY_WINDOW_S,
     USE_GPIOZERO_DISTANCE, MAX_JUMP_CM, ULTRASONIC_MAX_STALE,
+    ULTRASONIC_MIN_PERIOD_S, ULTRASONIC_PRESENT,
 )
 
 try:
@@ -114,6 +115,80 @@ class DistanceFilter:
         return self._ema
 
 
+class GroundEchoDetector:
+    """
+    🔴 كاشف **تشخيصي** لصدى الأرض — يُعلن ولا يعالج.
+
+    العلّة (مقاسة 2026-08-01): تثبيت منخفض يجعل الحافة السفلى لمخروط الشعاع
+    (±7.5°) تصطدم بالأرض، فتُقرأ **21سم ثابتة والروبوت ساكن ولا شيء أمامه**.
+    التوقيع المميّز **عنقودان ضيّقان** (21سم و182سم بنسبة 84%/15%) — لا تشتّت
+    عشوائي كالضجيج الكهربائي. والأثر: سلّم السلامة يتشنّج بين «توقف» و«طريق
+    مفتوح»، فينزلق الروبوت وتُعلَّم خلايا سليمة **محجوبة** خطأً.
+
+    ⚠⚠ **لا يُعالَج برمجياً ولا يُضاف مرشّح يتجاهل ما دون 30سم**: ذلك يُعمي
+    طبقة السلامة عن العوائق القريبة الحقيقية — وهي أخطر ما تحرسه. الحلّ
+    **تثبيت لا كود**، ووظيفة هذا الكاشف أن يقول ذلك بدل تركه يُخمَّن.
+
+    المرجع: حسّاس سليم على هدف ثابت يعطي تشتتاً ~1.1سم.
+    """
+
+    def __init__(self, window: int = 60, min_samples: int = 30,
+                 gap_cm: float = 40.0, cluster_cm: float = 8.0,
+                 min_share: float = 0.15):
+        self.window = int(window)
+        self.min_samples = int(min_samples)
+        self.gap_cm = float(gap_cm)
+        self.cluster_cm = float(cluster_cm)
+        self.min_share = float(min_share)
+        self._vals = deque(maxlen=self.window)
+        self.suspect = False
+        self.detail = None
+
+    def add(self, cm, moving: bool = False) -> None:
+        """⚠ تُهمَل العيّنات أثناء الحركة: تغيّر المسافة حينها **حقيقي**."""
+        if moving:
+            self._vals.clear()
+            self.suspect, self.detail = False, None
+            return
+        if cm is not None:
+            self._vals.append(float(cm))
+        self._evaluate()
+
+    def _evaluate(self) -> None:
+        if len(self._vals) < self.min_samples:
+            return
+        v = sorted(self._vals)
+        # أوسع فجوة بين قيمتين متتاليتين تفصل العنقودين
+        gi, gap = 0, 0.0
+        for i in range(1, len(v)):
+            d = v[i] - v[i - 1]
+            if d > gap:
+                gap, gi = d, i
+        if gap < self.gap_cm:
+            self.suspect, self.detail = False, None
+            return
+        lo, hi = v[:gi], v[gi:]
+        share = min(len(lo), len(hi)) / len(v)
+        lo_w = (max(lo) - min(lo)) if lo else 0.0
+        hi_w = (max(hi) - min(hi)) if hi else 0.0
+        # عنقودان **ضيّقان** متباعدان، وأصغرهما ذو حصة معتبرة
+        if share >= self.min_share and lo_w <= self.cluster_cm and hi_w <= self.cluster_cm:
+            self.suspect = True
+            self.detail = (
+                f"⚠ **اشتباه صدى أرضي — راجع ارتفاع تثبيت الألترا سونيك**: "
+                f"عنقودان ضيّقان والروبوت ساكن — "
+                f"{sum(lo) / len(lo):.0f}سم ({100 * len(lo) / len(v):.0f}%) و"
+                f"{sum(hi) / len(hi):.0f}سم ({100 * len(hi) / len(v):.0f}%). "
+                f"حسّاس سليم يعطي تشتتاً ~1.1سم على هدف ثابت. "
+                f"🔴 الحل **تثبيت لا كود** — لا تضف مرشّحاً يتجاهل ما دون 30سم.")
+        else:
+            self.suspect, self.detail = False, None
+
+    def state(self) -> dict:
+        return {"suspect": self.suspect, "detail": self.detail,
+                "samples": len(self._vals)}
+
+
 class QualityTracker:
     """نسبة القراءات الناجحة خلال آخر نافذة زمنية (تشخيص التوصيل/السطح)."""
 
@@ -146,6 +221,8 @@ class UltrasonicReader:
         self.backend = None
         self.filter = DistanceFilter()
         self.quality_tracker = QualityTracker()
+        self.ground_echo = GroundEchoDetector()
+        self.moving_hint = False      # تُضبط من المهمة أثناء الحركة
         self.raw_cm = None
         self._trig, self._echo = trig, echo
         self._h = None
@@ -154,6 +231,11 @@ class UltrasonicReader:
         self._st = {"rise": 0, "width": None}
         self._stop = False
 
+        # 🔴 معلَن غائباً ⇒ **لا يُحجز المنفذ ولا يُقرأ**: منفذ طافٍ يعطي
+        #    ضجيجاً أسوأ من غياب معلَن، والقيمة تبقى `None` = مجهولة.
+        if not ULTRASONIC_PRESENT:
+            self.error = "الألترا سونيك معلَن غائباً (ULTRASONIC_PRESENT=False)"
+            return
         if use_gpiozero and self._init_gpiozero():
             self.backend = "gpiozero"
             self.ok = True
@@ -229,11 +311,16 @@ class UltrasonicReader:
 
     def _run(self):
         while not self._stop:
+            t0 = time.time()
             raw = self._measure_once()
             self.raw_cm = raw
             self.quality_tracker.add(raw is not None)
             self.filter.feed(raw)
-            time.sleep(_MEASURE_GAP_S)
+            self.ground_echo.add(raw, moving=self.moving_hint)
+            # ⚠ **لا تنادِه أسرع من ~16 مرة/ث**: الصدى السابق يلوّث التالي،
+            #    فيُنتج قراءات شبحية تبدو عوائق. الفاصل يُحسب من بدء القياس
+            #    لا من نهايته حتى تبقى الدورة ثابتة مهما طال انتظار الصدى.
+            time.sleep(max(0.0, ULTRASONIC_MIN_PERIOD_S - (time.time() - t0)))
 
     # ── الواجهة العامة ──────────────────────────────────────────
     @property
@@ -251,9 +338,11 @@ class UltrasonicReader:
 
     def state(self) -> dict:
         return {"ok": self.ok, "error": self.error, "backend": self.backend,
+                "present": ULTRASONIC_PRESENT,
                 "distance_cm": self.distance_cm, "raw_cm": (
                     round(self.raw_cm, 1) if self.raw_cm is not None else None),
-                "quality": self.quality}
+                "quality": self.quality,
+                "ground_echo": self.ground_echo.state()}
 
     def close(self):
         self._stop = True

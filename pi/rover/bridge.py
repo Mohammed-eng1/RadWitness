@@ -147,6 +147,8 @@ class WaveRoverBridge:
         self._ina_reader = None         # None=لم يُجرَّب · False=غير متاح
         self.voltage_source = self.VSRC_NONE
         self.voltage_reason = None
+        self.battery_amps = None
+        self.battery_charging = False
         self._sim_v_override = False
         # محاكاة
         self._sim_v = 12.40
@@ -342,14 +344,18 @@ class WaveRoverBridge:
         # الواجهة يجب أن تبقى عاملة على العتاد أيضاً، وإلا تعطّلت بصمت.
         if self._sim_v_override:
             self.voltage_source, self.voltage_reason = self.VSRC_SIM, None
+            self.battery_amps, self.battery_charging = None, False
             return self._sim_v
         ina = self._ina()
         if ina is not None:
             r = ina.read()
             if r["v"] is not None:
                 self.voltage_source, self.voltage_reason = self.VSRC_INA, None
+                self.battery_amps = r.get("amps")
+                self.battery_charging = bool(r.get("charging"))
                 return r["v"]
             self.voltage_reason = r["reason"]
+        self.battery_amps, self.battery_charging = None, False
         v = self.last_status.get("v")
         if v is not None:
             self.voltage_source = self.VSRC_ROVER
@@ -382,9 +388,10 @@ class WaveRoverBridge:
     def battery_state(self) -> dict:
         """تصنيف الجهد **مع مصدره وسببه** — لا رقم عارٍ (البند 5)."""
         v = self.voltage()
-        info = batt.classify(v)
+        info = batt.classify(v, self.battery_amps)
         info["source"] = self.voltage_source
         info["source_reason"] = self.voltage_reason
+        info["charging"] = self.battery_charging
         ina = self._ina_reader if self._ina_reader not in (None, False) else None
         info["ina219"] = ina.state() if ina is not None else None
         return info

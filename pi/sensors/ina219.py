@@ -32,6 +32,7 @@ import threading
 from pi.config import (
     INA219_ADDR, INA219_I2C_BUS, INA219_CONFIG_VALUE, INA219_LSB_V,
     INA219_MIN_PLAUSIBLE_V, INA219_MAX_PLAUSIBLE_V,
+    INA219_SHUNT_OHM, INA219_CURRENT_LSB_V, INA219_CHARGING_A,
 )
 
 try:
@@ -41,6 +42,7 @@ except Exception:                      # noqa: BLE001 — ويندوز/بلا ع
     _SMBUS_OK = False
 
 REG_CONFIG = 0x00
+REG_SHUNT_VOLTAGE = 0x01
 REG_BUS_VOLTAGE = 0x02
 
 
@@ -56,6 +58,7 @@ class INA219Reader:
         self.ok = False
         self.error = None
         self.last_v = None
+        self.last_a = None
         self.last_raw = None
         self.ovf_count = 0            # كم قراءة رُفضت بالتجاوز
         self.reject_count = 0         # كم رُفضت لأي سبب (تشخيص التوصيل)
@@ -132,8 +135,32 @@ class INA219Reader:
                                f"{INA219_MAX_PLAUSIBLE_V:.0f}V — "
                                f"خطأ عنوان/سجل لا حالة بطارية")}
         self.last_v = v
+        amps = self._read_amps()
+        self.last_a = amps
         return {"v": v, "ok": True, "ovf": False, "cnvr": cnvr, "raw": raw,
+                "amps": amps,
+                # 🔴 «قيد الشحن» ليس زينة: الجهد أثناء الشحن **مضلّل** (أعلى
+                #    من الحقيقي)، فأي قرار سلامة يُتَّخذ عليه خاطئ — ولهذا
+                #    تُستثنى هذه الحالة من الإطفاء.
+                "charging": (amps is not None and amps > INA219_CHARGING_A),
+                "watts": (round(v * abs(amps), 2) if amps is not None else None),
                 "reason": None}
+
+    def _read_amps(self):
+        """
+        التيار من سجل الشنت: خطوة 10µV ÷ مقاومة الشنت. `None` عند الفشل.
+        ⚠ **مُوقَّع**: موجب = شحن داخل الحزمة، سالب = سحب. لا تأخذ المطلق
+           قبل فحص الإشارة وإلا اختفى الفرق بين الشحن والتفريغ.
+        """
+        try:
+            with self._lock:
+                d = self._bus.read_i2c_block_data(self.addr, REG_SHUNT_VOLTAGE, 2)
+        except Exception:              # noqa: BLE001 — I2C عابر
+            return None
+        raw = (d[0] << 8) | d[1]
+        if raw > 32767:                # مكمّل اثنين 16-بت
+            raw -= 65536
+        return (raw * INA219_CURRENT_LSB_V) / max(INA219_SHUNT_OHM, 1e-9)
 
     def voltage(self):
         """الجهد بالفولت أو `None` — الواجهة المختصرة للطبقات الأعلى."""
@@ -141,8 +168,11 @@ class INA219Reader:
 
     def state(self) -> dict:
         return {"ok": self.ok, "error": self.error, "addr": self.addr,
-                "bus": self.bus_num, "last_v": (round(self.last_v, 2)
-                                                if self.last_v is not None else None),
+                "bus": self.bus_num, "shunt_ohm": INA219_SHUNT_OHM,
+                "last_v": (round(self.last_v, 2)
+                           if self.last_v is not None else None),
+                "last_a": (round(self.last_a, 3)
+                           if self.last_a is not None else None),
                 "ovf_count": self.ovf_count, "reject_count": self.reject_count}
 
     def close(self) -> None:

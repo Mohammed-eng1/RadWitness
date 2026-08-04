@@ -15,22 +15,35 @@ battery.py — تصنيف جهد البطارية وحمايتها (البند �
 from pi.config import (
     BATT_EXCELLENT_V, BATT_GOOD_V, BATT_LOW_V, BATT_CRITICAL_V,
     BATT_FULL_V, BATT_EMPTY_V, BATT_CELLS, CALIB_VOLTAGE_DELTA_WARN,
+    BATT_CURVE, BATT_R_INTERNAL_OHM, BATT_SHUTDOWN_V,
 )
 
 # (الإجراء، الاسم، اللون)
 ACTION_NONE, ACTION_WARN, ACTION_RTH, ACTION_STOP = "none", "warn", "rth", "stop"
+# 🔴 إطفاء نظام التشغيل — **تحت** إيقاف المحركات لا بدلاً منه
+ACTION_SHUTDOWN = "shutdown"
 
 
-def percent(v: float) -> int:
+def percent(v: float, amps: float = None) -> int:
     """
-    تقدير نسبة الشحن خطياً بين الفارغة والممتلئة.
-    ⚠ **تقديري لا مقياس شحن**: منحنى تفريغ الليثيوم مسطّح في وسطه وحادّ عند
-    طرفيه، فالخطّية تبالغ في المنتصف. يُعرض للتوجيه، والقرار على **الجهد**.
+    نسبة الشحن **باستيفاء منحنى** لا بمعادلة خطية.
+
+    ⚠ منحنى تفريغ الليثيوم مسطّح في وسطه وحادّ عند طرفيه، فالخطّية تبالغ في
+    المنتصف وتضلّل عند الأطراف. والجهد **ينخفض تحت الحمل** (0.3–0.5V مقاسة
+    عند تشغيل المحركات) فيُعوَّض بمقاومة الحزمة: V_مفتوح ≈ V + |I|×R.
+    ⚠ تبقى **تقديرية** ويُتَّخذ القرار على **الجهد** لا عليها.
     """
-    if BATT_FULL_V <= BATT_EMPTY_V:
+    vv = float(v)
+    if amps:
+        vv += abs(float(amps)) * BATT_R_INTERNAL_OHM
+    if vv >= BATT_CURVE[0][0]:
+        return 100
+    if vv <= BATT_CURVE[-1][0]:
         return 0
-    pct = (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
-    return int(max(0.0, min(100.0, pct)))
+    for (v1, p1), (v2, p2) in zip(BATT_CURVE, BATT_CURVE[1:]):
+        if v2 <= vv <= v1:
+            return int(round(p2 + (vv - v2) * (p1 - p2) / (v1 - v2)))
+    return 0
 
 
 def cell_voltage(v: float) -> float:
@@ -38,14 +51,23 @@ def cell_voltage(v: float) -> float:
     return v / max(1, BATT_CELLS)
 
 
-def classify(v) -> dict:
+def classify(v, amps: float = None) -> dict:
     """يُصنّف الجهد ويحدّد الإجراء التلقائي الإلزامي."""
     if v is None:
         return {"level": "unknown", "action": ACTION_NONE, "color": "#8a93a6",
-                "percent": 0, "v": None, "cell_v": None,
-                "cells": BATT_CELLS, "text": "جهد غير معروف"}
-    common = {"percent": percent(v), "v": round(v, 2),
-              "cell_v": round(cell_voltage(v), 2), "cells": BATT_CELLS}
+                "percent": 0, "v": None, "cell_v": None, "amps": None,
+                "charging": False, "cells": BATT_CELLS,
+                "text": "جهد غير معروف"}
+    common = {"percent": percent(v, amps), "v": round(v, 2),
+              "cell_v": round(cell_voltage(v), 2), "cells": BATT_CELLS,
+              "amps": (round(amps, 3) if amps is not None else None)}
+    # 🔴 الطبقة الأخيرة: تحت هذا الحدّ يقترب قطع الحماية (~8.4V) الذي يقطع
+    #    التغذية فجأةً — وانقطاعها أثناء الكتابة على البطاقة يفسدها.
+    #    ⚠ الإجراء نفسه مشروط بـ5 قراءات متتالية وبعدم الشحن — في mission.
+    if v < BATT_SHUTDOWN_V:
+        return {"level": "shutdown", "action": ACTION_SHUTDOWN,
+                "color": "#7f1d1d",
+                "text": "🔴 حرج جداً — إطفاء منظَّم", **common}
     if v < BATT_CRITICAL_V:
         return {"level": "critical", "action": ACTION_STOP, "color": "#dc2626",
                 "text": "حرج — إيقاف فوري", **common}

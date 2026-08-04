@@ -336,7 +336,8 @@ def main() -> int:
         HeadingController, signed_error, available_headroom, config_sanity,
     )
     from pi.config import (
-        HEADING_SOURCE, BNO055_GYRO_SCALE, HEADING_MAX_CORR, STRAIGHT_BASE_POWER,
+        HEADING_SOURCE, BNO055_GYRO_SCALE, MPU6050_GYRO_SCALE,
+        HEADING_MAX_CORR, STRAIGHT_BASE_POWER,
         HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, MOTOR_TRIM_L,
         BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S, MISSION_HARD_LIMIT_S,
         MISSION_TIME_WARN_S, MIN_MOTOR_POWER,
@@ -511,9 +512,46 @@ def main() -> int:
     # مقاسة، والفحص المفيد صار **حارس وحدات**: خطأ الوحدات يعطي ≈57 (راديان
     # قُرئت كدرجات) أو ≈0.017 (العكس)، وكلاهما خارج النطاق المعقول لحسّاس
     # مضبوط مصنعياً بـ16 LSB/°ث. نفس الحدّ الذي يحذّر عنده سكربت المعايرة.
-    check("معامل BNO055 داخل النطاق المعقول (حارس خطأ وحدات)",
-          0.2 < BNO055_GYRO_SCALE < 5.0 and HEADING_SOURCE == "bno055_gyro",
-          f"scale={BNO055_GYRO_SCALE}")
+    # ⚠ كان يشترط `HEADING_SOURCE == "bno055_gyro"` — والشريحة **تلفت**
+    #   (5.40V على حدّ 3.6V) واستُبدلت بـMPU-6050. الحارس الباقي هو نفسه:
+    #   خطأ الوحدات يعطي ≈57 (راديان قُرئت درجات) أو ≈0.017 (العكس).
+    check("معامل MPU-6050 داخل النطاق المعقول (حارس خطأ وحدات)",
+          0.2 < MPU6050_GYRO_SCALE < 5.0 and HEADING_SOURCE == "mpu6050",
+          f"scale={MPU6050_GYRO_SCALE} · المصدر={HEADING_SOURCE}")
+
+    # ── MPU-6050: نفس عقد المصدر تماماً ──────────────────────────
+    from pi.sensors.heading import MPU6050GyroHeading
+    hm = MPU6050GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=+1)
+    hm.update(); time.sleep(0.05); hm.update()
+    check("mpu6050 يكامل (gz−bias)·dt·scale خلف نفس الواجهة",
+          hm.heading > 0 and hm.ok, f"heading={hm.heading:.2f}°")
+    hm_neg = MPU6050GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=-1)
+    hm_neg.update(); time.sleep(0.05); hm_neg.update()
+    check("إشارة محور z تقلب التكامل (تثبيت الحسّاس — تُقاس باليد)",
+          hm_neg.total_deg < 0, f"{hm_neg.total_deg:.2f}°")
+    check("MPU مفقود → المصدر يعلن الخلل لا يتظاهر بالسلامة",
+          not MPU6050GyroHeading(FakeIMU(ok=False)).ok)
+    check("MPU-6050 بلا مغنيتومتر ولا مرجع مطلق — ويُصرَّح بذلك",
+          MPU6050GyroHeading(FakeIMU()).state()["mag_used"] is False
+          and MPU6050GyroHeading(FakeIMU()).state()["calibrated"] is False)
+
+    # 🔴 لا مصدر ميت يُقبل بديلاً على العتاد الحقيقي
+    class RealishBridge(WaveRoverBridge):
+        """جسر يدّعي وضع real لاختبار سياسة المصادر (بلا منفذ فعلي)."""
+        def __init__(self):
+            super().__init__(mode="sim")
+            self.mode = "real"
+
+    rb = RealishBridge()
+    for dead_src, label in (("bno055_gyro", "BNO055 التالفة"),
+                            ("rover_gyro", "جايرو الروفر الميت")):
+        s_dead = make_heading_source(bridge=rb, source=dead_src)
+        check(f"🔴 {label} **لا يُقبل** مصدراً على العتاد (لا سقوط صامت)",
+              s_dead.ok is False and "لا مصدر اتجاه صالح"
+              in (s_dead.fallback_reason or ""),
+              (s_dead.error or "")[:58])
+    check("وفي المحاكاة يبقى البديل الوهمي مشروعاً ومعلَناً",
+          make_heading_source(bridge=br2, source="bno055_gyro").ok is True)
 
     # ═══ (ك) الحدّ الزمني بديلاً عن حماية الجهد المعطّلة (القسم 9) ══
     print("\nك) الحدّ الزمني (مراقبة الجهد معطّلة):")
@@ -642,6 +680,63 @@ def main() -> int:
           br_v.voltage() is None or br_v.voltage_source in
           (br_v.VSRC_NONE, br_v.VSRC_ROVER), br_v.voltage_source)
 
+    # ── منحنى النسبة + طبقة الإطفاء عند 9.6V ─────────────────────
+    from pi.config import (BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
+                           INA219_CHARGING_A)
+    check("النسبة من **منحنى** لا معادلة خطية (الطرفان حادّان والوسط مسطّح)",
+          _b.percent(12.60) == 100 and _b.percent(9.00) == 0
+          and abs(_b.percent(11.30) - 45) <= 1,
+          f"11.30V → {_b.percent(11.30)}% · 11.00V → {_b.percent(11.00)}%")
+    check("هبوط الحمل يُعوَّض بمقاومة الحزمة (النسبة تحت الحمل ليست أدنى كذباً)",
+          _b.percent(10.8, amps=2.0) > _b.percent(10.8),
+          f"{_b.percent(10.8)}% → {_b.percent(10.8, amps=2.0)}% عند 2A")
+    check("العتبات الأصلية **لم تُخفَّض**، و9.6V طبقة **تحت** إيقاف المحركات",
+          BATT_SHUTDOWN_V < V_CRIT < _b.BATT_LOW_V < V_GOOD < V_EXC,
+          f"إطفاء {BATT_SHUTDOWN_V} < إيقاف {V_CRIT} < عودة {_b.BATT_LOW_V}")
+    check("جهد دون 9.6V يُصنَّف إطفاءً منظَّماً",
+          _b.classify(9.5)["action"] == _b.ACTION_SHUTDOWN
+          and _b.classify(9.8)["action"] == _b.ACTION_STOP,
+          f"9.5V→{_b.classify(9.5)['action']} · 9.8V→{_b.classify(9.8)['action']}")
+
+    def shutdown_mission():
+        m = MissionSim()
+        m.configure_room(1.0, 1.0)
+        m.set_calibration(newp)
+        m.fired = []
+        m._do_shutdown = lambda: m.fired.append(True)   # لا إطفاء فعلي
+        return m
+
+    def feed(m, info, times):
+        for _ in range(times):
+            m._check_shutdown(dict(info))
+
+    base = {"action": _b.ACTION_SHUTDOWN, "v": 9.4, "cell_v": 3.13,
+            "charging": False, "source": "ina219"}
+    ms_sd = shutdown_mission()
+    feed(ms_sd, base, BATT_SHUTDOWN_CONSECUTIVE - 1)
+    part = len(ms_sd.fired)
+    feed(ms_sd, base, 1)
+    check(f"🔴 الإطفاء يحتاج {BATT_SHUTDOWN_CONSECUTIVE} قراءات متتالية "
+          f"(هبوط المحركات اللحظي لا يُطفئ الروبوت)",
+          part == 0 and len(ms_sd.fired) == 1,
+          f"بعد {BATT_SHUTDOWN_CONSECUTIVE - 1} قراءة: {part} · بعد الخامسة: "
+          f"{len(ms_sd.fired)}")
+    ms_r = shutdown_mission()
+    feed(ms_r, base, 3)
+    ms_r._check_shutdown({"action": _b.ACTION_NONE, "v": 11.0})   # قراءة سليمة
+    feed(ms_r, base, 4)
+    check("أي قراءة سليمة تُصفّر العدّاد (لا تراكم عبر انقطاعات)",
+          not ms_r.fired, f"3 ثم تصفير ثم 4 = {len(ms_r.fired)} إطفاء")
+    ms_c = shutdown_mission()
+    feed(ms_c, dict(base, charging=True), BATT_SHUTDOWN_CONSECUTIVE + 2)
+    check("قيد الشحن ⇒ **لا إطفاء** (الجهد أثناء الشحن مضلّل)",
+          not ms_c.fired, f"تيار > {INA219_CHARGING_A}A")
+    ms_x = shutdown_mission()
+    feed(ms_x, dict(base, source="sim_override"), BATT_SHUTDOWN_CONSECUTIVE + 2)
+    check("🔴 مصدر غير INA219 ⇒ لا إطفاء (لا نُطفئ جهازاً على رقم غير مقيس)",
+          not ms_x.fired
+          and any("ليس INA219" in e["msg"] for e in ms_x.events))
+
     # 🔴 الحارسان **مسلَّحان معاً** — الزمن لم يُحذف بعودة الجهد
     ms_g = MissionSim()
     ms_g.configure_room(1.0, 1.0)
@@ -660,6 +755,97 @@ def main() -> int:
           any(e["kind"] == "battery_source" for e in ms_g.events),
           [e["msg"] for e in ms_g.events
            if e["kind"] == "battery_source"][0][:70])
+
+    # ═══ (ك3) الحساسات: خمسة IR · الغائب مجهول · جاهزية المهمة ════
+    print("\nك3) أعلام الحساسات وجاهزية المهمة:")
+    from pi.config import (IR_PRESENT, IR_PULL_UP, IR_FRONT_MID_GPIO,
+                           IR_SIDE_LEFT_GPIO, IR_SIDE_RIGHT_GPIO,
+                           IR_SIDE_LOGIC_ENABLED, ULTRASONIC_MIN_PERIOD_S)
+    from pi.sensors.proximity import IR_PINS
+    from pi.sensors.ultrasonic import GroundEchoDetector
+
+    check("منافذ IR الخمسة معرَّفة بمواضعها",
+          len(IR_PINS) == 5 and dict(IR_PINS)["front_mid"] == IR_FRONT_MID_GPIO
+          and dict(IR_PINS)["side_left"] == IR_SIDE_LEFT_GPIO
+          and dict(IR_PINS)["side_right"] == IR_SIDE_RIGHT_GPIO,
+          " · ".join(f"{n}=BCM{p}" for n, p in IR_PINS))
+    check("الشدّ المرتفع مفعّل، ومنطق الجانبيين **مؤجَّل** حتى تأكيد المواضع",
+          IR_PULL_UP is True and IR_SIDE_LOGIC_ENABLED is False)
+
+    # 🔴 الغائب **مجهول** لا خالٍ
+    rs_u = ReactiveSafety(enabled=False)
+    d_unk = rs_u.decide(200.0, None, None)
+    check("🔴 IR غائب (None) لا يُقرأ «خالياً» بل يُذكر مجهولاً",
+          d_unk["action"] == "go" and set(d_unk["unknown"]) >= {"front_left",
+                                                               "front_right"}
+          and "مجهول" in d_unk["reason"],
+          d_unk["reason"][:60])
+    check("ولا يُقرأ «عائقاً» أيضاً (لا معلومة عنده — لا يخترع تفادياً)",
+          rs_u.decide(200.0, None, 1)["action"] == "go")
+    d_mid = rs_u.decide(200.0, 1, 1, 0)
+    check("IR الأوسط الجديد يسدّ العمى المركزي بين الركنين",
+          d_mid["action"] == "backup_turn" and d_mid["rung"] == "ir_mid",
+          d_mid["reason"])
+    check("ومنطق الركنين الأصلي لم يتغيّر",
+          rs_u.decide(200, 0, 1)["action"] == "turn_right"
+          and rs_u.decide(200, 1, 0)["action"] == "turn_left"
+          and rs_u.decide(200, 0, 0)["action"] == "backup_turn")
+
+    # كاشف الصدى الأرضي — إعلان لا معالجة
+    ge = GroundEchoDetector(min_samples=20)
+    for i in range(40):
+        ge.add(21.0 + (i % 3) * 0.4 if i % 6 else 182.0)
+    check("🔴 عنقودان ضيّقان والروبوت ساكن ⇒ **اشتباه صدى أرضي معلَن**",
+          ge.suspect and "تثبيت" in (ge.detail or ""),
+          (ge.detail or "")[:70])
+    ge_ok = GroundEchoDetector(min_samples=20)
+    for i in range(40):
+        ge_ok.add(120.0 + (i % 5) * 0.3)
+    check("قراءة سليمة (تشتت ~1سم) لا تُطلق إنذاراً", not ge_ok.suspect)
+    ge_mv = GroundEchoDetector(min_samples=20)
+    for i in range(40):
+        ge_mv.add(21.0 if i % 6 else 182.0, moving=True)
+    check("والعيّنات أثناء الحركة تُهمَل (تغيّر المسافة حينها حقيقي)",
+          not ge_mv.suspect)
+    check("حدّ معدل النداء ~16/ث (الصدى السابق يلوّث التالي)",
+          abs(ULTRASONIC_MIN_PERIOD_S - 1 / 16) < 1e-6,
+          f"{1 / ULTRASONIC_MIN_PERIOD_S:.0f} مرة/ث")
+
+    # 🔴 جاهزية المهمة: الرفض **بسبب معلَن**
+    ms_rd = MissionSim()
+    ms_rd.configure_room(1.0, 1.0)
+    ms_rd.set_calibration(newp)
+    rd0 = ms_rd.mission_readiness()
+    check("الجاهزية تُبثّ دائماً ومعها الموانع (لا رفض صامت)",
+          isinstance(rd0.get("blockers"), list) and "heading_ok" in rd0,
+          f"جاهز={rd0['ready']} · اتجاه={rd0['heading_source']}")
+
+    class BlindMission(MissionSim):
+        """مهمة بلا استشعار أمامي وبلا مصدر اتجاه — أسوأ حالة."""
+        def sensors(self):
+            return {"ultrasonic_cm": None, "ir_left": None, "ir_right": None,
+                    "ir_mid": None, "cpm": 0.0, "source": "unavailable",
+                    "quality": 0}
+
+    ms_bl = BlindMission()
+    ms_bl.configure_room(1.0, 1.0)
+    ms_bl.set_calibration(newp)
+    ms_bl.rover.heading_source.ok = False
+    ms_bl.rover.heading_source.error = "MPU-6050 غير متاح"
+    rd = ms_bl.mission_readiness()
+    check("🔴 بلا اتجاه وبلا استشعار أمامي ⇒ **غير جاهز** بسببين صريحين",
+          not rd["ready"] and len(rd["blockers"]) >= 2
+          and any("اتجاه" in b for b in rd["blockers"])
+          and any("استشعار أمامي" in b for b in rd["blockers"]),
+          " · ".join(b[:34] for b in rd["blockers"]))
+    ms_bl.drive_motors = True
+    res_bl = ms_bl.start()
+    check("و«بدء مسح» يرفض **برسالة مقروءة** لا بصمت",
+          res_bl["ok"] is False and "تعذّر بدء المسح" in res_bl["error"]
+          and any(e["kind"] == "not_ready" for e in ms_bl.events),
+          res_bl["error"][:80])
+    check("ولا يبدأ المسح رغم النقص (الرفض صحيح)",
+          ms_bl.state == "idle")
 
     # ═══ (ل) 🔴 البند 0: التحقق من الحركة ═════════════════════════
     print("\nل) التحقق من الحركة (البند 0):")
@@ -771,12 +957,82 @@ def main() -> int:
     dr_u = DeadReckoning(room, profile, 0.25, 0.25, 0.0)
     dr_v.advance(1.0, verified=True)
     dr_u.advance(1.0, verified=False)
+    # ⚠ الفرق يُقاس على **حدّ المسافة** وحده: `advance` صار يضيف أيضاً مساهمة
+    #   خطأ الاتجاه (المسافة × الزاوية) وهي مشتركة بين الحالتين، فالنسبة
+    #   الخام لم تعد تساوي المعامل بينما الخاصية المقصودة قائمة.
+    from pi.config import DRIFT_PER_METER as _DPM
     check("شوط غير متحقَّق ⇒ σ ينمو أسرع (لا يمنح المفترض وزن المقيس)",
           dr_u.uncertainty > dr_v.uncertainty
-          and abs((dr_u.uncertainty - UNCERTAINTY_INITIAL)
-                  / (dr_v.uncertainty - UNCERTAINTY_INITIAL)
-                  - MOTION_UNVERIFIED_DRIFT) < 1e-9,
+          # ⚠ التسامح 1e-4 لا 1e-9: نموّ شكّ الاتجاه يُحسب من **ساعة الحائط**،
+          #   فاختلاف ميكروثوانٍ بين الكائنين يُنتج فرقاً حقيقياً دون 0.1مم.
+          and abs((dr_u.uncertainty - dr_v.uncertainty)
+                  - _DPM * (MOTION_UNVERIFIED_DRIFT - 1.0)) < 1e-4,
           f"{dr_v.uncertainty:.3f} مقابل {dr_u.uncertainty:.3f} م")
+
+    # ⑤ب 🔴 انحراف الاتجاه بعد MPU-6050: مكوّن **زمني** واقتران ضربي
+    from pi.config import (HEADING_DRIFT_PER_S_DEG, HEADING_SIGMA_PER_TURN_DEG,
+                           HEADING_SIGMA_INITIAL_DEG, WALL_ALIGN_TOL_DEG)
+    dr_t = DeadReckoning(room, profile, 0.25, 0.25, 0.0)
+    dr_t._sigma_ts -= 100.0                      # محاكاة 100ث سكون
+    u_before = dr_t.uncertainty
+    dr_t.sync_time()
+    check("🔴 شكّ الاتجاه ينمو بالزمن **والروبوت واقف** (الجايرو ينحرف بلا حركة)",
+          dr_t.heading_sigma_deg > HEADING_SIGMA_INITIAL_DEG
+          and abs(dr_t.heading_sigma_deg - HEADING_SIGMA_INITIAL_DEG
+                  - 100.0 * HEADING_DRIFT_PER_S_DEG) < 1e-6,
+          f"{HEADING_SIGMA_INITIAL_DEG}° → {dr_t.heading_sigma_deg:.2f}° بعد 100ث")
+    check("والسكون وحده **لا يزيح** الموضع (الاقتران ضربي لا جمعي)",
+          dr_t.uncertainty == u_before,
+          "σ الموضع لم تتغيّر بالسكون")
+    dr_t.advance(1.0)
+    check("وعند أول حركة تظهر مساهمته: المسافة × الزاوية",
+          dr_t.uncertainty > u_before + _DPM,
+          f"σ الموضع {u_before:.3f} → {dr_t.uncertainty:.3f} م بعد متر واحد")
+    dr_q = DeadReckoning(room, profile, 0.25, 0.25, 0.0)
+    dr_q.turn(90.0)
+    check("واللفّ يزيد شكّ الاتجاه أيضاً",
+          dr_q.heading_sigma_deg >= HEADING_SIGMA_INITIAL_DEG
+          + HEADING_SIGMA_PER_TURN_DEG - 1e-6,
+          f"{dr_q.heading_sigma_deg:.2f}° بعد لفّة 90°")
+
+    # 🔴 الحلقة المفرغة: تصحيح الجدار **لا يصحّح الاتجاه**، وبوابته تنهار
+    dr_g = DeadReckoning(room, profile, 1.5, 3.5, 0.0)
+    dr_g.uncertainty = 0.6
+    sig_before = dr_g.heading_sigma_deg
+    rc = dr_g.try_front_wall_correction(0.55)
+    check("تصحيح الجدار يصغّر شكّ **الموضع** ولا يمسّ شكّ **الاتجاه**",
+          rc["corrected"] and dr_g.uncertainty < 0.6
+          and dr_g.heading_sigma_deg == sig_before,
+          f"الموضع ↓ · الاتجاه ثابت عند {sig_before:.2f}°")
+    dr_g.heading_sigma_deg = WALL_ALIGN_TOL_DEG + 1.0
+    check("🔴 تجاوز شكّ الاتجاه تسامح المحاذاة ⇒ **إعلان انهيار البوابة**",
+          dr_g.alignment_gate_lost and not DeadReckoning(
+              room, profile, 0, 0, 0).alignment_gate_lost,
+          f"{dr_g.heading_sigma_deg:.1f}° > {WALL_ALIGN_TOL_DEG:.0f}° "
+          f"⇒ لا تصحيح ممكن ⇒ الشك يكبر أكثر")
+    ms_gate = MissionSim()
+    ms_gate.configure_room(1.0, 1.0)
+    ms_gate.dr = DeadReckoning(ms_gate.room, newp, 0.25, 0.25, 0.0)
+    ms_gate.dr.heading_sigma_deg = WALL_ALIGN_TOL_DEG + 5.0
+    ms_gate._check_alignment_gate()
+    ms_gate._check_alignment_gate()              # لا يتكرر
+    gate_ev = [e for e in ms_gate.events if e["kind"] == "alignment_gate"]
+    check("والمهمة تُعلنه **مرة واحدة** لا في كل خلية",
+          len(gate_ev) == 1, gate_ev[0]["msg"][:70])
+
+    # ⑤ج توسيع **تسامح القبول** لا نصف قطر الخطة (البند ب٣)
+    from pi.config import (CONFIRM_TOL_SIGMA_K, CONFIRM_REGION_TOL_M,
+                           CONFIRM_RADIUS_M)
+    from pi.ai.source_locator import SourceLocator
+    loc_tol = SourceLocator(3.0, 4.0, background_cpm=20.0)
+    check("بلا قراءات: التسامح هو الثابت الأساسي",
+          abs(loc_tol.region_tolerance() - CONFIRM_REGION_TOL_M) < 1e-9)
+    loc_tol.add_reading(1.0, 1.0, 0.0, 5.0, 0.0, 3.0, pos_uncertainty_m=0.8)
+    check("σ كبيرة ⇒ **التسامح يتّسع** (ولا يُمسّ نصف قطر الخطة)",
+          abs(loc_tol.region_tolerance() - CONFIRM_TOL_SIGMA_K * 0.8) < 1e-9
+          and len(loc_tol.confirmation_plan((1.5, 2.0), CONFIRM_RADIUS_M)) > 0,
+          f"σ=0.8م → تسامح {loc_tol.region_tolerance():.2f}م "
+          f"(الخطة تبقى على {CONFIRM_RADIUS_M}م)")
 
     # ⑥ **اختبار تكامل** — المنفّذ يُنتج الحكم فعلاً (لا وحدة معزولة)
     class MotionRover:
