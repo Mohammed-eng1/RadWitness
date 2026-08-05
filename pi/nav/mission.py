@@ -1772,6 +1772,8 @@ class MissionSim:
             mark(PHASE_STOP)
             mark(PHASE_DOCUMENT)
             out["documentation"] = self._document_source()
+            # 🔴 إغلاق الحكم وإعادة الفرز — بحث عن مصدر **آخر** في نفس الغرفة
+            out["closed"] = self._close_finding_and_rescreen()
             mark(PHASE_REPORT)
         except Exception as e:                # noqa: BLE001 — لا تُسقط المهمة
             self._log("cycle_error", f"⚠ خطأ في دورة المراحل: {e}"[:160])
@@ -1782,6 +1784,33 @@ class MissionSim:
             except Exception:                 # noqa: BLE001
                 pass
         return out
+
+    def _close_finding_and_rescreen(self) -> dict:
+        """
+        يُغلق الحكم الحالي ويُعيد الفرز على **البواقي** — فيظهر مصدر ثانٍ إن
+        وُجد. يُستدعى بعد التوثيق مباشرةً.
+
+        🔴 هذا ما يسدّ فجوة «مصدر واحد لكل مهمة»: كان `reset_to_screening`
+        مبنيّاً ولا يستدعيه أحد، فتبقى آلة الحالات عالقة بعد أول حكم.
+        """
+        if self.locator is None:
+            return {"ok": False}
+        res = self.locator.close_finding()
+        if not res.get("ok"):
+            return res
+        # الفرز على البواقي: هل بقي دليل على مصدر آخر؟
+        s2 = self.locator.screen()
+        res["rescreen"] = {k: s2.get(k) for k in
+                           ("suspect", "lambda_stat", "threshold", "position")}
+        self._log("rescreen",
+                  ("🔎 بعد طرح المصدر المؤكَّد: **اشتباه جديد** عند "
+                   f"{s2.get('position')} (Λ={s2.get('lambda_stat')}) — "
+                   f"يحتاج تأكيداً بجولة تالية"
+                   if s2.get("suspect") else
+                   f"لا دليل على مصدر آخر بعد طرح المؤكَّد "
+                   f"(Λ={s2.get('lambda_stat')} دون العتبة "
+                   f"{s2.get('threshold')})"))
+        return res
 
     def _transit_toward(self, pos) -> dict:
         """

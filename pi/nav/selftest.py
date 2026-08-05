@@ -1351,6 +1351,37 @@ def main() -> int:
           cyc_nm.get("rescan", {}).get("ok") is not True,
           (cyc_nm.get("rescan") or {}).get("reason", "لا اشتباه")[:70])
 
+    # ⑦ج 🔴 الفجوة الوظيفية: البحث عن مصدر **ثانٍ** بعد أي حكم
+    from pi.ai.two_stage import CONFIRMED as _CONF, SCREENING as _SCR
+    ms_two = full_mission()
+    loc2 = ms_two.locator
+    check("بعد الدورة أُغلق الحكم وعاد الكاشف إلى **الفرز** (لا يعلق للأبد)",
+          loc2.detector.state == _SCR and len(loc2.findings) == 1
+          and loc2.findings[0]["verdict"] == _CONF,
+          f"أحكام مغلقة={len(loc2.findings)} · الحالة={loc2.detector.state}")
+    sub = (ms_two.cycle.get("closed") or {}).get("subtracted") or {}
+    check("🔴 ومساهمة المؤكَّد **طُرحت** — بلاها يُعاد اكتشاف نفسه بلا نهاية",
+          sub.get("ok") and sub.get("removed_counts", 0) > 0,
+          f"طُرح {sub.get('removed_counts')} عدّة · بقي "
+          f"{sub.get('remaining_counts')}")
+    rs2 = (ms_two.cycle.get("closed") or {}).get("rescreen") or {}
+    check("وإعادة الفرز على البواقي **لا تُعيد نفس المصدر**",
+          rs2.get("suspect") is not True
+          or (rs2.get("position") != loc2.findings[0]["position"]),
+          f"اشتباه جديد={rs2.get('suspect')} · Λ={rs2.get('lambda_stat')}")
+    check("والأحكام المغلقة تظهر في التقرير (لا تُمحى بإعادة الفرز)",
+          loc2.report()["n_findings"] == 1)
+    # الرفض لا يُطرح منه شيء — الاشتباه كان ضوضاء لا مساهمة
+    loc3 = SourceLocator(3.0, 4.0, background_cpm=20.0)
+    loc3.detector.state = "rejected"
+    n_before = loc3.detector.screen_grid.n_measurements
+    r3c = loc3.close_finding()
+    check("حكم **الرفض** يُغلق بلا طرح (الضوضاء لا مساهمة لها تُخصم)",
+          r3c["ok"] and r3c["subtracted"] is None
+          and loc3.detector.state == _SCR
+          and loc3.detector.screen_grid.n_measurements == n_before)
+    check("ولا يُغلق حكم غير موجود", loc3.close_finding()["ok"] is False)
+
     # ⑧ بروتوكول الدخول (القسم 3): نقطة البدء تُبلَّغ للمنسّق
     proto = ms_full.locator.protocol.status()
     check("بروتوكول الدخول يُبلَّغ بنقطة البداية ويحكم على شرعيّتها",
