@@ -143,6 +143,10 @@ class HeadingController:
         return {"samples": self.samples,
                 "mean_abs_error_deg": round(self.abs_error_sum / n, 2),
                 "max_abs_error_deg": round(self.max_abs_error, 2),
+                # آخر خطأ مقروء — به يُحدَّث اتجاه المهمة بعد الشوط **قياساً**
+                # لا افتراضاً بأن التثبيت أغلق الخطأ تماماً.
+                "final_error_deg": (round(self._last_error, 2)
+                                    if self._has_last else None),
                 "sign_changes": self.sign_changes,
                 "saturated": self.saturated,
                 "saturated_pct": round(100.0 * self.saturated / n, 1),

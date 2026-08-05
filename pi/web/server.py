@@ -22,7 +22,9 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from pi.config import WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR
+from pi.config import (
+    WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
+)
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
 from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
@@ -45,25 +47,82 @@ class RoverTestReq(BaseModel):
 
 _STATIC = Path(__file__).parent / "static"
 
+
+# ═══ إقلاع مُقاس: «يطول ولا يشتغل» يجب أن يصير سطراً معروفاً ══════
+# ⚠ كل الأنظمة الفرعية تُبنى **عند استيراد الوحدة**، أي قبل أن تطبع uvicorn
+#    حرفاً واحداً. فأي تعثّر (منفذ سيريال مشغول، ناقل I2C صامت، مكتبة ثقيلة)
+#    يظهر للمستخدم كشاشة سوداء بلا أي دليل على موضعه. هذه اللافتة تحوّل
+#    «يطول» إلى رقم بجانب اسم النظام الذي أخذ الوقت.
+_BOOT = []
+
+
+def _boot(label: str, factory):
+    """يبني نظاماً فرعياً ويطبع زمنه فوراً (flush) — لا يُسقط الإقلاع بفشله."""
+    t0 = time.time()
+    print(f"[إقلاع] {label} …", flush=True)
+    try:
+        obj = factory()
+        dt = time.time() - t0
+        _BOOT.append({"name": label, "seconds": round(dt, 2), "ok": True})
+        print(f"[إقلاع] {label}: تم في {dt:.2f}ث", flush=True)
+        return obj
+    except Exception as e:                     # noqa: BLE001
+        dt = time.time() - t0
+        _BOOT.append({"name": label, "seconds": round(dt, 2),
+                      "ok": False, "error": str(e)})
+        print(f"[إقلاع] {label}: ⚠ فشل بعد {dt:.2f}ث — {e}", flush=True)
+        raise
+
+
+_T_BOOT = time.time()
+
 # ── محرّك المحاكاة (الدفعة 2) ─────────────────────────────────────
-mission = MissionSim()
+# ⚠ MissionSim أولاً: جسره يفتح السيريال ويطلب **القارئ المشترك** للـBNO055،
+#    فيبقى `imu` أدناه نفس النسخة لا نسخة ثانية تتنازع الناقل.
+mission = _boot("جسر الروفر + مصدر الاتجاه (MissionSim)", MissionSim)
 calib_store = CalibrationStore()
 _active_calib = {"name": None}
 _sim_clients: set[WebSocket] = set()
 
 # ── الحساسات الحقيقية (M1 — تعمل على الراسبري، خاملة على ويندوز) ──
-geiger = GeigerReader()
-gps = GPSReader()
-imu = get_imu()          # ⚠ القارئ **المشترك**: مصدر الاتجاه يستخدم نفس النسخة
-camera = CameraReader()
+geiger = _boot("عدّاد جيجر (lgpio BCM17)", GeigerReader)
+gps = _boot("GPS", GPSReader)
+imu = _boot("BNO055 (القارئ المشترك)", get_imu)
+camera = _boot("الكاميرا (فتحها كسول)", CameraReader)
 rover = RoverBridge(mode="sim")
 # حساسات القرب الحقيقية + مصدر الإشعاع → محرّك المهمة (المرحلة 2)
-ultrasonic = UltrasonicReader()
-ir_sensors = IRReader()
+ultrasonic = _boot("ألترا سونيك", UltrasonicReader)
+ir_sensors = _boot("حسّاسا IR", IRReader)
 mission.set_proximity(ultrasonic, ir_sensors)
 mission.set_geiger(geiger)
 _sensor_clients: set[WebSocket] = set()
 _last_sensor_loop = time.time()
+
+
+def _boot_summary() -> dict:
+    """خلاصة الإقلاع: زمن كل نظام وحالته — تُطبع وتُعرض عبر /api/boot."""
+    return {
+        "total_s": round(time.time() - _T_BOOT, 2),
+        "steps": list(_BOOT),
+        "health": {
+            "geiger": {"ok": geiger.ok, "error": geiger.error},
+            "gps": {"ok": gps.ok, "error": gps.error},
+            "imu": {"ok": imu.ok, "error": imu.error,
+                    "bus": imu.bus_num, "addr": imu.addr,
+                    "driver": imu.driver, "mode": imu.mode_name},
+            "ultrasonic": {"ok": ultrasonic.ok, "error": ultrasonic.error},
+            "ir": {"ok": ir_sensors.ok, "error": ir_sensors.error},
+            "rover": {"mode": mission.rover.mode, "error": mission.rover.error,
+                      "heading_source": mission.rover.heading_source.name},
+        },
+    }
+
+
+print(f"[إقلاع] اكتمل تجهيز الأنظمة في "
+      f"{time.time() - _T_BOOT:.2f}ث — يبدأ uvicorn الآن", flush=True)
+for _k, _v in _boot_summary()["health"].items():
+    if _v.get("error"):
+        print(f"[إقلاع] ⚠ {_k}: {_v['error']}", flush=True)
 
 
 # ═══ حلقات الخلفية ═══════════════════════════════════════════════
@@ -178,6 +237,35 @@ async def api_platform():
     return platform_banner()
 
 
+@app.get("/api/boot")
+async def api_boot():
+    """زمن إقلاع كل نظام فرعي وحالته — لتشخيص «السيرفر يطول ولا يشتغل»."""
+    return _boot_summary()
+
+
+@app.get("/api/imu/health")
+def api_imu_health():
+    """
+    حالة شريحة BNO055 كما تقرأها **هي** (CHIP_ID/OPR_MODE/SYS_STAT/SYS_ERR).
+    تفرّق بين «الحسّاس مفقود» و«عاد إلى CONFIG فيقرأ أصفاراً وهو حيّ».
+    """
+    return {"reader": imu.state(), "chip": imu.health(),
+            "heading_source": mission.rover.heading_source.state()}
+
+
+@app.post("/api/imu/recover")
+def api_imu_recover():
+    """إحياء يدوي للحسّاس + إعادة تسليح مصدر الاتجاه (زر «أعِد المحاولة»)."""
+    src = mission.rover.heading_source
+    src.reset_recovery_budget()        # طلب صريح من المستخدم → رصيد جديد
+    res = src.attempt_recovery()
+    mission._log("heading_recover",
+                 ("✅ أُحيي مصدر الاتجاه: " if res.get("recovered")
+                  else "⚠ تعذّر الإحياء: ") + str(res.get("detail")))
+    return {"ok": bool(res.get("recovered")), **res,
+            "heading_source": src.state()}
+
+
 @app.post("/api/room")
 async def api_room(req: Request):
     d = await req.json()
@@ -258,11 +346,24 @@ async def api_rover_mode(req: Request):
     if mode not in ("sim", "real"):
         return JSONResponse({"ok": False, "error": "الوضع يجب أن يكون sim أو real"},
                             status_code=400)
+    # ⚠⚠ **لا تبديل والمهمة جارية** ⚠⚠
+    # `close()` يقفل منفذ السيريال بينما خيط المحركات يكتب عليه، فيموت بـ
+    # `write failed: [Errno 9] Bad file descriptor` وسط الحركة (شوهد على
+    # العتاد 2026-08-01). والأسوأ أن `DriveExecutor` يحتفظ بمرجع **الجسر
+    # القديم** فيظل يكتب على منفذ مغلق حتى لو نجح التبديل.
+    if mission.state in ("running", "paused") or (
+            mission._worker is not None and mission._worker.is_alive()):
+        return JSONResponse(
+            {"ok": False, "rover_mode": mission.rover.mode,
+             "error": "المهمة جارية — أوقفها (إيقاف طوارئ) قبل تبديل وضع "
+                      "الروفر. التبديل يقفل منفذ السيريال تحت خيط المحركات."},
+            status_code=409)
     try:
         mission.rover.close()
     except Exception:                          # noqa: BLE001
         pass
     mission.rover = WaveRoverBridge(mode=mode)
+    mission.executor = None        # المنفّذ يحمل مرجع الجسر القديم — أبطِله
     if mission.rover.mode != "real":
         mission.drive_motors = False   # لا تُبقِ قيادة محركات على جسر sim
     mission._log("rover_mode",
@@ -304,6 +405,30 @@ def api_rover_test(body: RoverTestReq):
     except Exception as e:                      # noqa: BLE001
         rv.stop()                               # ⚠ أي استثناء → إيقاف
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/rover/status")
+def api_rover_status():
+    """
+    ردّ `T=130` **خاماً** (تشخيص وصلة السيريال والفيرموير).
+
+    ⛔ **لا حسّاس جهد على هذا العتاد** — الحقل `v` لا يصل والحسّاس معطّل. لا
+       تبنِ عليه شيئاً. الحماية من الاستنزاف قائمة على بديلين لا يحتاجان
+       فولتميتر: حدّ زمني، و**ذروة معدل الدوران** (الدوران بالمكان أثقل
+       مناورة فهو أول ما يسقط مع ضعف البطارية).
+    """
+    st = mission.rover.read_status()
+    rv = mission.rover
+    return {
+        "raw": st, "mode": rv.mode,
+        "link_ok": rv.link_ok, "link_error": rv.link_error,
+        "voltage_sensor": "معطّل — لا قراءة جهد على هذا العتاد",
+        "battery_monitor_enabled": BATTERY_MONITOR_ENABLED,
+        # الحماية البديلة الفعلية
+        "turn_peak_baseline_dps": rv.turn_peak_baseline,
+        "last_turn_peak_dps": rv.last_turn_peak,
+        "time_limit": mission.time_limit_info(),
+    }
 
 
 @app.get("/api/sensors/check")

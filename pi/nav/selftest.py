@@ -330,8 +330,9 @@ def main() -> int:
     print("\nي) مصدر الاتجاه (البند 1) وتثبيته:")
     from pi.sensors.heading import (
         RateConditioner, HeadingSource, BNO055GyroHeading, BNO055FusionHeading,
-        make_heading_source, PHASES,
+        make_heading_source, PHASES, ZERO_RUN_DEAD,
     )
+    from pi.config import HEADING_RECOVERY_ATTEMPTS
     from pi.nav.heading_hold import (
         HeadingController, signed_error, available_headroom, config_sanity,
     )
@@ -368,6 +369,13 @@ def main() -> int:
     check("عتبة طور اللفّ أوسع من طور السير (40–60°/ث دوران طبيعي)",
           PHASES["turn"][0] > 60.0 > PHASES["drive"][0]
           and HEADING_SPIKE_DPS_TURN > HEADING_SPIKE_DPS_DRIVE)
+    # ⚠ حارس مقاس: ذروة الدوران ببطارية مشحونة عند TURN_POWER=0.40 بلغت
+    #    **198°/ث** بينما العتبة كانت 200 — أي 99% منها. فوق العتبة يُعيد
+    #    المرشّح صفراً لا القراءة، فيتجمّد التكامل في أسرع لحظة من اللفّة.
+    #    العتبة يجب أن تسبق أسرع دوران ممكن بهامش، لا أن تلامسه.
+    check("عتبة اللفّ تسبق أسرع دوران مقاس (221°/ث) بهامش ≥2×",
+          HEADING_SPIKE_DPS_TURN >= 2.0 * 221.0,
+          f"{HEADING_SPIKE_DPS_TURN:.0f}°/ث مقابل 221°/ث مقاسة")
 
     # BNO055 (جايرو): تكامل بمعامل الحسّاس + إشارة المحور
     hs = BNO055GyroHeading(FakeIMU(rate=8.0), scale=1.0, sign=+1)
@@ -1355,6 +1363,336 @@ def main() -> int:
           ms_bad.locator.protocol.status()["perimeter_start_ok"] is False
           and ms_bad.locator.report()["position"] is None,
           ms_bad.locator.report()["position_blockers"][0][:60])
+
+    # ═══ (ل) عطل مصدر الاتجاه: إحياء، لا محركات، ولا حلقة لا نهائية ══
+    # عطل مقاس على العتاد (2026-08-01): مصدر الاتجاه أعلن الموت، فصار كل لفّ
+    # يفشل في صفر ثانية وتعيده حلقة المحركات فوراً — عشرات المحاولات في عُشر
+    # ثانية، كلٌّ تنبض المحركات لحظة (ارتجاف في المكان) وتكتب سطراً مكرّراً.
+    print("\nل) عطل مصدر الاتجاه — إحياء وحواجز:")
+
+    class ResettableIMU(FakeIMU):
+        """
+        يحاكي BNO055 عاد إلى وضع CONFIG: حاضر على الناقل ويردّ **صفراً
+        مضبوطاً** حتى تُعاد تهيئته، وبعدها يقرأ طبيعياً.
+        """
+        def __init__(self, recoverable=True):
+            super().__init__(rate=0.0)
+            self.recoverable = recoverable
+            self.reinits = 0
+
+        def recover(self):
+            if not self.recoverable:
+                return {"recovered": False,
+                        "detail": "CHIP_ID=0xff — الشريحة مفقودة عن الناقل"}
+            self.reinits += 1
+            self._r = 30.0                 # عادت الحياة بعد إعادة التهيئة
+            return {"recovered": True, "detail": "عادت إلى CONFIG وأُعيدت تهيئتها"}
+
+    live = ResettableIMU(recoverable=True)
+    hs_rec = BNO055GyroHeading(live, scale=1.0, sign=+1)
+    for _ in range(ZERO_RUN_DEAD + 2):
+        hs_rec.update()
+    check("صفر مضبوط + شريحة قابلة للإحياء → تُحيا ولا يُعلَن العطل",
+          hs_rec.ok and hs_rec.recoveries == 1 and live.reinits == 1,
+          f"إحياءات={hs_rec.recoveries} · ok={hs_rec.ok}")
+
+    gone = ResettableIMU(recoverable=False)
+    hs_dead = BNO055GyroHeading(gone, scale=1.0, sign=+1)
+    for _ in range(ZERO_RUN_DEAD * 8):
+        hs_dead.update()
+    check("شريحة غير قابلة للإحياء → عطل معلن **بحالتها المقروءة**",
+          not hs_dead.ok and "CHIP_ID" in (hs_dead.error or ""), hs_dead.error)
+    check("محاولات الإحياء محدودة (لا إغراق للناقل)",
+          hs_dead.recovery_attempts <= HEADING_RECOVERY_ATTEMPTS,
+          f"{hs_dead.recovery_attempts} ≤ {HEADING_RECOVERY_ATTEMPTS}")
+
+    # الحاجز الحاسم: **لا أمر حركة** ومصدر الاتجاه معطّل
+    class SpyBridge(WaveRoverBridge):
+        """
+        يعدّ أوامر المحركات **المُشغِّلة فقط** (قوة ≠ 0). أوامر الإيقاف
+        (0,0) لا تُعدّ: هي عكس ما نحرسه — الإيقاف المضمون مطلوب دائماً.
+        """
+        def motors(self, l, r):
+            if l or r:
+                self.motor_calls = getattr(self, "motor_calls", 0) + 1
+            return super().motors(l, r)
+
+    spy = SpyBridge(mode="sim", heading_source=hs_dead)
+    spy.motor_calls = 0
+    t0 = time.time()
+    rdead = spy.turn_by_angle(90, timeout=5.0)
+    check("لفّ ومصدر الاتجاه معطّل → إجهاض بلا أي أمر حركة",
+          rdead["aborted"] == "heading_source_fault" and spy.motor_calls == 0,
+          f"أوامر محركات={spy.motor_calls} · إجهاض={rdead['aborted']}")
+    check("لا معايرة انحياز 5ث على حسّاس معطّل (الإجهاض فوري)",
+          (time.time() - t0) < 1.0, f"{time.time() - t0:.2f}ث")
+
+    # الأحداث المتطابقة تُضغط بعدّاد بدل أن تدفن ما قبلها
+    for _ in range(5):
+        spy._event("heading_fault", "نفس الرسالة")
+    faults = [e for e in spy.events if e["kind"] == "heading_fault"
+              and e.get("base") == "نفس الرسالة"]
+    check("الأحداث المتطابقة تُضغط بعدّاد لا تُكدَّس",
+          len(faults) == 1 and faults[0]["n"] == 5, faults[0]["msg"])
+
+    # خيط المحركات: عطل الاتجاه يوقف المهمة بدل الدوران على الفراغ
+    ms3 = MissionSim()
+    ms3.rover = SpyBridge(mode="sim", heading_source=hs_dead)
+    ms3.rover.motor_calls = 0
+    ms3.configure_room(2.0, 2.0)
+    ms3.set_calibration(default_sim_profile())
+    ms3.set_drive_motors(True, allow_sim=True)
+    # ⚠ حارسان في **لحظتين مختلفتين**، وكلاهما لازم:
+    #   (أ) بوابة الجاهزية ترفض **البدء** بمصدر اتجاه ميت — تسبق الخيط أصلاً.
+    #   (ب) وحارس الخيط يُجهض حين يموت المصدر **وسط المهمة** (الجاهزية مرّت).
+    res3 = ms3.start()
+    check("(أ) مصدر اتجاه ميت ⇒ **رفض البدء** بسبب مقروء قبل تشغيل الخيط",
+          res3["ok"] is False and ms3._worker is None
+          and any("اتجاه" in b for b in res3["readiness"]["blockers"]),
+          res3["error"][:70])
+    # (ب) نتجاوز البوابة عمداً لنختبر الحارس داخل الخيط (موت وسط المهمة)
+    from pi.nav.executor import DriveExecutor as _DE
+    ms3.dr = DeadReckoning(ms3.room, ms3.profile,
+                           *ms3.grid.cell_center(*ms3.current), 0.0)
+    ms3.executor = _DE(ms3.rover, ms3.reactive, ms3.sensors, ms3.profile)
+    ms3.state = "running"
+    ms3._visit(ms3.current)          # كما يفعل start: خلية البدء أولاً
+    r3 = ms3._advance_one_cell(ms3._next_target())
+    aborts = [e for e in ms3.events if e["kind"] == "mission_abort"]
+    check("(ب) وموته وسط المهمة **قاتل للخطوة** لا خطوة تُعاد",
+          r3.get("fatal") is True and ms3.state == "estop" and aborts,
+          aborts[0]["msg"][:60] if aborts else f"الحالة={ms3.state}")
+    check("لم تُشغَّل المحركات ولا مرة أثناء الإجهاض",
+          ms3.rover.motor_calls == 0, f"{ms3.rover.motor_calls} أمر")
+    turn_fails = [e for e in ms3.events if e["kind"] == "turn_failed"]
+    check("سطر فشل واحد لا عشرات (السجل يحفظ السبب الأول)",
+          len(turn_fails) <= 1, f"{len(turn_fails)} سطر")
+
+    # ═══ (م) دقّة نهاية اللفّة: تهدئة + قياس القصور + تصحيح ═════════
+    # مقاس على العتاد (2026-08-01): `rate_dps = 137.4` **لحظة قطع الطاقة**،
+    # فيواصل الروبوت الدوران بالقصور الذاتي بينما حلقة اللفّ انتهت — التجاوز
+    # لا يُقاس أصلاً فيظنّ النظام أنه على 90° وهو على ~100°.
+    print("\nم) دقّة نهاية اللفّة (التجاوز والقصور الذاتي):")
+    import math as _math
+    from pi.config import (
+        TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_TOLERANCE_DEG,
+        TURN_CORRECTION_PASSES, TURN_POWER,
+    )
+
+    # منحنى القوة: منطق خالص، يُختبر مباشرةً
+    _tp = WaveRoverBridge._turn_power
+    check("قوة كاملة بعيداً عن الهدف",
+          _tp(TURN_SLOWDOWN_DEG + 10, 45.0, TURN_POWER) == TURN_POWER)
+    check("القوة تنزل إلى الأدنى عند الهدف",
+          abs(_tp(0.0, 45.0, TURN_POWER) - TURN_MIN_POWER) < 1e-9,
+          f"{_tp(0.0, 45.0, TURN_POWER)}")
+    check("التهدئة تنازلية لا قفزة",
+          _tp(30, 45.0, TURN_POWER) > _tp(10, 45.0, TURN_POWER)
+          > _tp(2, 45.0, TURN_POWER))
+    # ⚠ الحارس الحاسم: لفّة تصحيح صغيرة تبدأ **داخل** قوس التهدئة، فلو خُفّضت
+    #   قوّتها قبل أن يدور الروبوت لما كسرت السكون ولما تحرّك إطلاقاً.
+    check("قبل بدء الدوران القوة كاملة (كسر السكون في لفّة التصحيح)",
+          _tp(5.0, 0.0, TURN_POWER) == TURN_POWER)
+
+    class InertialBridge(WaveRoverBridge):
+        """
+        جسر محاكاة **بقصور ذاتي**: الدوران لا ينقطع مع الطاقة بل يخبو أسّياً.
+        بدونه تبقى المحاكاة أنظف من العتاد في النقطة التي انكسر فيها بالضبط.
+        """
+        TAU = 0.10
+
+        def stop(self):
+            rate = self._sim_turn_rate
+            super().stop()
+            if rate:
+                self._coast_rate, self._coast_ts = rate, time.time()
+
+        def read_imu(self):
+            d = super().read_imu()
+            if not self._moving and getattr(self, "_coast_rate", 0.0):
+                r = self._coast_rate * _math.exp(
+                    -(time.time() - self._coast_ts) / self.TAU)
+                if abs(r) < 1.0:
+                    r = self._coast_rate = 0.0
+                d["gz"] = round(r + self._sim_bias, 3)
+            return d
+
+    inr = InertialBridge(mode="sim")
+    inr.calibrate_gyro_bias(seconds=0.3)
+    check("لا استباق مفترض قبل أي قياس (τ يبدأ صفراً)", inr._coast_tau == 0.0)
+
+    first = inr.turn_by_angle(90, timeout=8.0)
+    check("القصور الذاتي بعد قطع الطاقة **يُقاس** لا يُهمَل",
+          abs(first["coast_deg"]) > 0.5, f"قصور={first['coast_deg']}°")
+    check("اللفّة الأولى: التجاوز رقم معلوم لا 90.0 مضبوطة تخفيه",
+          abs(first["overshoot_deg"]) > 0.0,
+          f"تجاوز={first['overshoot_deg']}° · دار {first['turned_deg']}°")
+    check("τ يُشتقّ من القياس لا من config",
+          inr._coast_tau > 0.0, f"τ={inr._coast_tau:.3f}ث")
+
+    # ⚠ جوهر الإصلاح: اللفّات التالية تستفيد مما قيس في الأولى
+    for _ in range(3):
+        last = inr.turn_by_angle(90, timeout=8.0)
+    check("بعد التعلّم: اللفّة تصيب الهدف ضمن التسامح",
+          abs(last["residual_deg"]) <= TURN_TOLERANCE_DEG,
+          f"متبقٍّ={last['residual_deg']}° مقابل {first['residual_deg']}° أولاً")
+    check("الاستباق ألغى الحاجة إلى دورات التصحيح",
+          last["corrections"] == 0, f"{last['corrections']} تصحيح")
+    check("التصحيح محدود العدد دائماً (لا مطاردة بلا نهاية)",
+          first["corrections"] <= TURN_CORRECTION_PASSES
+          and last["corrections"] <= TURN_CORRECTION_PASSES)
+
+    # منصّة بلا قصور ذاتي: الاستباق يبقى صفراً فلا تقصُر اللفّة أبداً
+    clean = WaveRoverBridge(mode="sim")
+    clean.calibrate_gyro_bias(seconds=0.3)
+    rcl = clean.turn_by_angle(90, timeout=8.0)
+    check("بلا قصور ذاتي: إصابة ضمن التسامح بلا تصحيح ولا نقص",
+          rcl["corrections"] == 0
+          and abs(rcl["residual_deg"]) <= TURN_TOLERANCE_DEG,
+          f"متبقٍّ={rcl['residual_deg']}° · تصحيحات={rcl['corrections']}")
+    check("τ يبقى ~صفر على منصّة تقف فوراً (لا استباق كاذب)",
+          clean._coast_tau < 0.02, f"τ={clean._coast_tau:.4f}ث")
+
+    # ── الخطأ الصغير: يُغلق أثناء السير لا بلفّة بالمكان ───────────
+    # ⚠ العطل الذي أنتجه قياسُ التجاوز نفسه: صار النظام يرى خطأه (+4.8°)
+    #    فيطلب لفّة −5°، وقصورها 6.2° فينتهي عند −3.4° فيطلب +3°… رجفة عند
+    #    كل خلية بلا تقارب. الأداة كانت خطأ لا القياس.
+    from pi.nav.executor import DriveExecutor
+    from pi.config import TURN_MIN_ACHIEVABLE_DEG
+
+    ex_br = WaveRoverBridge(mode="sim")
+    ex_br.calibrate_gyro_bias(seconds=0.3)
+    open_road = lambda: {"ultrasonic_cm": 300.0, "ir_left": 1, "ir_right": 1}  # noqa: E731
+    ex = DriveExecutor(ex_br, ReactiveSafety(), open_road, default_sim_profile())
+
+    t_small = ex.turn_to(94.8, 90.0)
+    check("خطأ أصغر من أصغر لفّة ممكنة → لا لفّة بالمكان إطلاقاً",
+          t_small.get("skipped") and t_small["turned_deg"] == 0.0,
+          f"متبقٍّ={t_small.get('residual_deg'):.1f}° < {TURN_MIN_ACHIEVABLE_DEG}°")
+    check("الخطأ المتبقّي يُمرَّر لا يُبتلع (وإلا ثبّتنا الاتجاه الخاطئ)",
+          abs(t_small["residual_deg"] - (-4.8)) < 1e-6,
+          f"{t_small['residual_deg']}°")
+    check("لفّة 90° تبقى لفّة بالمكان كالمعتاد",
+          not ex.turn_to(0.0, 90.0).get("skipped"))
+
+    fw = ex.forward_cell(0.5, heading_error_deg=6.0)
+    hh = fw.get("heading_hold") or {}
+    check("الشوط يثبّت **الهدف** لا الاتجاه الحالي",
+          hh.get("target_offset_deg") == 6.0 and hh["max_abs_error_deg"] >= 5.0,
+          f"إزاحة={hh.get('target_offset_deg')}° أقصى خطأ={hh['max_abs_error_deg']}°")
+    # ⚠ الحارس الحاسم: شوط بخطأ حقيقي = طور **توجيه** لا سير. بعتبة السير
+    #    (12°/ث) يرفض المرشّح دوران الروبوت الذي أمر به المتحكّم نفسه
+    #    (41–62°/ث عند الإشباع) فيتجمّد التكامل ويبقى مشبعاً بلا انغلاق —
+    #    قِيس قبل الإصلاح: 6.0° بقيت 5.1° بإشباع **100%** طوال الشوط.
+    check("شوط بخطأ زاوي حقيقي يعمل في طور «التوجيه»",
+          hh.get("phase") == "steer", f"الطور={hh.get('phase')}")
+    check("تثبيت الاتجاه **يغلق** الخطأ فعلاً أثناء السير",
+          abs(hh["final_error_deg"]) < 1.5 and hh["saturated_pct"] < 50.0,
+          f"6.0° → {hh['final_error_deg']}° · إشباع {hh['saturated_pct']}%")
+    check("الخطأ النهائي **مقاس** ويصل إلى المهمة",
+          hh.get("final_error_deg") is not None)
+    hh0 = (ex.forward_cell(0.5, heading_error_deg=0.0) or {})["heading_hold"]
+    check("السير المستقيم يبقى على عتبته الضيّقة المعايرة (لا توسيع مجاني)",
+          hh0.get("phase") == "drive", f"الطور={hh0.get('phase')}")
+
+    # ── «مهلة اللفّ» تُسمّى: هل تعثّر بعد 70° أم لم يدر أصلاً؟ ──────
+    class StuckBridge(WaveRoverBridge):
+        """روبوت تصل إليه الأوامر ولا يدور (بطارية منهكة / عجلة عالقة)."""
+        def read_imu(self):
+            d = super().read_imu()
+            d["gz"] = self._sim_bias        # لا دوران مهما أُمر
+            return d
+
+    stuck = StuckBridge(mode="sim")
+    stuck.calibrate_gyro_bias(seconds=0.3)
+    rst = stuck.turn_by_angle(90, timeout=1.0)
+    check("لفّ بلا دوران يُسمّى بوضوح لا «مهلة» مبهمة",
+          rst["timed_out"]
+          and any(e["kind"] == "turn_no_rotation" for e in stuck.events),
+          next((e["msg"][:70] for e in stuck.events
+                if e["kind"] == "turn_no_rotation"), "لا حدث"))
+
+    # ── إعادة تعريف الغرفة توقف خيط المحركات الجاري ────────────────
+    # ⚠ بدونه يواصل الخيط القديم قيادة الروبوت على شبكة استُبدلت تحته، ويكتب
+    #   أحداثه في سجل صُفّر للتوّ — فتظهر وكأنها **سبقت** بدء المهمة الجديدة
+    #   (شوهد على العتاد: turn_failed عند 1.9ث و mission_start عند 4.0ث).
+    ms4 = MissionSim()
+    ms4.configure_room(2.0, 2.0)
+    ms4.set_calibration(default_sim_profile())
+    ms4.set_drive_motors(True, allow_sim=True)
+    ms4.start()
+    ms4.configure_room(3.0, 2.0)              # إعادة تعريف والمهمة جارية
+    check("إعادة تعريف الغرفة توقف المهمة والخيط الجاري",
+          ms4.state == "idle"
+          and (ms4._worker is None or not ms4._worker.is_alive())
+          and not ms4.rover._moving,
+          f"الحالة={ms4.state} · محركات={ms4.rover._moving}")
+
+    # ═══ (ن) وصلة الروفر + الحماية البديلة عن حسّاس الجهد ══════════
+    print("\nن) وصلة الروفر والحماية بلا حسّاس جهد:")
+    from pi.config import TURN_RATE_FADE_WARN, TURN_NO_ROTATION_LIMIT
+
+    # ⚠ الحارس الحاسم: منفذ ميت كان يجعل `finally: self.stop()` **نفسه** يرمي
+    #    استثناءً — فتضيع «الإيقاف المضمون» في اللحظة الوحيدة التي وُجدت لها،
+    #    ويطبع بايثون شلال استثناءات متداخلة يدفن السبب الأول (شوهد على العتاد).
+    class DeadPort:
+        closed = False
+        def write(self, _b):  raise OSError(9, "Bad file descriptor")   # noqa: E704
+        def close(self):      self.closed = True                        # noqa: E704
+
+    dead = WaveRoverBridge(mode="sim")
+    dead.mode, dead._ser = "real", DeadPort()      # منفذ يرفض كل كتابة
+    try:
+        dead.motors(0.4, -0.4)
+        dead.stop()
+        raised = False
+    except Exception:                              # noqa: BLE001
+        raised = True
+    check("منفذ ميت لا يرمي استثناءً — الإيقاف المضمون يبقى مضموناً",
+          not raised and not dead.link_ok, f"link_ok={dead.link_ok}")
+    check("انقطاع الوصلة يُعلَن حدثاً مقروءاً مرة واحدة",
+          sum(1 for e in dead.events if e["kind"] == "rover_link_fault") == 1,
+          next((e["msg"][:60] for e in dead.events
+                if e["kind"] == "rover_link_fault"), "لا حدث"))
+    rlink = dead.turn_by_angle(90, timeout=1.0)
+    check("اللفّ على وصلة ميتة يُجهض بسبب صريح لا بمهلة",
+          rlink["aborted"] == "rover_link_fault", str(rlink["aborted"]))
+
+    # ذروة معدل الدوران = مقياس شحن ضمني (لا فولتميتر على هذا العتاد)
+    class FadingBridge(WaveRoverBridge):
+        """بطارية تنهك: معدل الدوران المتاح ينزل لفّة بعد لفّة."""
+        gain = 1.0
+        def read_imu(self):
+            d = super().read_imu()
+            d["gz"] = round(d["gz"] * self.gain, 3)
+            return d
+
+    fade = FadingBridge(mode="sim")
+    fade.calibrate_gyro_bias(seconds=0.3)
+    fade.turn_by_angle(90, timeout=8.0)
+    base_peak = fade.turn_peak_baseline
+    fade.gain = 0.4                                # البطارية تنهك
+    fade.turn_by_angle(90, timeout=8.0)
+    check("ذروة الدوران تُقاس وتُتخذ مرجعاً (بديل حسّاس الجهد)",
+          base_peak and base_peak > 0, f"مرجع={base_peak:.0f}°/ث")
+    check("هبوط ذروة الدوران يُعلَن تحذير إنهاك بطارية",
+          any(e["kind"] == "turn_fade" for e in fade.events),
+          next((e["msg"][:64] for e in fade.events
+                if e["kind"] == "turn_fade"), f"عتبة={TURN_RATE_FADE_WARN}"))
+
+    # العجز الكامل عن اللفّ يُنهي المهمة (RTH يحتاج لفّاً أيضاً)
+    ms5 = MissionSim()
+    ms5.rover = StuckBridge(mode="sim")
+    ms5.configure_room(2.0, 2.0)
+    ms5.set_calibration(default_sim_profile())
+    ms5.set_drive_motors(True, allow_sim=True)
+    ms5.start()
+    ms5._worker.join(timeout=30.0)
+    check(f"{TURN_NO_ROTATION_LIMIT} لفّتان بلا دوران → إنهاء المهمة بسبب صريح",
+          ms5.state == "estop"
+          and any("اشحن البطارية" in e["msg"] for e in ms5.events),
+          next((e["msg"][:70] for e in ms5.events
+                if e["kind"] == "mission_abort"), f"الحالة={ms5.state}"))
 
     # الخلاصة
     passed = sum(_results)

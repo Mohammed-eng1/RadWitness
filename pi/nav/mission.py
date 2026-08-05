@@ -33,6 +33,7 @@ from pi.config import (
     APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
     BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
     RESCAN_MAX_CELLS_PER_POINT, GRADIENT_TRANSIT_STOP_M,
+    MISSION_STEP_RETRY_S, MISSION_MAX_CONSECUTIVE_FAILS, TURN_NO_ROTATION_LIMIT,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator, SURVEY, CONFIRM
@@ -170,6 +171,8 @@ class MissionSim:
         self._gate_lost_logged = False  # أُعلن انهيار بوابة المحاذاة مرة
         self._wall_corrections = 0    # تصحيحات جدار ناجحة (لتقرير الانسحاب)
         self._ground_echo_logged = False  # أُعلن اشتباه صدى الأرض مرة
+        self._last_turn = None        # نتيجة آخر لفّة (لتمييز العطل القاتل)
+        self._no_rot = 0              # لفّات متتالية بلا دوران يُذكر
         self.last_reactive = None
         self.drive_motors = False
         self.executor = None
@@ -181,8 +184,32 @@ class MissionSim:
         self.camera = None       # تُحقن من السيرفر (اختيارية)
         self.documentation = None  # نتيجة التوثيق البصري بعد المسح
 
+    def _stop_worker(self, reason: str = "") -> None:
+        """
+        يوقف خيط المحركات **وينتظره فعلاً** (لا يكتفي بتغيير الحالة).
+
+        ⚠ بدون الانتظار يواصل الخيط القديم قيادة الروبوت على **شبكة استُبدلت
+           تحته**، ويكتب أحداثه في سجل صُفّر للتوّ فتبدو كأنها سبقت بدء المهمة
+           الجديدة (شوهد على العتاد: `turn_failed` عند 1.9ث و`mission_start`
+           عند 4.0ث). والمحركات تُوقَف صراحةً قبل الانتظار لا بعده.
+        """
+        w = self._worker
+        self.state = IDLE
+        try:
+            self.rover.stop()
+        except Exception:                  # noqa: BLE001
+            pass
+        if w is not None and w.is_alive() and w is not threading.current_thread():
+            w.join(timeout=3.0)
+            if reason:
+                self._log("mission_stopped", f"أُوقفت المهمة الجارية — {reason}")
+        self._worker = None
+
     def configure_room(self, length_m, width_m, start_corner="back_left",
                        scan_spacing_m=0.5, source_xy=None, bg_cpm=22.0):
+        # 🔴 مهمة جارية على شبكة ستُستبدل الآن — أوقفها وانتظرها أولاً
+        if self._worker is not None or self.state in (RUNNING, PAUSED):
+            self._stop_worker("أُعيد تعريف الغرفة")
         self.room = Room(length_m=float(length_m), width_m=float(width_m),
                          start_corner=start_corner, scan_spacing_m=float(scan_spacing_m))
         self.grid = OccupancyGrid(self.room)
@@ -650,6 +677,26 @@ class MissionSim:
         تستغرق ثوانٍ (لفّ + تقدّم + توقّف قياس)، بينما تبقى حلقة البثّ حيّة.
         ⚠ ينتهي دائماً بـstop() مهما حدث.
         """
+        # ⚠⚠ **كل مسار `continue` هنا يمرّ بـ`_step_failed`** ⚠⚠
+        # عطل مقاس (2026-08-01): مع عطل دائم في مصدر الاتجاه كانت الخطوة تفشل
+        # في **صفر ثانية** فتُعاد آلاف المرات في الثانية. والضرر ليس ضجيج
+        # السجل: كل محاولة تُشغّل المحركات لحظة ثم توقفها، فيرتجف الروبوت في
+        # مكانه (شوهد)، ويلتهم الخيط المعالج فتتجمّد الواجهة.
+        fails = 0                     # إخفاقات **متتابعة** بلا تقدّم فعلي
+
+        def _step_failed(reason: str) -> bool:
+            """تسجيل إخفاق خطوة + تهدئة إلزامية. True = المهمة يجب أن تتوقف."""
+            nonlocal fails
+            fails += 1
+            if fails >= MISSION_MAX_CONSECUTIVE_FAILS:
+                self._log("mission_abort",
+                          f"⛔ {fails} خطوات متتالية بلا تقدّم ({reason}) — "
+                          f"إيقاف المهمة بدل الدوران على الفراغ")
+                self.estop()
+                return True
+            time.sleep(MISSION_STEP_RETRY_S)
+            return False
+
         try:
             while self.state in (RUNNING, PAUSED):
                 if self.state == PAUSED:
@@ -675,6 +722,8 @@ class MissionSim:
                     self.dirty.add(target)
                     self._log("unreachable",
                               f"هدف غير قابل للوصول ({target[0]},{target[1]})")
+                    if _step_failed("لا مسار"):
+                        break
                     continue
                 if r.get("blocked_cell"):
                     self.replans[target] = self.replans.get(target, 0) + 1
@@ -683,8 +732,16 @@ class MissionSim:
                         self.dirty.add(target)
                         self._log("unreachable",
                                   f"هدف محاصر ({target[0]},{target[1]})")
+                    if _step_failed("أُجهض التقدّم"):
+                        break
                     continue
-                if (r.get("entered") and self._returning
+                if not r.get("entered"):
+                    # لفّة فاشلة · لا حركة · حركة ناقصة — كلها بلا تقدّم فعلي
+                    if _step_failed(r.get("reason") or "خطوة بلا تقدّم"):
+                        break
+                    continue
+                fails = 0                  # تقدّمنا خلية فعلاً → صفّر العدّاد
+                if (self._returning
                         and self.current == self.grid.start_cell()):
                     self._finish()
                     break
@@ -716,7 +773,40 @@ class MissionSim:
         # الحساسات تعتمد self.heading، فلو بقي قديماً لقاس الروبوت
         # المسافة في الاتجاه الخاطئ وأجهض الخطوة بعائق وهمي.
         if not self._face(target_heading):
-            return {"ok": False, "entered": False, "turn_failed": True}
+            t = self._last_turn or {}
+            # ⚠ عطل مصدر الاتجاه ليس «خطوة فاشلة تُعاد»: بلا زاوية مقروءة لا
+            #    توجد ملاحة أصلاً، والمحاولة التالية تفشل بنفس السبب حتماً.
+            #    وإشارة محور مقلوبة عطلُ تركيب لا يُصلحه التكرار. ووصلة روفر
+            #    ميتة تعني ألّا أمر حركة يصل. الثلاثة **قاتلة للمهمة**.
+            if t.get("aborted") in ("heading_source_fault", "sign_mismatch"):
+                src = getattr(self.rover, "heading_source", None)
+                self._log("mission_abort",
+                          f"⛔ توقّفت المهمة — الملاحة بلا اتجاه مستحيلة: "
+                          f"{getattr(src, 'error', None) or t.get('aborted')}")
+                self.estop()
+                return {"ok": False, "entered": False, "fatal": True}
+            if t.get("aborted") == "rover_link_fault":
+                self._log("mission_abort",
+                          f"⛔ توقّفت المهمة — انقطع اتصال الروفر: "
+                          f"{getattr(self.rover, 'link_error', None)}")
+                self.estop()
+                return {"ok": False, "entered": False, "fatal": True}
+            # ── العجز عن اللفّ = طبقة حماية ثالثة (سلوكية) ──────────
+            # الدوران بالمكان أثقل مناورة فهو أول ما يسقط مع ضعف البطارية.
+            # لفّتان بلا دوران ⇒ لا مسح ولا حتى عودة إجبارية (RTH يحتاج لفّاً).
+            if t.get("no_rotation"):
+                self._no_rot += 1
+                if self._no_rot >= TURN_NO_ROTATION_LIMIT:
+                    self._log("mission_abort",
+                              f"⛔ توقّفت المهمة — {self._no_rot} لفّتان بلا "
+                              f"دوران: المنصّة لم تعد تستطيع اللفّ. "
+                              f"**اشحن البطارية** أو افحص عائقاً/عجلة عالقة.")
+                    self.estop()
+                    return {"ok": False, "entered": False, "fatal": True}
+            else:
+                self._no_rot = 0
+            return {"ok": False, "entered": False, "turn_failed": True,
+                    "reason": "فشل اللفّ"}
 
         # المسافة المتوقَّعة للجدار من **مركز الخلية الهدف** (من الخريطة)
         tx, ty = self.grid.cell_center(*nxt)
@@ -840,8 +930,13 @@ class MissionSim:
                       f"كلياً (σ تعكس ذلك).")
 
     def _face(self, target_heading: float) -> bool:
-        """يلفّ نحو اتجاه مطلوب ويحدّث الاتجاه فوراً. False عند فشل اللفّة."""
+        """
+        يلفّ نحو اتجاه مطلوب ويحدّث الاتجاه فوراً. False عند فشل اللفّة.
+        ⚠ يحفظ نتيجة اللفّ في `_last_turn` — المستدعي يحتاج **سبب** الفشل
+           للتمييز بين خطوة تُعاد وعطل قاتل للمهمة.
+        """
         t = self.executor.turn_to(self.heading, target_heading)
+        self._last_turn = t
         turned = t.get("turned_deg", 0.0)
         if self.dr and turned:
             self.dr.turn(turned)
@@ -943,6 +1038,8 @@ class MissionSim:
         self._rolling_warned = False
         self._gate_lost_logged = False
         self._wall_corrections = 0
+        self._last_turn = None
+        self._no_rot = 0
 
     def _motion_step_m(self, covered: float, motion: dict) -> float:
         """

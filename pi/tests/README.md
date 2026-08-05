@@ -20,12 +20,20 @@ source venv/bin/activate
 | `test_ultrasonic.py` | مسافة HC-SR04 (اختبار مكتبي) | `python3 pi/tests/test_ultrasonic.py` | TRIG=GPIO23، ECHO=GPIO24 ⚠ **مقسّم جهد** |
 | `test_ir.py` | حساس عائق IR (اختبار مكتبي) | `python3 pi/tests/test_ir.py` | OUT=GPIO25 ⚠ **تغذية 3.3V** |
 | `calibrate_heading.py` | **معايرة الاتجاه** (انحياز/معامل/KP) — يحرّك المحركات في المرحلتين 2 و3 | `python3 -m pi.tests.calibrate_heading` | BNO055 I2C **0x29** + الروفر على `/dev/serial0` |
+| `check_imu_health.py` | **«الحسّاس ميت» أم عاد إلى CONFIG؟** يقرأ CHIP_ID/OPR_MODE/SYS_ERR ويحصي الصفر المضبوط | `python3 -m pi.tests.check_imu_health` (أضف `--motors` لإعادة إنتاج انهيار التغذية ⚠ يحرّك الروبوت) | BNO055 على i2c-**4** @ 0x29 |
 
 ملاحظات:
 - **الجيجر** يستخدم `lgpio` (بلا daemon — بديل pigpio المحذوف من Debian trixie).
   إن ظهر خطأ صلاحيات، تأكد أن مستخدمك ضمن مجموعة `gpio`: `groups | grep gpio`.
 - **GPS** قد يستغرق دقائق للقفل الأول في العراء.
-- **BNO055**: افحص الوجود أولاً `i2cdetect -y 1` (يجب أن يظهر **29**). صار **مصدر
+- ⚠ **«40 قراءة صفر مضبوط متتابعة — الحسّاس ميت؟» في سجل المهمة لا تعني الموت
+  بالضرورة**: في وضع **CONFIG** تقرأ كل سجلات بيانات BNO055 `0x00`، والشريحة
+  تعود إلى CONFIG وحدها بعد أي إعادة تشغيل ذاتية (أشيع سبب: هبوط جهد 3.3V عند
+  اندفاع تيار المحركات). فهي حيّة على الناقل وتردّ بهويتها والجايرو صفر إلى
+  الأبد. مصدر الاتجاه يحاول الإحياء تلقائياً قبل إعلان العطل؛ ولحسم السبب:
+  `python3 -m pi.tests.check_imu_health --motors`.
+- **BNO055**: افحص الوجود أولاً `i2cdetect -y 4` (يجب أن يظهر **29** — الناقل
+  4 لا 1، انظر `BNO055_I2C_BUS`). صار **مصدر
   الاتجاه الأساسي** بعد موت جايرو الروفر، ويعمل في وضع **IMUPLUS بلا مغنيتومتر**
   → لا حاجة للتلويح على شكل ∞، و`mag_cal = 0` **متوقَّع** (المهم `gyro_cal ≥ 2`).
   إجراء المعايرة الكامل في [`docs/PATCH_HEADING_SOURCE.md`](../../docs/PATCH_HEADING_SOURCE.md).

@@ -27,6 +27,7 @@ from pi.config import (
     KNOWN_WALL_TOL_M, HARD_STOP_CM, IR_RANGE_CM,
     HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE, SPEED_RAMP_UP_PER_S,
     MOTION_VERIFY_ENABLED, MOTION_SETTLE_S, MOTION_BACKWARD_MAX_M,
+    TURN_MIN_ACHIEVABLE_DEG, HEADING_STEER_PHASE_DEG,
 )
 from pi.nav.room import CELL_SIZE_M
 from pi.nav.heading_hold import HeadingController, signed_error
@@ -70,14 +71,25 @@ class DriveExecutor:
     # ── اللفّ نحو اتجاه مطلوب ────────────────────────────────────
     def turn_to(self, current_heading: float, target_heading: float) -> dict:
         delta = _ang_signed(current_heading, target_heading)
-        if abs(delta) < 2.0:
-            return {"ok": True, "turned_deg": 0.0, "skipped": True}
+        # ⚠⚠ **لا تُطلب لفّة أصغر ممّا تستطيعه المنصّة** ⚠⚠
+        # القصور الذاتي بعد قطع الطاقة 5.5–8.0° مهما صغرت اللفّة (قِيس: طلب
+        # 2° أنتج 6.4°)، فطلب 3° لا يقرّب من الهدف بل يتجاوزه إلى الجهة
+        # الأخرى — ويتكرّر عند كل خلية كرجفة بلا تقارب. الخطأ الصغير يعود
+        # إلى `forward_cell` ليغلقه تثبيت الاتجاه **أثناء السير**: تصحيح
+        # سلس، بلا قصور ذاتي، وبمتحكّم معاير أصلاً.
+        if abs(delta) < TURN_MIN_ACHIEVABLE_DEG:
+            return {"ok": True, "turned_deg": 0.0, "skipped": True,
+                    "residual_deg": delta}
         res = self.rover.turn_by_angle(delta, timeout=ROVER_TURN_TIMEOUT_S)
         # `aborted` يعني عطلاً في مصدر الاتجاه أو إشارة محور مقلوبة — فشل
         # صريح لا يجوز اعتباره لفّة ناجحة (وإلا تقدّم الروبوت باتجاه خاطئ).
         return {"ok": not res["timed_out"] and not res.get("aborted"),
                 "turned_deg": res["turned_deg"], "aborted": res.get("aborted"),
-                "segments": res.get("segments", 1), "timed_out": res["timed_out"]}
+                "segments": res.get("segments", 1), "timed_out": res["timed_out"],
+                # إشارات تشخيصية تصعد إلى المهمة: العجز عن اللفّ أصلاً، وذروة
+                # معدل الدوران (مقياس الشحن الضمني — لا حسّاس جهد على العتاد).
+                "no_rotation": res.get("no_rotation", False),
+                "peak_rate_dps": res.get("peak_rate_dps")}
 
     # ── قراءتا التحقق من الحركة (البند 0) ────────────────────────
     def _settled_front_cm(self):
@@ -104,9 +116,14 @@ class DriveExecutor:
 
     # ── التقدّم خلية واحدة تحت إشراف السلامة ─────────────────────
     def forward_cell(self, distance_m: float = CELL_SIZE_M,
-                     expected_wall_end_m=None) -> dict:
+                     expected_wall_end_m=None,
+                     heading_error_deg: float = 0.0) -> dict:
         """
         يتقدّم `distance_m` بسرعة يقررها سلّم السلامة لحظياً.
+
+        `heading_error_deg`: الخطأ الزاوي المتبقّي بعد اللفّ (موجب = يجب اللفّ
+        يميناً للوصول إلى اتجاه الشبكة). **يُغلق أثناء السير** بدل لفّة بالمكان
+        ثانية — لفّة أصغر من القصور الذاتي مستحيلة (TURN_MIN_ACHIEVABLE_DEG).
 
         `expected_wall_end_m`: المسافة المتوقَّعة **من الخريطة** بين نهاية
         الخطوة والجدار المواجه. تُستخدم لتمييز **الجدار المعروف** عن العائق
@@ -127,16 +144,25 @@ class DriveExecutor:
         witness = AccelWitness() if self.verify_motion_enabled else None
         d_start = self._settled_front_cm() if self.verify_motion_enabled else None
 
-        # ── تثبيت الاتجاه: الهدف هو الاتجاه **لحظة بدء العبور** ──────
+        # ── تثبيت الاتجاه: الهدف = الاتجاه الحالي + الخطأ المتبقّي ─────
         # يُلتقط من الحسّاس لا من إطار الغرفة: مرجع مصدر الاتجاه يُصفَّر
-        # مستقلاً عن `mission.heading` فقد يكون الإطاران مزاحين، والتقاطه
-        # هنا يجعل الشوط **خطاً مستقيماً** أياً كان الإطار.
+        # مستقلاً عن `mission.heading` فقد يكون الإطاران مزاحين. ولهذا يُجمع
+        # **الفرق فقط** (`heading_error_deg`) لا الاتجاه المطلق — فيصير الهدف
+        # صحيحاً في إطار الحسّاس أياً كان الإزاحة بين الإطارين.
+        # ⚠ بلا هذا الجمع كان الشوط يثبّت الاتجاه **الخاطئ**: يمشي مستقيماً
+        #   تماماً لكن على خط منحرف عن الشبكة، ويتراكم الانزياح خلية بعد خلية.
         src = getattr(self.rover, "heading_source", None)
         hold = None
         if HEADING_HOLD_IN_MISSION and src is not None and getattr(src, "ok", False):
-            src.set_phase("drive")   # عتبة السير (12°/ث) لا عتبة اللفّ (200)
+            # ⚠ الطور يُختار **مرة واحدة في البداية** لا وسط الشوط: تبديله
+            #   يصفّر المرشّح فيُحدث قفزة في أسوأ لحظة. شوطٌ يبدأ بخطأ حقيقي
+            #   هو شوط **توجيه**: المتحكّم سيدير الروبوت عمداً بمعدل ترفضه
+            #   عتبة السير الضيّقة (12°/ث) فيعمى الحسّاس عن دوران الروبوت نفسه.
+            phase = ("steer" if abs(heading_error_deg) >= HEADING_STEER_PHASE_DEG
+                     else "drive")
+            src.set_phase(phase)
             src.update()             # يثبّت مرجع الزمن قبل أول تصحيح
-            hold = src.heading
+            hold = (src.heading + float(heading_error_deg)) % 360.0
             self.heading_ctl.reset()
         hold_lost = None
         base_capped = None       # (المطلوب من السلّم، المطبَّق) عند تقييد السقف
@@ -235,6 +261,14 @@ class DriveExecutor:
                 "saturated_pct": s["saturated_pct"],
                 "samples": s["samples"], "lost": hold_lost,
                 "base_capped": base_capped,
+                # الخطأ المتبقّي **مقاساً** عند نهاية الشوط — به تحدّث المهمة
+                # اتجاهها بدل افتراض أن التثبيت أغلقه تماماً.
+                "final_error_deg": s.get("final_error_deg"),
+                "target_offset_deg": round(float(heading_error_deg), 2),
+                "phase": phase,
+                # إشباع مرتفع مع خطأ لا ينغلق = سلطة التصحيح لا تكفي
+                # (ارفع HEADING_MAX_CORR أو أنزل قوة الأساس).
+                "spikes": getattr(src.cond, "spikes", None),
             }
         elif HEADING_HOLD_IN_MISSION:
             out["heading_hold"] = {"lost": "مصدر الاتجاه غير متاح عند بدء العبور"}
