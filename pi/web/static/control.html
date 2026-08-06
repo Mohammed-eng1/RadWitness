@@ -209,6 +209,37 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
       </div>
     </div>
 
+    <div class="card" id="cardAI" style="margin-top:14px">
+      <h2>🧠 استشارة الذكاء الاصطناعي <span class="pill">اقتراح فقط — لا يتحكم بالروبوت</span></h2>
+      <div class="muted" style="font-size:12.5px;line-height:1.8">
+        يُرسل القراءات الحية + تقرير المحدِّد + صورة الكاميرا إلى نموذج AI ويعيد
+        تحليلاً، ثم تسأل ما شئت. 🔴 <b>المفتاح يبقى في متصفحك فقط</b>
+        (localStorage) والنداء يخرج من متصفحك مباشرة — لا يمرّ بالراسبري إطلاقاً
+        (قاعدة المشروع §8). والتحليل استشاري: طبقات السلامة مستقلة عنه كلياً.
+      </div>
+      <div class="slider" style="margin-top:10px">
+        <select id="aiProvider" style="flex:0 0 110px">
+          <option value="claude" selected>Claude</option>
+          <option value="gemini">Gemini</option>
+        </select>
+        <input type="text" id="aiModel" value="claude-opus-5" style="flex:1" title="اسم النموذج">
+        <input type="password" id="aiKey" placeholder="مفتاح API — يبقى في متصفحك" style="flex:2">
+      </div>
+      <div class="btnrow" style="margin-top:9px">
+        <button id="aiConsult" class="primary">📤 استشر الآن (القراءات + الصورة)</button>
+        <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" id="aiWithImage" checked> إرفاق صورة الكاميرا
+        </label>
+        <button id="aiClear" style="margin-inline-start:auto">🗑 محادثة جديدة</button>
+      </div>
+      <div id="aiChat" class="log" style="height:300px;margin-top:10px;display:none"></div>
+      <div class="slider" id="aiAskRow" style="display:none">
+        <input type="text" id="aiQuestion" placeholder="اسأل عن التحليل…" style="flex:1">
+        <button id="aiSend">إرسال</button>
+      </div>
+      <div id="aiMsg"></div>
+    </div>
+
     <div class="card" id="cardReport" style="display:none;margin-top:14px">
       <h2>📋 التقرير النهائي
         <span style="float:left">
@@ -953,6 +984,198 @@ $("#repPrint").onclick = () => {
   document.body.classList.add("printing");
   setTimeout(() => { window.print(); document.body.classList.remove("printing"); }, 60);
 };
+
+/* ═══ استشارة الذكاء الاصطناعي ═══
+   🔴 قاعدة §8: المفتاح لا يلمس الراسبري — يُحفظ في متصفح المستخدم فقط
+   والنداء يخرج من المتصفح مباشرة إلى مزوّد الـAI. لا SDK (قاعدة بلا CDN)
+   فالنداء HTTP خام. والتحليل **اقتراح فقط** (طبقة 5): لا مسار منه لأي أمر. */
+const AI_DEFAULTS = {claude: "claude-opus-5", gemini: "gemini-2.5-flash"};
+let aiHistory = [];        // [{role:"user"|"assistant", text, image?}]
+let aiBusy = false;
+
+function aiLoadPrefs(){
+  const p = localStorage.getItem("ai_provider") || "claude";
+  $("#aiProvider").value = p;
+  $("#aiModel").value = localStorage.getItem("ai_model_" + p) || AI_DEFAULTS[p];
+  $("#aiKey").value = localStorage.getItem("ai_key_" + p) || "";
+}
+$("#aiProvider").onchange = () => {
+  localStorage.setItem("ai_provider", $("#aiProvider").value);
+  aiLoadPrefs();
+};
+$("#aiModel").onchange = () =>
+  localStorage.setItem("ai_model_" + $("#aiProvider").value, $("#aiModel").value);
+$("#aiKey").onchange = () =>
+  localStorage.setItem("ai_key_" + $("#aiProvider").value, $("#aiKey").value);
+
+const AI_SYSTEM =
+  "أنت خبير في الفيزياء الصحية وسلامة الإشعاع، تستشيرك محطة تحكم روبوت مسح " +
+  "إشعاعي داخلي (عدّاد جيجر معايَر K=111 CPM/(µSv/h) ضد Cs-137، غرفة مغلقة، " +
+  "روبوت أرضي بلا إنكودرات). ستصلك قراءات لحظية وتقرير محدِّد مصدر بايزي " +
+  "(Λ إحصائية، موقع مقدَّر، شكوك) وربما صورة من كاميرا الروبوت.\n" +
+  "مهمتك: تحليل الوضع الإشعاعي، تقييم الخطورة على البشر، تفسير الصورة إن " +
+  "وُجدت (ما الجسم المرئي المحتمل عند الموقع المقدَّر؟)، واقتراح أولويات " +
+  "للمشغّل. التزم بحدودك: تحليلك استشاري للمشغّل البشري ولا يتحكم بالروبوت؛ " +
+  "الصورة توثّق الموقع ولا تثبت هوية الجسم المشعّ؛ وصرّح بجهلك حين تجهل. " +
+  "أجب بالعربية بإيجاز منظم.";
+
+function aiContext(){
+  // خلاصة سياق مضغوطة من آخر حالة مبثوثة — أرقام لا سرد
+  const st = ST || {};
+  const src = st.source || {};
+  return {
+    "الوقت": new Date().toISOString(),
+    "الحالة": st.state, "المرحلة": st.phase_ar,
+    "القراءة": st.reading,
+    "التغطية": st.coverage_text,
+    "محدد_المصدر": !src.active ? "غير نشط" : {
+      "الخلاصة": src.headline, "حالة_الكشف": src.detection_state,
+      "لامدا_الإحصائية": src.lambda_stat, "العتبة": src.threshold,
+      "الموقع_المقدر_م": src.found ? src.position : null,
+      "الشك_م": src.uncertainty_m, "الثقة": src.confidence,
+      "عدد_القياسات": src.n_readings,
+      "الخلفية_CPM": src.background_cpm,
+      "أعلى_جرعة_uSvh": src.max_usvh,
+      "مستوى_الخطر": src.hazard_level,
+    },
+    "موضع_الروبوت_م": st.robot ? [st.robot.x, st.robot.y] : null,
+    "البطارية": (st.battery && st.battery.v != null)
+      ? st.battery.v + "V (" + st.battery.percent + "%)" : "مجهولة",
+  };
+}
+
+async function aiSnapshotB64(){
+  try {
+    const r = await fetch("/snapshot.jpg?t=" + Date.now());
+    if (!r.ok) return null;
+    const blob = await r.blob();
+    return await new Promise(res => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result).split(",")[1] || null);
+      fr.onerror = () => res(null);
+      fr.readAsDataURL(blob);
+    });
+  } catch(e){ return null; }
+}
+
+/* ── محوّل Claude: HTTP خام على /v1/messages بترويسة النداء المتصفحي ── */
+async function aiCallClaude(key, model){
+  const messages = aiHistory.map(m => ({
+    role: m.role,
+    content: m.image
+      ? [{type: "image", source: {type: "base64", media_type: "image/jpeg", data: m.image}},
+         {type: "text", text: m.text}]
+      : m.text,
+  }));
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      // الترويسة الرسمية للنداء المباشر من المتصفح (قاعدة §8)
+      "anthropic-dangerous-direct-browser-access": "true",
+      // احتياط الرفض الأمني: يعاد التوجيه لنموذج بديل بدل فشل صامت
+      "anthropic-beta": "server-side-fallback-2026-07-01",
+    },
+    body: JSON.stringify({model: model, max_tokens: 16000,
+                          fallbacks: "default",
+                          system: AI_SYSTEM, messages: messages}),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+  if (j.stop_reason === "refusal")
+    throw new Error("رفض النموذج الطلب لاعتبارات أمان (" +
+      ((j.stop_details && j.stop_details.category) || "غير محدد") + ")");
+  return (j.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+}
+
+/* ── محوّل Gemini ── */
+async function aiCallGemini(key, model){
+  const contents = aiHistory.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: m.image
+      ? [{inline_data: {mime_type: "image/jpeg", data: m.image}}, {text: m.text}]
+      : [{text: m.text}],
+  }));
+  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/"
+      + encodeURIComponent(model) + ":generateContent?key=" + encodeURIComponent(key), {
+    method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({system_instruction: {parts: [{text: AI_SYSTEM}]},
+                          contents: contents}),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+  const cand = j.candidates && j.candidates[0];
+  if (!cand || !cand.content) throw new Error("ردّ فارغ من Gemini" +
+    (j.promptFeedback && j.promptFeedback.blockReason
+      ? " (حُجب: " + j.promptFeedback.blockReason + ")" : ""));
+  return cand.content.parts.map(p => p.text || "").join("\n");
+}
+
+function aiRender(){
+  const box = $("#aiChat");
+  box.style.display = "";
+  $("#aiAskRow").style.display = "";
+  box.innerHTML = aiHistory.map(m =>
+    '<div class="ev"><span class="src ' + (m.role === "user" ? "src-manual" : "src-vision") + '">' +
+    (m.role === "user" ? "أنت" : "AI") + '</span><span class="msg" style="white-space:pre-wrap">' +
+    esc(m.text.length > 4000 ? m.text.slice(0, 4000) + "…" : m.text) +
+    (m.image ? " 📷" : "") + '</span></div>'
+  ).join("") + (aiBusy ? '<div class="ev"><span class="src src-vision">AI</span><span class="msg">⏳ يفكّر…</span></div>' : "");
+  box.scrollTop = box.scrollHeight;
+}
+
+async function aiTurn(userText, image){
+  const key = $("#aiKey").value.trim();
+  if (!key){ showMsg("#aiMsg", "⚠ أدخل مفتاح API أولاً — يبقى في متصفحك ولا يُرسل للراسبري.", "err"); return; }
+  if (aiBusy) return;
+  aiBusy = true; $("#aiMsg").innerHTML = "";
+  aiHistory.push({role: "user", text: userText, image: image || undefined});
+  aiRender();
+  try {
+    const model = $("#aiModel").value.trim() || AI_DEFAULTS[$("#aiProvider").value];
+    const reply = $("#aiProvider").value === "gemini"
+      ? await aiCallGemini(key, model) : await aiCallClaude(key, model);
+    aiHistory.push({role: "assistant", text: reply || "(ردّ فارغ)"});
+  } catch(e){
+    aiHistory.pop();                       // لا نترك سؤالاً بلا جواب في السياق
+    showMsg("#aiMsg", "⛔ فشل النداء: " + esc(e.message) +
+      (String(e.message).includes("Failed to fetch")
+        ? " — تحقق من الإنترنت (النداء من متصفحك لا من الراسبري) أو من صلاحية المفتاح للنداء المتصفحي" : ""), "err");
+  }
+  aiBusy = false; aiRender();
+}
+
+$("#aiConsult").onclick = async () => {
+  // فحص المفتاح **قبل** التقاط اللقطة — الالتقاط قد يستغرق ثواني بلا كاميرا
+  if (!$("#aiKey").value.trim()){
+    showMsg("#aiMsg", "⚠ أدخل مفتاح API أولاً — يبقى في متصفحك ولا يُرسل للراسبري.", "err");
+    return;
+  }
+  let img = null, note = "";
+  if ($("#aiWithImage").checked){
+    img = await aiSnapshotB64();
+    if (!img) note = "\n(تعذّر التقاط صورة الكاميرا — التحليل بالقراءات وحدها)";
+  }
+  const ctx = JSON.stringify(aiContext(), null, 1);
+  await aiTurn("حلّل الوضع الإشعاعي الحالي وقيّم الخطورة واقترح أولويات للمشغّل." +
+               note + "\n\nبيانات المحطة:\n" + ctx, img);
+};
+$("#aiSend").onclick = () => {
+  const q = $("#aiQuestion").value.trim();
+  if (!q) return;
+  $("#aiQuestion").value = "";
+  aiTurn(q);
+};
+$("#aiQuestion").addEventListener("keydown", e => {
+  if (e.key === "Enter"){ e.preventDefault(); $("#aiSend").click(); }
+});
+$("#aiClear").onclick = () => {
+  aiHistory = []; $("#aiChat").style.display = "none";
+  $("#aiAskRow").style.display = "none"; $("#aiMsg").innerHTML = "";
+};
+aiLoadPrefs();
 
 /* ═══ تحديث الحالة ═══ */
 function apply(st){

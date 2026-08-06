@@ -324,6 +324,26 @@ def main() -> None:
     check("وزر «قِس الأبعاد تلقائياً» موجود في إعداد الغرفة",
           'id="btnMeasure"' in html_sim and "room/measure" in html_sim)
 
+    # ═══ ي٢) استشارة الذكاء الاصطناعي (قاعدة §8) ═══════════════════
+    section("ي٢) استشارة الذكاء الاصطناعي:")
+    import inspect
+    html_ai = c.get("/").text
+    check("بطاقة الاستشارة موجودة بمزوّدين ومفتاح متصفحي",
+          'id="cardAI"' in html_ai and 'id="aiProvider"' in html_ai
+          and "localStorage" in html_ai)
+    check("🔴 §8: النداء من المتصفح مباشرة (ترويسة النداء المتصفحي حاضرة)",
+          "anthropic-dangerous-direct-browser-access" in html_ai
+          and "api.anthropic.com" in html_ai)
+    check("والتحليل معلَن «اقتراح فقط» (طبقة 5 — لا تحكم بالروبوت)",
+          "لا يتحكم بالروبوت" in html_ai)
+    # 🔴 الحارس البنيوي: لا سطر واحد في السيرفر يلمس مفاتيح/مزوّدي AI —
+    #    وجود أيٍّ منها هناك يعني أن المفتاح صار يمرّ بالراسبري (كسر §8)
+    srv_src = inspect.getsource(srv)
+    check("🔴 §8 بنيوياً: صفر أثر لمزوّدي AI أو مفاتيحهم في كود السيرفر",
+          all(t not in srv_src for t in
+              ("anthropic", "api_key", "generativelanguage", "openai", "gemini")),
+          "المفتاح لا يلمس الراسبري")
+
     # ═══ ك) تشغيلية اللوحة الرئيسية (دفعة ملاحظات 2026-08-06) ══════
     section("ك) تشغيلية اللوحة الرئيسية:")
     html = c.get("/").text
