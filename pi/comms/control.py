@@ -24,6 +24,11 @@ control.py — مسار الأوامر اليدوية والراديو (بواب
 | `FWD` | 🔴 تُرفض عند عائق أمامي، وتُقصّ سرعتها بسلّم المسافة |
 | `BACK` · `LEFT` · `RIGHT` | مسموحة — هي **طريق الخروج** من الانحشار |
 | `RTH` | عبر `mission.return_home()` (مسار المهمة القائم) |
+| `WDRAW` | عبر `mission.request_withdraw()` — **مهمة نشطة فقط** (انظر أدناه) |
+
+⚠ **لماذا يُشترط لـ`WDRAW` مهمة نشطة؟** طلب الانسحاب علمٌ معلّق تخدمه
+حلقة التنفيذ. قبوله والمهمة idle يتركه كامناً حتى **المهمة التالية**
+فتنسحب فور بدئها بلا أمر أحد — رفض واضح الآن خير من مفاجأة لاحقاً.
 
 ⚠ **لماذا `BACK` بلا بوابة؟** لا حسّاس خلفيّ على هذا العتاد. رفضها يسدّ
 المخرج الوحيد من عائق أمامي؛ والسماح بها يجعل الخلف **مسؤولية المشغّل**
@@ -40,7 +45,7 @@ import time
 
 from pi.comms.protocol import (
     CMD_FWD, CMD_BACK, CMD_LEFT, CMD_RIGHT, CMD_STOP, CMD_ESTOP,
-    CMD_STATUS, CMD_RTH, RADIO_COMMANDS, MOTION_COMMANDS,
+    CMD_STATUS, CMD_RTH, CMD_WITHDRAW, RADIO_COMMANDS, MOTION_COMMANDS,
     ACK_OK, ACK_BADCMD, ACK_SAFE, ACK_BUSY, ACK_FAULT,
 )
 from pi.config import (
@@ -131,6 +136,32 @@ class ManualControl:
             self.last_cmd, self.last_ts = cmd, now
             self._log("return_home", f"عودة لنقطة الانطلاق ({_ar_source(source)})")
             return self._ok(cmd, ACK_OK, "عودة لنقطة الانطلاق", source)
+
+        # ── WDRAW: انسحاب على أثر الدخول — أولوية مطلقة في المهمة ──
+        if cmd == CMD_WITHDRAW:
+            self.last_cmd, self.last_ts = cmd, now
+            # مهمة نشطة فقط: العلم المعلّق على idle يفاجئ المهمة التالية
+            if self.mission.state not in ("running", "paused", "returning"):
+                self.rejected_count += 1
+                return self._reject(
+                    cmd, ACK_BUSY,
+                    f"لا مهمة نشطة (الحالة: {self.mission.state}) — "
+                    "الانسحاب يخصّ مسحاً ذاتياً جارياً", source)
+            try:
+                res = self.mission.request_withdraw(
+                    reason=f"أمر انسحاب ({_ar_source(source)})")
+            except Exception as e:              # noqa: BLE001 — §6.3
+                return self._reject(cmd, ACK_FAULT,
+                                    f"تعذّر طلب الانسحاب: {e}", source)
+            if res.get("ok"):
+                return self._ok(cmd, ACK_OK,
+                                "طلب انسحاب — أولوية مطلقة على أي هدف مسح",
+                                source)
+            # المهمة رفضته (مثلاً: بلا قيادة محركات) — السبب يصل كما هو
+            self.rejected_count += 1
+            return self._reject(cmd, ACK_FAULT,
+                                res.get("error", "رفضت المهمة طلب الانسحاب"),
+                                source)
 
         # ── من هنا: أوامر حركة فقط ────────────────────────────────
         # 🔴 حصرية الأنماط: لا قيادة يدوية فوق مسح ذاتي جارٍ. لو سُمح

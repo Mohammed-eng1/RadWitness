@@ -1,29 +1,35 @@
 /*
- * protocol.h — بروتوكول الراديو (مرآة pi/comms/protocol.py)
+ * protocol.h -- radio protocol (mirror of pi/comms/protocol.py)
  * ==================================================================
- * 🔴 **أي تغيير هنا يجب أن يقابله تغيير هناك.** الطرفان يتكلّمان نفس
- *    اللغة حرفياً، والانحراف بينهما يعطي «أطراً تالفة» بلا سبب ظاهر.
+ * ANY change here MUST be mirrored there. Both ends speak the exact
+ * same bytes; any drift between them produces "corrupt frames" with no
+ * visible cause, and the symptom looks electrical, not software.
+ * pi/comms/selftest.py compiles test_protocol.cpp and compares this
+ * implementation against the Python one automatically.
  *
- *   الإطار:   $<payload>*<HH>\n      (HH = XOR لبايتات payload، طراز NMEA)
- *   أمر:      C,<seq>,<cmd>,<p1>,<p2>
- *   تيليمتري: T,<seq>,<cpm>,<mv>,<state>     (mv ميلي فولت، -1 = مجهول)
- *   إقرار:    A,<seq>,<code>
+ *   Frame:     $<payload>*<HH>\n   (HH = XOR of payload bytes, NMEA style)
+ *   Command:   C,<seq>,<cmd>,<p1>,<p2>
+ *   Telemetry: T,<seq>,<cpm>,<mv>,<state>   (mv millivolts, -1 = unknown)
+ *   Ack:       A,<seq>,<code>
  *
- * 🔴 قائمة الأوامر **مغلقة**: FWD BACK LEFT RIGHT STOP ESTOP STATUS RTH
+ * CLOSED command list: FWD BACK LEFT RIGHT STOP ESTOP STATUS RTH WDRAW
+ *
+ * ASCII only in this file (comments AND literals) -- Arabic BiDi text
+ * broke the Arduino build before. See the note in controller_display.ino.
  */
 #pragma once
 #include <Arduino.h>
 #include "config.h"
 
-// ── XOR checksum على بايتات الحمولة ──────────────────────────
+// -- XOR checksum over the payload bytes -----------------------
 inline uint8_t xorChecksum(const char *payload) {
   uint8_t c = 0;
   for (const char *p = payload; *p; ++p) c ^= (uint8_t)(*p);
   return c;
 }
 
-// ── بناء إطار كامل جاهز للإرسال ──────────────────────────────
-// يُعيد false إن تجاوزت الحمولة الحدّ (لا يقصّ بصمت).
+// -- Build a complete frame ready to transmit ------------------
+// Returns false if the payload exceeds the cap (no silent truncation).
 inline bool buildFrame(const char *payload, char *out, size_t outSize) {
   size_t n = strlen(payload);
   if (n > MAX_PAYLOAD || outSize < n + 6) return false;
@@ -31,8 +37,8 @@ inline bool buildFrame(const char *payload, char *out, size_t outSize) {
   return true;
 }
 
-// ── فكّ إطار والتحقق من الـchecksum ──────────────────────────
-// يكتب الحمولة في payloadOut ويُعيد true عند الصحة فقط.
+// -- Parse a frame and verify its checksum ---------------------
+// Writes the payload into payloadOut; returns true only when valid.
 inline bool parseFrame(const char *line, char *payloadOut, size_t outSize) {
   if (!line || line[0] != '$') return false;
   const char *star = strrchr(line, '*');
@@ -47,43 +53,45 @@ inline bool parseFrame(const char *line, char *payloadOut, size_t outSize) {
   return true;
 }
 
-// ── 🔴 القائمة المغلقة ───────────────────────────────────────
+// -- The CLOSED command list -----------------------------------
 inline bool isAllowedCommand(const char *cmd) {
   static const char *ALLOWED[] = { "FWD", "BACK", "LEFT", "RIGHT",
-                                   "STOP", "ESTOP", "STATUS", "RTH" };
-  for (uint8_t i = 0; i < 8; ++i)
+                                   "STOP", "ESTOP", "STATUS", "RTH",
+                                   "WDRAW" };
+  for (uint8_t i = 0; i < 9; ++i)
     if (strcmp(cmd, ALLOWED[i]) == 0) return true;
   return false;
 }
 
-// ── بناء إطار أمر (يرفض ما هو خارج القائمة) ──────────────────
+// -- Build a command frame (rejects anything outside the list) --
 inline bool buildCommand(uint16_t seq, const char *cmd, float p1,
                          char *out, size_t outSize) {
   if (!isAllowedCommand(cmd)) return false;
   char payload[MAX_PAYLOAD + 1];
-  // 🔴 يطابق `_num()` في بايثون **حرفياً**: صحيح بلا فاصلة، وإلا خانتان
-  //    مع **تجريد الأصفار اللاحقة** (0.30 → 0.3). بلا التجريد يختلف
-  //    البايت فيختلف الـchecksum، وتفترق النسختان بصمت — وهو ما كشفه
-  //    `test_protocol.cpp` فعلاً عند أول تشغيل.
+  // Must match Python's _num() BYTE FOR BYTE: integers without a decimal
+  // point, otherwise two decimals with TRAILING ZEROS STRIPPED
+  // (0.30 -> 0.3). Without the stripping the byte differs, so the
+  // checksum differs, and the two sides drift apart silently -- which is
+  // exactly what test_protocol.cpp caught on its first run.
   char pbuf[12];
   if (p1 == (int)p1) {
     snprintf(pbuf, sizeof(pbuf), "%d", (int)p1);
   } else {
     snprintf(pbuf, sizeof(pbuf), "%.2f", p1);
     size_t L = strlen(pbuf);
-    while (L > 0 && pbuf[L - 1] == '0') pbuf[--L] = 0;      // أصفار لاحقة
-    if (L > 0 && pbuf[L - 1] == '.') pbuf[--L] = 0;         // فاصلة معلّقة
+    while (L > 0 && pbuf[L - 1] == '0') pbuf[--L] = 0;      // trailing zeros
+    if (L > 0 && pbuf[L - 1] == '.') pbuf[--L] = 0;         // dangling dot
   }
   snprintf(payload, sizeof(payload), "C,%u,%s,%s,0",
            (unsigned)(seq % SEQ_MODULO), cmd, pbuf);
   return buildFrame(payload, out, outSize);
 }
 
-// ── تيليمتري مفكوك ───────────────────────────────────────────
+// -- Decoded telemetry ------------------------------------------
 struct Telemetry {
   uint16_t seq;
   long     cpm;
-  long     mv;        // -1 = مجهول (**لا يُعرض صفراً**)
+  long     mv;        // -1 = unknown (NEVER displayed as zero)
   char     state[10];
   bool     valid;
 };
@@ -105,7 +113,7 @@ inline Telemetry parseTelemetry(const char *payload) {
   return t;
 }
 
-// ── إقرار مفكوك (يجعل الرفض مرئياً على الشاشة لا صامتاً) ─────
+// -- Decoded ack (rejections stay visible on screen, not swallowed)
 inline bool parseAck(const char *payload, char *codeOut, size_t outSize) {
   if (!payload || payload[0] != 'A' || payload[1] != ',') return false;
   const char *c = strchr(payload + 2, ',');

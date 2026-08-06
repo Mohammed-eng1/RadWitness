@@ -15,6 +15,7 @@ pi/nav حيّاً عبر محرّك mission.py — تعمل بالكامل عل�
 import asyncio
 import json
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -135,6 +136,35 @@ if LORA_ENABLED:
 modes = ModeManager(mission, manual, camera)
 
 
+def init_side_ultrasonic(mission_obj, enabled: bool = None) -> dict:
+    """
+    يبني مصفوفة الألترا سونيك (أمامي + جانبان بالتناوب) ويحقنها عبر
+    `mission.set_side_ultrasonic` — التوصيل الذي كان مفقوداً (§1.2).
+
+    - العلم مطفأ ⇒ **لا يُحجز منفذ ولا يُبنى شيء** (قاعدة §6.1)، والسبب
+      يُعلَن لا يُسكت عنه.
+    - العلم مضاء والبناء فشل (لا lgpio / منفذ محجوز) ⇒ الحقن يجري لكن
+      المهمة نفسها تبقيه معطّلاً (`array.ok=False`) والسبب في الخلاصة.
+    """
+    from pi.config import SIDE_ULTRASONIC_ENABLED
+    enabled = SIDE_ULTRASONIC_ENABLED if enabled is None else bool(enabled)
+    if not enabled:
+        return {"ok": False, "skipped": True,
+                "reason": "SIDE_ULTRASONIC_ENABLED=False — لا يُحجز منفذ ولا يُقرأ"}
+    # استيراد كسول: لا يلمس lgpio إلا حين يُطلب فعلاً
+    from pi.sensors.ultrasonic_array import UltrasonicArray
+    arr = UltrasonicArray(enabled=True)
+    res = mission_obj.set_side_ultrasonic(arr)
+    return {"ok": bool(res.get("ok")), "error": arr.error, "array": arr}
+
+
+_side_us = _boot("مصفوفة الألترا سونيك الجانبية",
+                 lambda: init_side_ultrasonic(mission))
+if not _side_us.get("ok"):
+    _say(f"[إقلاع] ⚠ الألترا سونيك الجانبي غير فاعل: "
+         f"{_side_us.get('reason') or _side_us.get('error')}")
+
+
 def _boot_summary() -> dict:
     """خلاصة الإقلاع: زمن كل نظام وحالته — تُطبع وتُعرض عبر /api/boot."""
     return {
@@ -152,6 +182,9 @@ def _boot_summary() -> dict:
                       "heading_source": mission.rover.heading_source.name},
             "lora": {"ok": lora.ok, "error": lora.error,
                      "enabled": lora.enabled, "port": lora.port},
+            "side_ultrasonic": {
+                "ok": bool(_side_us.get("ok")),
+                "error": _side_us.get("reason") or _side_us.get("error")},
         },
     }
 
@@ -206,7 +239,14 @@ def _full_state(include_full_grid: bool = False) -> dict:
     return {**mission.state_dict(include_full_grid=include_full_grid),
             "ui_mode": modes.state(),
             "manual": manual.state(),
-            "lora": lora.state()}
+            "lora": lora.state(),
+            # حالة الانسحاب للشريط العلوي: «معلّق» قبل أن تخدمه الحلقة،
+            # و«جارٍ» حين يصير الطور withdraw. (قراءة فقط — كما تقرأ
+            # البوابة `mission._worker` — والمنطق كله يبقى في mission)
+            "withdraw": {
+                "pending": getattr(mission, "_withdraw_req", None) is not None,
+                "active": getattr(mission, "phase", "") == "withdraw",
+            }}
 
 
 def _sensor_telemetry() -> dict:
@@ -264,6 +304,8 @@ async def lifespan(_app: FastAPI):
     manual.set_enabled(False)  # ولا تُترك عجلة تدور عند إغلاق السيرفر
     geiger.close(); gps.close(); camera.close()
     ultrasonic.close(); ir_sensors.close()
+    if _side_us.get("array") is not None:
+        _side_us["array"].close()   # يحرّر منافذ الجانبيين إن حُجزت
 
 
 # ⚠ حقن الكاميرا في المهمة: التوثيق البصري بعد المسح يحتاجها، وبلا هذا
@@ -354,6 +396,48 @@ async def api_room(req: Request):
         return {"ok": True, "grid": mission.grid_meta()}
     except (KeyError, ValueError) as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+# ═══ قياس أبعاد الغرفة تلقائياً (دورة المحيط — §1.2) ═════════════
+# 🔴 الدورة **تقود المحركات وقد تستغرق دقائق** (سقفها PERIMETER_MAX_CYCLE_S)
+#    فلا تُشغَّل داخل معالج HTTP — خيط خلفي واحد ونقطة حالة تُستطلع.
+_perimeter_run = {"thread": None, "result": None, "started_ts": None}
+
+
+def _perimeter_worker() -> None:
+    try:
+        _perimeter_run["result"] = mission.run_perimeter_cycle()
+    except Exception as e:                     # noqa: BLE001 — §6.3
+        _perimeter_run["result"] = {"ok": False, "reason": f"عطل غير متوقّع: {e}"}
+
+
+@app.post("/api/room/measure")
+async def api_room_measure():
+    """
+    يبدأ دورة قياس المحيط في الخلفية. الرفض المبكر (بلا محركات/مصفوفة)
+    يعود فوراً بسببه من `run_perimeter_cycle` نفسها — لا ازدواج شروط هنا.
+    """
+    t = _perimeter_run["thread"]
+    if t is not None and t.is_alive():
+        return JSONResponse({"ok": False, "running": True,
+                             "error": "دورة قياس جارية — انتظر نتيجتها"},
+                            status_code=409)
+    _perimeter_run["result"] = None
+    _perimeter_run["started_ts"] = time.time()
+    th = threading.Thread(target=_perimeter_worker, daemon=True,
+                          name="perimeter-measure")
+    _perimeter_run["thread"] = th
+    th.start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/api/room/measure/status")
+async def api_room_measure_status():
+    """حالة القياس: جارٍ · نتيجة (بمقارنة المُدخل إن وُجدت غرفة) · لم يبدأ."""
+    t = _perimeter_run["thread"]
+    return {"running": t is not None and t.is_alive(),
+            "result": _perimeter_run["result"],
+            "started_ts": _perimeter_run["started_ts"]}
 
 
 @app.get("/api/calibration")

@@ -38,6 +38,12 @@ h2{font-size:15px;margin:0 0 10px;color:var(--dim);font-weight:600}
 #estop{background:var(--bad);border-color:#7f1d1d;color:#fff;font-weight:800;
   padding:11px 22px;font-size:16px;letter-spacing:.3px}
 #estop:hover{background:#dc2626}
+/* زر الانسحاب: أمر سلامة بارز — دون حدّة الطوارئ (الطوارئ يقتل، هذا يرجع) */
+#withdraw{background:#7c2d12;border-color:#9a3412;color:#fff;font-weight:700;
+  padding:11px 18px;font-size:15px}
+#withdraw:hover{background:#c2410c}
+#cWithdraw{background:#450a0a;border-color:#b91c1c;color:#fecaca;font-weight:700;
+  animation:pulse 1.6s ease-in-out infinite}
 
 /* لافتة «المحركات مفعّلة» — الأبرز على الصفحة حين تظهر */
 .live{display:none;background:linear-gradient(90deg,#7f1d1d,#b91c1c);color:#fff;
@@ -122,7 +128,9 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
   <span class="chip"><span class="dot" id="dRadio"></span><span id="tRadio">الراديو</span></span>
   <span class="chip"><span class="dot" id="dBatt"></span><b id="tBatt">—</b></span>
   <span class="chip" id="cState">—</span>
+  <span class="chip hide" id="cWithdraw">🔴 <b id="tWithdraw">انسحاب</b></span>
   <div class="spacer"></div>
+  <button id="withdraw" title="انسحاب على أثر الدخول عكسياً — أولوية مطلقة على أي هدف مسح">⬅ انسحاب</button>
   <button id="estop">⛔ إيقاف طوارئ</button>
 </div>
 <div class="live" id="liveWarn">⚠ المحركات مفعّلة — الروبوت سيتحرك فعلياً</div>
@@ -319,6 +327,14 @@ $("#estop").onclick = async () => {
   releaseAll();
   await api("/api/manual/command", {cmd:"ESTOP"});   // البوابة نفسها
   await api("/api/mission/estop", {});               // ومسار المهمة
+};
+
+/* ═══ الانسحاب — نفس بوابة الأوامر (لا مسار ثانياً حول السلامة) ═══ */
+$("#withdraw").onclick = async () => {
+  const r = await api("/api/manual/command", {cmd:"WDRAW"});
+  // الرفض يُعرض بسببه (لا مهمة نشطة · بلا قيادة محركات) لا يُبتلع
+  if (r && r.ok === false)
+    addEvent("sys", "⚠ رُفض الانسحاب: " + (r.reason || "سبب مجهول"), Date.now()/1000);
 };
 
 /* ═══ أوامر المهمة ═══ */
@@ -601,6 +617,12 @@ function apply(st){
   ST = st;
   if (st.ui_mode && st.ui_mode.mode !== MODE) applyMode(st.ui_mode.mode);
   $("#liveWarn").classList.toggle("on", !!(st.ui_mode && st.ui_mode.motors_live));
+
+  // مؤشر الانسحاب: «معلّق» قبل أن تخدمه الحلقة، «جارٍ» أثناء التنفيذ
+  const wd = st.withdraw || {};
+  const wdOn = !!(wd.pending || wd.active);
+  $("#cWithdraw").classList.toggle("hide", !wdOn);
+  if (wdOn) $("#tWithdraw").textContent = wd.active ? "انسحاب جارٍ" : "انسحاب معلّق";
 
   // 🔴 الجهد المجهول يُقال «مجهول» لا يُعرض صفراً (الفرق هو كل شيء)
   const b = st.battery || {};

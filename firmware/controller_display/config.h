@@ -1,37 +1,41 @@
 /*
- * config.h — فيرموير شاشة CYD (وحدة تحكم LoRa)
+ * config.h -- CYD display firmware (LoRa controller)
  * ==================================================================
- * كل المنافذ والثوابت هنا حصراً (نفس قاعدة `pi/config.py` على الراسبري).
+ * ALL pins and constants live here exclusively (same rule as
+ * pi/config.py on the Pi).
  *
- * ⚠ المنافذ **منقولة من الفيرموير القديم المجرَّب** على نفس اللوحات:
- *   `legacy/RadiationRover/firmware/controller_display/config.h`.
- *   لم تُخترع أرقام جديدة — هذه عملت فعلاً على هذا العتاد.
+ * The pins are CARRIED OVER FROM THE PROVEN LEGACY FIRMWARE on these
+ * exact boards: legacy/RadiationRover/firmware/controller_display/
+ * config.h. No new numbers were invented -- these actually worked on
+ * this hardware.
  *
- * اختيار الموديل: DISPLAY_MODEL
- *   1 = ESP32-3248S035R: ST7796 320×480، لمس XPT2046، الإضاءة IO27
- *   2 = ESP32-2432S028 : ILI9341 240×320، الإضاءة IO21
- * ملف إعداد TFT_eSPI المطابق في legacy/.../tft_setup/.
+ * Model select: DISPLAY_MODEL
+ *   1 = ESP32-3248S035R: ST7796 320x480, XPT2046 touch, backlight IO27
+ *   2 = ESP32-2432S028 : ILI9341 240x320, backlight IO21
+ * The matching TFT_eSPI setup file is in legacy/.../tft_setup/.
+ *
+ * ASCII only in this file -- see the BiDi note in controller_display.ino.
  */
 #pragma once
 
-#define DISPLAY_MODEL 1        // 1 = 3248S035R (افتراضي) | 2 = 2432S028
+#define DISPLAY_MODEL 1        // 1 = 3248S035R (default) | 2 = 2432S028
 
-// ═══ منافذ حسب الموديل (مجرَّبة) ══════════════════════════════
+// === Pins per model (proven) ==================================
 #if DISPLAY_MODEL == 1
-  #define TFT_BL_PIN     27    // ⚠ الإضاءة الخلفية حصراً — PWM
-  #define LORA_RX_PIN    21    // ← HC-14 TX
-  #define LORA_TX_PIN    22    // → HC-14 RX
+  #define TFT_BL_PIN     27    // backlight ONLY -- PWM
+  #define LORA_RX_PIN    21    // <- HC-14 TX
+  #define LORA_TX_PIN    22    // -> HC-14 RX
 #else
   #define TFT_BL_PIN     21
   #define LORA_RX_PIN    35
   #define LORA_TX_PIN    27
 #endif
 
-// 🔴 يجب أن يطابق `LORA_BAUD` في pi/config.py — عدم التطابق يعطي
-//    أطراً تالفة باستمرار وهو أشيع سبب لـ«الراديو لا يعمل».
+// MUST match LORA_BAUD in pi/config.py -- a mismatch yields endless
+// corrupt frames and is the most common cause of "the radio is dead".
 #define LORA_BAUD       9600
 
-// اللمس XPT2046 — SPI مستقل (مشترك بين الموديلين، عائلة CYD)
+// XPT2046 touch -- its own SPI bus (shared across CYD family models)
 #define TOUCH_CLK_PIN  25
 #define TOUCH_MOSI_PIN 32
 #define TOUCH_MISO_PIN 39
@@ -39,37 +43,41 @@
 #define TOUCH_IRQ_PIN  36
 #define TOUCH_RAW_MIN  200
 #define TOUCH_RAW_MAX  3700
-#define TOUCH_PRESSURE_TH 40   // فوقها = لمسة حقيقية (السكون ~10-17)
+#define TOUCH_PRESSURE_TH 40   // above = real touch (idle noise ~10-17)
 #define TOUCH_SWAP_XY  0
 #define TOUCH_INVERT_X 0
 #define TOUCH_INVERT_Y 0
 
-// ═══ البروتوكول (يطابق pi/comms/protocol.py) ══════════════════
+// === Protocol (must match pi/comms/protocol.py) ===============
 #define MAX_PAYLOAD     56     // = LORA_MAX_PAYLOAD
 #define SEQ_MODULO      1000   // = LORA_SEQ_MODULO
 
-// ═══ إيقاعات ══════════════════════════════════════════════════
+// === Timing ===================================================
 #define TFT_BACKLIGHT_PCT   60
-#define UI_UPDATE_MS        250    // إعادة رسم الحقول المتغيّرة فقط
-// 🔴 تجديد أمر الحركة المضغوط: **أقصر من مهلة الراديو** (2000ms في
-//    pi/config.py). 500ms يعني أن فقدان إطارين متتاليين لا يقطع الأمر.
+#define UI_UPDATE_MS        250    // redraw changed fields only
+// Held-button command refresh: MUST be shorter than the radio command
+// timeout on the Pi (2000ms in pi/config.py). 500ms means losing two
+// consecutive frames still does not cut the motion off.
 #define DRIVE_REPEAT_MS     500
-// بلا أي تيليمتري خلالها ⇒ القناة تُعلَن ميتة (الروبوت يبثّ كل 2ث)
+// No telemetry for this long => the link is declared dead (the robot
+// broadcasts every 2s).
 #define LORA_TIMEOUT_MS     8000
 
-// ═══ كشف وضع الجسر ════════════════════════════════════════════
-// ⚠⚠ **ESP32 الكلاسيكي لا يكشف وصل USB مباشرةً** ⚠⚠
-// اللوحة تستعمل محوّل CH340/CP2102 على UART0، ولا يوجد مكدّس USB أصيل
-// (بخلاف ESP32-S2/S3) — فلا حدث «وُصِل» ولا خط DTR مقروء. و`Serial`
-// تُعيد `true` دائماً على UART عادي، فاستعمالها كـ«هل USB موصول؟» يعطي
-// **جسراً دائماً** ويقتل الوضع المستقل تماماً.
-// ⇒ الكشف **بالحركة لا بالكهرباء**: أول إطار صالح من UART0 يُدخل وضع
-//   الجسر، وصمتٌ بطول BRIDGE_IDLE_MS يُعيد الوضع المستقل. وهذا هو
-//   السلوك المطلوب فعلاً: «هل يقودني حاسوب الآن؟» لا «هل الكبل مركّب؟»
+// === Bridge-mode detection ====================================
+// WARNING: classic ESP32 CANNOT detect a USB cable electrically.
+// These boards use a CH340/CP2102 adapter on UART0 and there is no
+// native USB stack (unlike ESP32-S2/S3) -- no "attached" event, no
+// readable DTR line. And `Serial` evaluates true ALWAYS on a plain
+// UART, so using it as "is USB plugged in?" gives permanent bridge
+// mode and kills standalone mode entirely.
+// => Detect by TRAFFIC, not electricity: the first valid frame on
+//    UART0 enters bridge mode; BRIDGE_IDLE_MS of silence returns to
+//    standalone. This is also the semantically right question:
+//    "is a computer driving me right now?" not "is a cable attached?"
 #define BRIDGE_IDLE_MS      5000
-#define USB_BAUD            115200 // باود المتصفح ↔ الشاشة (Web Serial)
+#define USB_BAUD            115200 // browser <-> display baud (Web Serial)
 
-// ═══ ألوان الواجهة (داكنة — تطابق لوحة الموقع) ════════════════
+// === UI colors (dark -- matches the web dashboard) ============
 #define COL_BG      0x0861     // #0b0f17
 #define COL_PANEL   0x18C3     // #131a26
 #define COL_LINE    0x2247     // #243149

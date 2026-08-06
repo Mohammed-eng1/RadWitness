@@ -21,7 +21,7 @@ from pi.comms.protocol import (
     ProtocolError, SequenceGuard, build_frame, parse_frame, xor_checksum,
     encode_command, decode_command, encode_telemetry, decode_telemetry,
     encode_ack, RADIO_COMMANDS, ACK_SAFE, ACK_BADCMD, ACK_BUSY, ACK_BADSEQ,
-    ACK_BADCRC, ACK_OK,
+    ACK_BADCRC, ACK_OK, ACK_FAULT,
 )
 from pi.config import (
     MANUAL_POWER_MAX, MANUAL_POWER_MIN, MANUAL_HEARTBEAT_S,
@@ -102,6 +102,8 @@ class FakeMission:
                          "ir_mid": 1}
         self.estopped = 0
         self.returned_home = 0
+        self.withdraw_reqs = []
+        self.withdraw_ok = True
 
     def sensors(self):
         return dict(self._sensors)
@@ -113,6 +115,13 @@ class FakeMission:
 
     def return_home(self):
         self.returned_home += 1
+
+    def request_withdraw(self, until_cpm=None, reason=""):
+        self.withdraw_reqs.append(reason)
+        if self.withdraw_ok:
+            return {"ok": True, "until_cpm": until_cpm, "reason": reason}
+        return {"ok": False,
+                "error": "طلب انسحاب بلا قيادة محركات — لا حركة تُنفَّذ"}
 
     def _log(self, kind, msg):
         self.events.append((kind, msg))
@@ -159,10 +168,12 @@ def main() -> None:
 
     # ═══ ب) 🔴 القائمة المغلقة ════════════════════════════════════
     section("ب) القائمة المغلقة:")
-    check("القائمة هي الثمانية المتفق عليها بالضبط",
+    check("القائمة هي التسعة المتفق عليها بالضبط (الثمانية + WDRAW)",
           RADIO_COMMANDS == {"FWD", "BACK", "LEFT", "RIGHT", "STOP",
-                             "ESTOP", "STATUS", "RTH"},
+                             "ESTOP", "STATUS", "RTH", "WDRAW"},
           str(sorted(RADIO_COMMANDS)))
+    check("WDRAW يُفكّ كأي أمر من القائمة",
+          decode_command("C,3,WDRAW,0,0").cmd == "WDRAW")
     c = decode_command(parse_frame(encode_command(7, "FWD", 0.3)))
     check("أمر سليم يُفكّ بحقوله", c.seq == 7 and c.cmd == "FWD" and c.p1 == 0.3,
           str(c))
@@ -293,6 +304,30 @@ def main() -> None:
     m.sensors = lambda: dict(m._sensors)
     m.reactive.decision = {"action": "go", "speed": 0.4, "priority": "clear",
                            "rung": "≥100سم", "reason": "سالك", "unknown": []}
+
+    # ── WDRAW: انسحاب عبر البوابة نفسها ──────────────────────────
+    r = mc.command("WDRAW")
+    check("🔴 WDRAW بلا مهمة نشطة يُرفض (علم معلّق يفاجئ المهمة التالية)",
+          not r["ok"] and r["ack"] == ACK_BUSY and not m.withdraw_reqs,
+          r["reason"])
+    m.state = "running"
+    r = mc.command("WDRAW", source=SOURCE_RADIO)
+    check("🔴 WDRAW أثناء مهمة يصل إلى `mission.request_withdraw` فعلاً",
+          r["ok"] and len(m.withdraw_reqs) == 1, str(m.withdraw_reqs))
+    check("ومصدر الأمر (راديو) داخل سبب الانسحاب المسجَّل",
+          "راديو" in m.withdraw_reqs[0], m.withdraw_reqs[0])
+    mc.set_enabled(False)
+    r = mc.command("WDRAW")
+    check("والقيادة اليدوية **ليست شرطاً** — أمر سلامة يمرّ والنمط مغلق",
+          r["ok"] and len(m.withdraw_reqs) == 2, r.get("reason", ""))
+    mc.set_enabled(True)
+    m.withdraw_ok = False
+    r = mc.command("WDRAW")
+    check("ورفض المهمة (بلا قيادة محركات) يصل بسببه لا يُبتلع",
+          not r["ok"] and r["ack"] == ACK_FAULT and "قيادة محركات" in r["reason"],
+          r["reason"])
+    m.withdraw_ok = True
+    m.state = "idle"
 
     # ═══ و) حدّ القوة و ESTOP ═════════════════════════════════════
     section("و) حدّ القوة والإيقاف:")
@@ -486,6 +521,19 @@ def main() -> None:
           max(abs(v) for v in real.rover._cmd_lr) <= MAX_MOTOR_POWER,
           f"_cmd_lr={real.rover._cmd_lr}")
 
+    # WDRAW على المهمة الحقيقية: في المحاكاة `drive_motors=False`، فالرفض
+    # المتوقَّع يأتي **من المهمة نفسها** بسببها المقروء — أي أن النداء وصل
+    # فعلاً إلى `request_withdraw` الحقيقية لا إلى مزدوجة (قاعدة التوصيل).
+    real.state = "running"
+    r = rmc.command("WDRAW")
+    check("🔴 WDRAW يبلغ `request_withdraw` الحقيقية (رفضها يعود بسببها)",
+          not r["ok"] and r["ack"] == ACK_FAULT and "قيادة محركات" in r["reason"],
+          r["reason"])
+    check("وطلب الانسحاب مسجَّل في أحداث المهمة الحقيقية",
+          any(e["kind"] == "withdraw_request" for e in real.events),
+          str([e["kind"] for e in real.events[-3:]]))
+    real.state = "idle"
+
     rmc.command("ESTOP")
     check("🔴 ESTOP يغيّر حالة المهمة الحقيقية إلى estop",
           real.state == "estop", real.state)
@@ -529,6 +577,33 @@ def main() -> None:
     # اختبار الفيرموير ويُقارن آلياً بدل الاعتماد على المراجعة البصرية.
     # (وقع فعلاً: C++ كان يكتب `0.30` وبايثون `0.3`.)
     section("ك) تطابق فيرموير الشاشة (C++) مع بايثون:")
+
+    # 🔴 حارس ASCII: تعليق عربي واحد في C++ كسر ترجمة Arduino فعلاً
+    # (BiDi يخلط ترتيب المحارف فيقع `//` في غير موضعه — والخطأ يشير إلى
+    # سطر بريء). بايثون تتحمّل العربية، ومترجم Arduino لا. هذا الفحص
+    # يمسك التسرّب **قبل** أي مترجم وعلى كل منصة.
+    from pathlib import Path as _P
+    _fw_root = _P(__file__).resolve().parents[2] / "firmware" / "controller_display"
+    for _f in sorted(_fw_root.rglob("*")):
+        if _f.suffix not in (".ino", ".h", ".cpp"):
+            continue
+        _raw = _f.read_bytes()
+        _bad = [i for i, b in enumerate(_raw) if b > 127]
+        check(f"🔴 ASCII صرف (لا عربية/BiDi): {_f.name}",
+              not _bad,
+              f"أول بايت غير ASCII عند الإزاحة {_bad[0]}" if _bad else
+              f"{len(_raw)} بايت كلها ASCII")
+
+    _ino = _arduino_compile(_fw_root)
+    if _ino is None:
+        print("  ⏭  ترجمة الفيرموير الكاملة تُخطّى: لا arduino-cli أو لا نواة esp32")
+        print("     يدوياً: arduino-cli compile --fqbn esp32:esp32:esp32 "
+              "firmware/controller_display")
+    else:
+        ok_c, err_c = _ino
+        check("🔴 الفيرموير الكامل يُترجَم بلا خطأ (arduino-cli)", ok_c,
+              err_c[:120] if not ok_c else "compile OK")
+
     firm = _run_firmware_vectors()
     if firm is None:
         print("  ⏭  تُخطّى: لا مترجم g++ (تُشغَّل على جهاز فيه مترجم)")
@@ -539,7 +614,8 @@ def main() -> None:
         expect = [encode_command(s, c, p) for s, c, p in (
             (1, "FWD", 0.30), (7, "FWD", 0.0), (42, "ESTOP", 0.0),
             (999, "STOP", 0.5), (123, "RTH", 0.25), (0, "STATUS", 0.0),
-            (500, "LEFT", 0.4), (12, "BACK", 0.1), (1001, "RIGHT", 1.0))]
+            (500, "LEFT", 0.4), (12, "BACK", 0.1), (1001, "RIGHT", 1.0),
+            (77, "WDRAW", 0.0))]
         for got, want in zip(cmds, expect):
             check(f"إطار متطابق بايتاً ببايت: {want.strip()}",
                   got == want.rstrip("\n"), f"الفيرموير: {got}")
@@ -579,6 +655,33 @@ def main() -> None:
     print(f"\n=== النتيجة: {_passed}/{_passed + _failed} نجح ===")
     if _failed:
         sys.exit(1)
+
+
+def _arduino_compile(fw_root):
+    """
+    يترجم الفيرموير كاملاً بـarduino-cli إن توفّرت الأداة **ونواة esp32**.
+
+    يُعيد None عند غياب أيّهما (تخطٍّ معلَن لا نجاح صامت) — أما إذا توفّرا
+    وفشلت الترجمة فهذا **فشل حقيقي**: على الجهاز المجهّز للرفع هذا بالضبط
+    ما نريد أن يصرخ قبل محاولة الرفع لا أثناءها.
+    """
+    import shutil
+    import subprocess
+
+    cli = shutil.which("arduino-cli")
+    if cli is None:
+        return None
+    try:
+        cores = subprocess.run([cli, "core", "list"], capture_output=True,
+                               text=True, timeout=30).stdout
+        if "esp32:esp32" not in cores:
+            return None
+        r = subprocess.run(
+            [cli, "compile", "--fqbn", "esp32:esp32:esp32", str(fw_root)],
+            capture_output=True, text=True, timeout=600)
+        return (r.returncode == 0, (r.stderr or r.stdout))
+    except Exception as e:                          # noqa: BLE001
+        return (False, f"تعذّر تشغيل arduino-cli: {e}")
 
 
 def _run_firmware_vectors():

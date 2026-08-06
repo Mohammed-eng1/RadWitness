@@ -153,6 +153,27 @@ def main() -> None:
     check("حالة البوابة والراديو مكشوفة للواجهة",
           "manual" in st and "lora" in st)
 
+    # ── الانسحاب عبر نفس البوابة ─────────────────────────────────
+    r = c.post("/api/manual/command", json={"cmd": "WDRAW"}).json()
+    check("🔴 WDRAW بلا مهمة نشطة يُرفض بسبب مقروء (لا علم كامناً)",
+          not r["ok"] and "لا مهمة نشطة" in r["reason"], r["reason"])
+    mission.state = "running"
+    r = c.post("/api/manual/command", json={"cmd": "WDRAW"}).json()
+    check("🔴 WDRAW أثناء مهمة يمرّ عبر HTTP إلى `request_withdraw`",
+          "ack" in r and ("ok" in r), f"ack={r.get('ack')} — {str(r.get('reason'))[:60]}")
+    # في المحاكاة drive_motors=False ⇒ ترفضه المهمة بسببها — وهذا إثبات
+    # الوصول (قاعدة التوصيل): السبب صادر من mission لا من البوابة.
+    check("وسبب المهمة الحقيقية يصل إلى الواجهة كما هو",
+          "قيادة محركات" in str(r.get("reason", "")), str(r.get("reason"))[:70])
+    mission.state = "idle"
+    full = c.get("/api/sim/status").json()
+    check("حالة الانسحاب (pending/active) داخل البثّ للشريط العلوي",
+          "withdraw" in full and "pending" in full["withdraw"]
+          and "active" in full["withdraw"], str(full.get("withdraw")))
+    html = c.get("/").text
+    check("زر الانسحاب موجود في الواجهة ويمرّ بالبوابة",
+          'id="withdraw"' in html and '"WDRAW"' in html.replace("'", '"'))
+
     # ═══ و) الكاميرا: بثّ عند الطلب فقط ═══════════════════════════
     section("و) بثّ الكاميرا:")
     r = c.get("/stream.mjpg")
@@ -256,6 +277,52 @@ def main() -> None:
     check("🔴 ولا تدّعي «مفعّلة» والجسر في sim (التحذير يفقد معناه)",
           full["ui_mode"]["motors_live"] is False,
           f"rover={full['ui_mode']['rover_mode']}")
+
+    # ═══ ط) توصيل الألترا سونيك الجانبي (§1.2 — كان بلا مسار حقن) ══
+    section("ط) توصيل الألترا سونيك الجانبي:")
+    boot = c.get("/api/boot").json()
+    check("خلاصة الإقلاع تعلن حالة المصفوفة الجانبية بسببها",
+          "side_ultrasonic" in boot["health"]
+          and boot["health"]["side_ultrasonic"]["error"],
+          str(boot["health"]["side_ultrasonic"])[:70])
+
+    r = srv.init_side_ultrasonic(mission, enabled=False)
+    check("🔴 العلم مطفأ ⇒ لا بناء ولا حجز منفذ، والسبب معلَن (§6.1)",
+          not r["ok"] and r.get("skipped") and "SIDE_ULTRASONIC" in r["reason"],
+          r["reason"])
+
+    prev_arr = getattr(mission, "us_array", None)
+    r = srv.init_side_ultrasonic(mission, enabled=True)
+    check("🔴 العلم مضاء ⇒ تُبنى المصفوفة **وتُحقن** عبر set_side_ultrasonic",
+          getattr(mission, "us_array", None) is r.get("array")
+          and r.get("array") is not None, str(r.get("error"))[:60])
+    check("وعلى ويندوز بلا lgpio: معطّلة بسبب مقروء لا انهيار",
+          r["ok"] is False and r.get("error"),
+          str(r.get("error"))[:60])
+    mission.set_side_ultrasonic(prev_arr)   # إعادة الحال — لا أثر جانبي
+
+    # ═══ ي) قياس أبعاد الغرفة تلقائياً (run_perimeter_cycle) ═══════
+    section("ي) قياس أبعاد الغرفة:")
+    import time as _t
+    r = c.post("/api/room/measure").json()
+    check("🔴 زر القياس يبدأ الدورة في الخلفية (لا معالج HTTP معلَّق)",
+          r.get("ok") and r.get("started"), str(r))
+    for _ in range(40):                     # في المحاكاة يُرفض فوراً
+        st = c.get("/api/room/measure/status").json()
+        if not st["running"] and st["result"] is not None:
+            break
+        _t.sleep(0.05)
+    check("والنتيجة تصل عبر نقطة الحالة",
+          st["result"] is not None, str(st)[:60])
+    # في المحاكاة drive_motors=False ⇒ الرفض يأتي من المهمة **بسببها** —
+    # إثبات أن `run_perimeter_cycle` الحقيقية هي المستدعاة (قاعدة التوصيل).
+    check("🔴 والرفض المبكر بسبب `run_perimeter_cycle` الحقيقية المقروء",
+          st["result"].get("ok") is False
+          and "قيادة محركات" in str(st["result"].get("reason")),
+          str(st["result"].get("reason")))
+    html_sim = c.get("/sim").text
+    check("وزر «قِس الأبعاد تلقائياً» موجود في إعداد الغرفة",
+          'id="btnMeasure"' in html_sim and "room/measure" in html_sim)
 
     print(f"\n=== النتيجة: {_passed}/{_passed + _failed} نجح ===")
     if _failed:

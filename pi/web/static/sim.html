@@ -164,7 +164,11 @@
         <select id="calibSel"><option value="">— لا يوجد —</option></select>
         <button class="btn" id="btnNewCalib">＋ معايرة جديدة (محاكاة)</button>
         <button class="btn primary" id="btnRoom">🗺️ إنشاء الغرفة</button>
+        <button class="btn" id="btnMeasure"
+                title="دورة المحيط: يتبع الجدار أربع لفّات ويقيس أبعاد الغرفة فعلياً ويقارنها بالمُدخل — يحتاج ألترا سونيك جانبياً وقيادة محركات">
+          📐 قِس الأبعاد تلقائياً</button>
         <div class="hint" id="roomMsg"></div>
+        <div class="hint" id="measureMsg"></div>
       </div>
 
       <div class="card">
@@ -700,6 +704,34 @@
     if(r.ok){setGrid(r.grid);$("roomMsg").textContent="الغرفة جاهزة — "+r.grid.rows+"×"+r.grid.cols+" خلية";
       $("roomMsg").style.color="var(--ok)";updateButtons();}
     else{$("roomMsg").textContent="خطأ: "+r.error;$("roomMsg").style.color="var(--bad)";}
+  };
+
+  // ── قياس الأبعاد تلقائياً (دورة المحيط) ────────────────────────
+  // الدورة تجري في خيط خلفي على السيرفر (قد تطول دقائق على العتاد)،
+  // فالزر يبدأها ثم تُستطلع النتيجة دورياً. الرفض المبكر يظهر فوراً بسببه.
+  let _measPoll=null;
+  function _measShow(txt,color){$("measureMsg").textContent=txt;
+    $("measureMsg").style.color=color||"var(--fg)";}
+  function _measResult(res){
+    if(!res){_measShow("");return;}
+    if(!res.ok&&res.reason){_measShow("⛔ "+res.reason,"var(--bad)");return;}
+    const s=res.summary||{};
+    let txt="✅ القياس اكتمل";
+    if(s.width_m!=null&&s.length_m!=null)
+      txt+=" — المقاس: "+s.width_m+"×"+s.length_m+" م";
+    if(res.self_check&&res.self_check.reason) txt+=" · "+res.self_check.reason;
+    _measShow(txt, res.self_check&&res.self_check.ok===false?"var(--warn)":"var(--ok)");
+  }
+  $("btnMeasure").onclick=async()=>{
+    const r=await api("/api/room/measure",{});
+    if(!r.ok){_measShow("⛔ "+(r.error||"تعذّر البدء"),"var(--bad)");return;}
+    _measShow("⏳ دورة القياس جارية — يتبع الجدار أربع لفّات…","var(--fg)");
+    clearInterval(_measPoll);
+    _measPoll=setInterval(async()=>{
+      const st=await fetch("/api/room/measure/status").then(x=>x.json()).catch(()=>null);
+      if(!st) return;
+      if(!st.running){clearInterval(_measPoll);_measResult(st.result);}
+    },1500);
   };
   async function loadCalib(){
     const r=await fetch("/api/calibration").then(x=>x.json());

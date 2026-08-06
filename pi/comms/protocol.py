@@ -30,8 +30,9 @@ protocol.py — بروتوكول الراديو (منطق خالص بلا عتا
 
 ## 🔴 قائمة الأوامر **مغلقة**
 
-`FWD · BACK · LEFT · RIGHT · STOP · ESTOP · STATUS · RTH` — لا أوامر
-مركّبة ولا تنفيذ نصوص حرّة. أي شيء خارجها يُرفض **ويُسجَّل بسببه**.
+`FWD · BACK · LEFT · RIGHT · STOP · ESTOP · STATUS · RTH · WDRAW` — لا
+أوامر مركّبة ولا تنفيذ نصوص حرّة. أي شيء خارجها يُرفض **ويُسجَّل بسببه**.
+(`WDRAW` = طلب انسحاب: أولوية مطلقة في المهمة، يسير على أثر الدخول عكسياً.)
 
 ## 🔴 منع إعادة الإرسال
 
@@ -109,11 +110,12 @@ CMD_STOP = "STOP"
 CMD_ESTOP = "ESTOP"
 CMD_STATUS = "STATUS"
 CMD_RTH = "RTH"
+CMD_WITHDRAW = "WDRAW"   # انسحاب على أثر الدخول — أمر سلامة لا حركة مباشرة
 
 #: القائمة المغلقة — أي أمر خارجها يُرفض ويُسجَّل.
 RADIO_COMMANDS = frozenset({
     CMD_FWD, CMD_BACK, CMD_LEFT, CMD_RIGHT,
-    CMD_STOP, CMD_ESTOP, CMD_STATUS, CMD_RTH,
+    CMD_STOP, CMD_ESTOP, CMD_STATUS, CMD_RTH, CMD_WITHDRAW,
 })
 
 #: الأوامر التي **تحرّك المحركات** — وحدها تمرّ ببوابة السلامة.

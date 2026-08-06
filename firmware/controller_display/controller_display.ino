@@ -1,26 +1,40 @@
 /*
- * controller_display.ino — وحدة تحكم LoRa على شاشة CYD
- * ==================================================================
- * دورها في المنظومة: **قناة طوارئ مستقلة عن الإنترنت وTailscale**.
+ * controller_display.ino -- LoRa controller on a CYD (Cheap Yellow Display)
+ * ==========================================================================
+ * Role in the system: an EMERGENCY CHANNEL fully independent of the
+ * internet and Tailscale.
  *
- *     المتصفح ──USB──> هذه الشاشة ──LoRa──> HC-14 على الراسبري ──> الروبوت
+ *     Browser --USB--> this display --LoRa--> HC-14 on the Pi --> robot
  *
- * ⚠ **ليست نسخة من الفيرموير القديم**: القديم (legacy/…/controller_display)
- *   يبني WiFi + WebServer + mDNS + WebSocket + موقعاً مضمّناً — وكلها
- *   تعتمد على الشبكة، أي على ما وُجدت هذه القناة لتعمل **بدونه**. المنقول
- *   منه هو ما يستحق النقل: خريطة المنافذ المجرَّبة ومنطق اللمس (config.h).
+ * NOTE: this is NOT a copy of the legacy firmware. The legacy one
+ * (legacy/RadiationRover/firmware/controller_display) builds WiFi +
+ * WebServer + mDNS + WebSocket + an embedded site -- all of which depend
+ * on the network, i.e. on exactly what this channel must work WITHOUT.
+ * What was carried over is what deserved it: the proven pin map and the
+ * touch handling logic (config.h).
  *
- * ── وضعان، والكشف بالحركة ─────────────────────────────────────
- *  1) **مستقل**: أزرار اللمس ترسل أوامر عبر LoRa مباشرة (وحدة تحكم كاملة).
- *  2) **جسر**:   يمرّر بين المتصفح (USB) والراديو في الاتجاهين.
- *  الانتقال: أول إطار صالح من USB ⇒ جسر · صمت BRIDGE_IDLE_MS ⇒ مستقل.
- *  (سبب عدم الاعتماد على كشف USB كهربائياً مشروح في config.h.)
+ * -- Two modes, detected by traffic ---------------------------------
+ *  1) STANDALONE: touch buttons send commands directly over LoRa
+ *     (a complete handheld controller).
+ *  2) BRIDGE: when driven by a computer over USB, it relays frames
+ *     between the browser and the radio in both directions.
+ *  Transition: first valid frame from USB => bridge; silence longer
+ *  than BRIDGE_IDLE_MS => back to standalone. (Why we cannot detect the
+ *  USB cable electrically is explained in config.h.)
  *
- * ── تُعرض: CPM · الجهد · حالة الاتصال · آخر أمر · مؤشّر الوضع ──
+ * -- Shown on screen: CPM, voltage, link state, last command, mode --
  *
- * المكتبات: TFT_eSPI + XPT2046_Touchscreen (لا WiFi ولا JSON — القناة ضيقة)
- * الترجمة: لوحة "ESP32 Dev Module" + إعداد TFT_eSPI من
- *          legacy/RadiationRover/firmware/controller_display/tft_setup/
+ * IMPORTANT: all comments and string literals in this firmware must be
+ * plain ASCII English. Arabic (RTL/BiDi) text in C++ sources reorders
+ * invisibly in editors and has broken the Arduino build before
+ * ("expected ')' before ';'" pointing at a comment line). Arabic is
+ * fine in Python and Markdown -- never here. An automated ASCII guard
+ * in pi/comms/selftest.py enforces this.
+ *
+ * Libraries: TFT_eSPI + XPT2046_Touchscreen (no WiFi, no JSON -- the
+ * channel is narrow).
+ * Build: board "ESP32 Dev Module" + the TFT_eSPI setup file from
+ *        legacy/RadiationRover/firmware/controller_display/tft_setup/
  */
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -34,11 +48,11 @@ SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen ts(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 HardwareSerial loraSerial(2);
 
-// ═══ الحالة المعروضة ══════════════════════════════════════════
+// === Displayed state ==========================================
 long     dCpm      = 0;
-long     dMv       = -1;        // -1 = مجهول (**لا يُعرض صفراً**)
+long     dMv       = -1;        // -1 = unknown (NEVER shown as zero)
 char     dState[10] = "?";
-char     dLastCmd[12] = "—";
+char     dLastCmd[12] = "-";
 char     dLastAck[10] = "";
 bool     bridgeMode = false;
 uint32_t lastUsbFrameMs = 0;
@@ -47,11 +61,11 @@ uint16_t txSeq          = 0;
 uint32_t lastUiMs       = 0;
 bool     uiDirty        = true;
 
-// الزرّ المضغوط حالياً (الضغط المستمر يحرّك)
+// Currently held button (press-and-hold keeps the robot moving)
 int      heldBtn        = -1;
 uint32_t lastRepeatMs   = 0;
 
-// ═══ الأزرار ══════════════════════════════════════════════════
+// === Buttons ==================================================
 struct Btn { int x, y, w, h; const char *label; const char *cmd; uint16_t col; };
 #define NBTN 8
 Btn btns[NBTN];
@@ -59,21 +73,24 @@ int HDR = 0, PANEL_H = 0;
 
 bool loraLink() { return (millis() - lastLoraRxMs) < LORA_TIMEOUT_MS; }
 
-// ═══ التخطيط ══════════════════════════════════════════════════
+// === Layout ===================================================
 void layout() {
   int W = tft.width(), H = tft.height();
-  HDR = 96;                                  // لوحة القراءات أعلى
+  HDR = 96;                                  // readings panel on top
   int gy = HDR + 6;
   int gh = H - gy - 6;
   int cw = W / 3, ch = gh / 3;
 
-  // صفّ 1: ⟲ | ▲ | ⟳          صفّ 2: ◀ | STOP | ▶
-  // صفّ 3: ▼ | ESTOP | RTH
+  // Row 1: < | ^ | >   Row 2: WDRW | STOP | RTH   Row 3: v | ESTOP(x2)
+  // WDRW (withdraw) replaces STAT deliberately: telemetry is broadcast
+  // periodically anyway, while withdraw is a safety order the operator
+  // must be able to issue from the standalone handheld -- this screen
+  // may be their only channel when the network is down.
   int i = 0;
   btns[i++] = { 0,      gy,          cw, ch, "<",     "LEFT",   COL_PANEL };
   btns[i++] = { cw,     gy,          cw, ch, "^",     "FWD",    COL_PANEL };
   btns[i++] = { cw * 2, gy,          cw, ch, ">",     "RIGHT",  COL_PANEL };
-  btns[i++] = { 0,      gy + ch,     cw, ch, "STAT",  "STATUS", COL_PANEL };
+  btns[i++] = { 0,      gy + ch,     cw, ch, "WDRW",  "WDRAW",  0x6300 };
   btns[i++] = { cw,     gy + ch,     cw, ch, "STOP",  "STOP",   0x5000 };
   btns[i++] = { cw * 2, gy + ch,     cw, ch, "RTH",   "RTH",    COL_PANEL };
   btns[i++] = { 0,      gy + ch * 2, cw, ch, "v",     "BACK",   COL_PANEL };
@@ -94,18 +111,18 @@ void drawButtons() {
   tft.setTextDatum(TL_DATUM);
 }
 
-// ═══ لوحة القراءات ════════════════════════════════════════════
+// === Readings panel ===========================================
 void drawHeader() {
   tft.fillRect(0, 0, tft.width(), HDR, COL_PANEL);
   tft.drawFastHLine(0, HDR - 1, tft.width(), COL_LINE);
   tft.setTextDatum(TL_DATUM);
 
-  // الوضع — بارز دائماً (مطلوب صراحةً)
+  // Mode indicator -- always prominent (explicit requirement)
   tft.setTextSize(2);
   tft.setTextColor(bridgeMode ? COL_ACCENT : COL_OK, COL_PANEL);
   tft.drawString(bridgeMode ? "BRIDGE" : "STANDALONE", 8, 8);
 
-  // حالة القناة
+  // Link state
   bool up = loraLink();
   tft.setTextColor(up ? COL_OK : COL_BAD, COL_PANEL);
   tft.setTextSize(2);
@@ -118,21 +135,23 @@ void drawHeader() {
   snprintf(buf, sizeof(buf), "%ld CPM", dCpm);
   tft.drawString(buf, 8, 34);
 
-  // الجهد — 🔴 مجهول يُكتب "-- V" لا "0.00V"
+  // Voltage -- unknown is printed "-- V", NEVER "0.00V" (a zero reading
+  // is a catastrophe and "don't know" is not; the difference is the
+  // whole point of the -1 sentinel).
   tft.setTextSize(2);
   if (dMv < 0) {
     tft.setTextColor(COL_DIM, COL_PANEL);
     tft.drawString("-- V", tft.width() - 118, 40);
   } else {
     float v = dMv / 1000.0f;
-    // ألوان عتبات 3S (تطابق pi/config.py)
+    // 3S threshold colors (must match pi/config.py)
     uint16_t c = (v >= 11.5f) ? COL_OK : (v >= 10.8f) ? COL_WARN : COL_BAD;
     tft.setTextColor(c, COL_PANEL);
     snprintf(buf, sizeof(buf), "%.2f V", v);
     tft.drawString(buf, tft.width() - 118, 40);
   }
 
-  // آخر أمر + إقراره
+  // Last command + its ack
   tft.setTextSize(2);
   tft.setTextColor(COL_DIM, COL_PANEL);
   snprintf(buf, sizeof(buf), "%s %s  [%s]", dLastCmd,
@@ -142,23 +161,23 @@ void drawHeader() {
 
 void redraw() { drawHeader(); drawButtons(); }
 
-// ═══ الإرسال ══════════════════════════════════════════════════
+// === Transmit =================================================
 void sendCommand(const char *cmd, float p1) {
-  if (!isAllowedCommand(cmd)) return;         // 🔴 لا شيء خارج القائمة
+  if (!isAllowedCommand(cmd)) return;         // nothing outside the closed list
   char frame[MAX_PAYLOAD + 8];
   txSeq = (txSeq + 1) % SEQ_MODULO;
   if (!buildCommand(txSeq, cmd, p1, frame, sizeof(frame))) return;
   loraSerial.print(frame);
   strncpy(dLastCmd, cmd, sizeof(dLastCmd) - 1);
   dLastCmd[sizeof(dLastCmd) - 1] = 0;
-  dLastAck[0] = 0;                            // ننتظر إقراراً جديداً
+  dLastAck[0] = 0;                            // await a fresh ack
   uiDirty = true;
 }
 
-// ═══ استقبال من الراديو ═══════════════════════════════════════
+// === Receive from the radio ===================================
 void handleLoraLine(const char *line) {
   char payload[MAX_PAYLOAD + 1];
-  if (!parseFrame(line, payload, sizeof(payload))) return;   // تالف ⇒ تجاهل
+  if (!parseFrame(line, payload, sizeof(payload))) return;   // corrupt => drop
   lastLoraRxMs = millis();
 
   if (payload[0] == 'T') {
@@ -174,28 +193,30 @@ void handleLoraLine(const char *line) {
     if (parseAck(payload, code, sizeof(code))) {
       strncpy(dLastAck, code, sizeof(dLastAck) - 1);
       dLastAck[sizeof(dLastAck) - 1] = 0;
-      uiDirty = true;                         // الرفض يظهر لا يُبتلع
+      uiDirty = true;                         // rejections are shown, not swallowed
     }
   }
-  // في وضع الجسر: مرّر كل ما وصل إلى المتصفح كما هو
+  // In bridge mode: relay everything received to the browser verbatim
   if (bridgeMode) { Serial.print(line); Serial.print('\n'); }
 }
 
-// ═══ استقبال من USB (المتصفح) ═════════════════════════════════
+// === Receive from USB (the browser) ===========================
 void handleUsbLine(const char *line) {
   char payload[MAX_PAYLOAD + 1];
   if (!parseFrame(line, payload, sizeof(payload))) return;
-  // ⚠ إطار صالح من USB = «يقودني حاسوب الآن» ⇒ وضع الجسر
+  // A valid frame from USB means "a computer is driving me now" => bridge
   lastUsbFrameMs = millis();
   if (!bridgeMode) { bridgeMode = true; uiDirty = true; }
-  // 🔴 يُمرَّر كما هو **بلا تفسير ولا توليد أوامر**: التحقق النهائي عند
-  //    الراسبري (تسلسل + checksum + قائمة مغلقة + طبقة سلامة). الجسر
-  //    ناقل لا سلطة — وأي «ذكاء» هنا يصير حارساً ثانياً يجب صيانته.
+  // Relayed VERBATIM -- no interpretation, no command synthesis. Final
+  // validation happens on the Pi (sequence + checksum + closed list +
+  // safety layer). The bridge is a carrier, not an authority -- any
+  // "smarts" here would become a second guard that someone must
+  // maintain, and one of the two would eventually be forgotten.
   loraSerial.print(line);
   loraSerial.print('\n');
 }
 
-// ═══ قراءة سطر من منفذ (بلا حجب) ══════════════════════════════
+// === Line reader for a port (non-blocking) ====================
 template <typename S>
 void pump(S &port, char *buf, size_t cap, size_t &len, void (*cb)(const char *)) {
   while (port.available()) {
@@ -205,7 +226,7 @@ void pump(S &port, char *buf, size_t cap, size_t &len, void (*cb)(const char *))
     } else if (len < cap - 1) {
       buf[len++] = ch;
     } else {
-      len = 0;                                // سطر أطول من الحدّ ⇒ اطرحه
+      len = 0;                                // line exceeds cap => discard it
     }
   }
 }
@@ -213,7 +234,7 @@ void pump(S &port, char *buf, size_t cap, size_t &len, void (*cb)(const char *))
 char usbBuf[96];  size_t usbLen  = 0;
 char loraBuf[96]; size_t loraLen = 0;
 
-// ═══ اللمس ════════════════════════════════════════════════════
+// === Touch ====================================================
 int btnAt(int x, int y) {
   for (int i = 0; i < NBTN; ++i) {
     Btn &b = btns[i];
@@ -246,7 +267,8 @@ void handleTouch() {
         lastRepeatMs = millis();
         uiDirty = true;
       } else if (i >= 0) {
-        // الضغط المستمر يحرّك: جدّد الأمر قبل انتهاء مهلة الراديو
+        // Press-and-hold keeps moving: refresh the command before the
+        // radio command timeout (2s on the Pi) can cut it off.
         if (millis() - lastRepeatMs >= DRIVE_REPEAT_MS) {
           sendCommand(btns[i].cmd, 0.30f);
           lastRepeatMs = millis();
@@ -255,7 +277,8 @@ void handleTouch() {
     }
   }
   if (!touched && heldBtn >= 0) {
-    // 🔴 رفع الإصبع عن زرّ حركة ⇒ **إيقاف فوري** لا انتظار المهلة
+    // Finger lifted off a motion button => IMMEDIATE stop, not "wait
+    // for the timeout to notice".
     const char *c = btns[heldBtn].cmd;
     bool motion = (strcmp(c, "FWD") == 0 || strcmp(c, "BACK") == 0 ||
                    strcmp(c, "LEFT") == 0 || strcmp(c, "RIGHT") == 0);
@@ -265,9 +288,9 @@ void handleTouch() {
   }
 }
 
-// ═══ setup / loop ═════════════════════════════════════════════
+// === setup / loop =============================================
 void setup() {
-  Serial.begin(USB_BAUD);                       // ← المتصفح (Web Serial)
+  Serial.begin(USB_BAUD);                       // <- browser (Web Serial)
   loraSerial.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
 
   pinMode(TFT_BL_PIN, OUTPUT);
@@ -289,14 +312,15 @@ void loop() {
   pump(Serial, usbBuf, sizeof(usbBuf), usbLen, handleUsbLine);
   pump(loraSerial, loraBuf, sizeof(loraBuf), loraLen, handleLoraLine);
 
-  // انقضاء صمت USB ⇒ العودة إلى الوضع المستقل (الكشف بالحركة)
+  // USB silence elapsed => back to standalone (detection by traffic)
   if (bridgeMode && (millis() - lastUsbFrameMs) > BRIDGE_IDLE_MS) {
     bridgeMode = false;
     uiDirty = true;
   }
 
-  // ⚠ اللمس يعمل في **الوضعين**: زرّ الطوارئ على الجهاز يجب ألّا يتعطّل
-  //   لأن حاسوباً موصول — وهو أضمن مسار حين يتجمّد المتصفح.
+  // Touch works in BOTH modes: the on-device emergency button must not
+  // go dead just because a computer is attached -- it is the most
+  // reliable path exactly when the browser freezes.
   handleTouch();
 
   uint32_t now = millis();
