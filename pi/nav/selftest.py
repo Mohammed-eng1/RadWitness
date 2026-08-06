@@ -2081,11 +2081,12 @@ def main() -> int:
     # ⚠ ثلاث واجهات مهمة جاهزة ومختبَرة تنتظر ربط الواجهة (المسار الآخر).
     #   وجودها هنا **مؤقت معلَن** لا إعفاء دائم: إن وُصلت أو وُسمت فأزل
     #   سطرها — الفحص الثاني يصرخ على الإعفاء البائت عمداً.
-    _pending_web = {
-        "pi/nav/mission.py::request_withdraw",     # زر «انسحب» واجهة/LoRa
-        "pi/nav/mission.py::set_side_ultrasonic",  # حقن المصفوفة عند التفعيل
-        "pi/nav/mission.py::run_perimeter_cycle",  # دورة قياس أبعاد الغرفة
-    }
+    # كانت هنا قائمة «بانتظار ربط الواجهة» لثلاث واجهات مهمة بلا مستدعٍ —
+    # فوصّلها المسار الآخر كلها والحارس كشف إعفاءها البائت واحدة واحدة:
+    # request_withdraw (أمر WDRAW في pi/comms/control.py) ·
+    # set_side_ultrasonic (server.init_side_ultrasonic عند الإقلاع) ·
+    # run_perimeter_cycle (السيرفر). أي إعفاء جديد يُضاف هنا **بسبب وتاريخ**.
+    _pending_web: set = set()
 
     def _public_funcs(tree):
         out = []
