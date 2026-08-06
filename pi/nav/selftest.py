@@ -855,6 +855,211 @@ def main() -> int:
     check("ولا يبدأ المسح رغم النقص (الرفض صحيح)",
           ms_bl.state == "idle")
 
+    # ═══ (ن) 🔴 تصحيح الاتجاه من الجدار الجانبي ═══════════════════
+    print("\nن) تصحيح الاتجاه من الجدار الجانبي (المرجع المفقود):")
+    from pi.nav.wall_heading import (
+        WallHeadingCorrector, tilt_from_delta, RIGHT as W_R, LEFT as W_L,
+        OK as W_OK, R_RANGE, R_TRAVEL, R_TILT, R_INCONSISTENT,
+    )
+    from pi.sensors.ultrasonic_array import perpendicular_cm
+    from pi.config import (
+        WALL_HEADING_CONSISTENT_N, WALL_HEADING_MAX_TILT_DEG,
+        WALL_HEADING_MAX_CORR_DEG, WALL_FOLLOW_MAX_CM,
+        WALL_HEADING_SIGMA_SHRINK, SIDE_ULTRASONIC_ENABLED, US_SIDE_TILT_DEG,
+        WALL_ALIGN_TOL_DEG as W_ALIGN_TOL,
+    )
+
+    check("🔴 العلم معطّل افتراضياً (المنافذ وσ غير مؤكَّدة بعد)",
+          SIDE_ULTRASONIC_ENABLED is False)
+    check("ميل التركيب يُحوَّل إلى مسافة عمودية (لا تُستعمل القراءة خاماً)",
+          abs(perpendicular_cm(100.0, 0.0) - 100.0) < 1e-9
+          and perpendicular_cm(100.0, US_SIDE_TILT_DEG) < 100.0,
+          f"100سم بميل {US_SIDE_TILT_DEG}° → "
+          f"{perpendicular_cm(100.0, US_SIDE_TILT_DEG):.1f}سم عمودية")
+
+    # 🔴 الإشارة: خطؤها يُنتج تغذية راجعة موجبة لا تصحيحاً ضعيفاً
+    t_r = tilt_from_delta(+10.0, 0.5, W_R)     # جدار يمين · ابتعدنا
+    t_l = tilt_from_delta(+10.0, 0.5, W_L)     # جدار يسار · ابتعدنا
+    check("ابتعاد عن جدار **يمين** ⇒ تصحيح موجب (لفّ يميناً نحوه)",
+          t_r > 0, f"{t_r:+.2f}°")
+    check("ونفس الابتعاد عن جدار **يسار** ⇒ تصحيح سالب (الإشارة تنعكس)",
+          t_l < 0 and abs(t_l + t_r) < 1e-9, f"{t_l:+.2f}°")
+    check("الميل من atan2(Δd, المسافة) — 10سم على 0.5م ≈ 11.3°",
+          abs(abs(t_r) - math.degrees(math.atan2(0.1, 0.5))) < 1e-9)
+
+    # مسار سليم: ميل ثابت ⇒ تصحيح بعد N قراءات متسقة
+    wc = WallHeadingCorrector(side=W_R)
+    dec = None
+    for i in range(WALL_HEADING_CONSISTENT_N + 2):
+        dec = wc.feed(40.0 + i * 6.0, i * 0.30)   # يبتعد 6سم كل 30سم
+    check(f"ميل ثابت ⇒ تصحيح بعد {WALL_HEADING_CONSISTENT_N} قراءات متسقة",
+          dec["apply"] and dec["reason"] == W_OK and dec["correction_deg"] > 0,
+          f"تصحيح {dec['correction_deg']:+.2f}° من {dec['n_consistent']} قراءات")
+
+    # 🔴 التطبيق: heading يتغيّر **فعلاً** وσ تصغر
+    dr_w = DeadReckoning(room, profile, 1.0, 1.0, 90.0)
+    dr_w.heading_sigma_deg = 12.0
+    res_w = wc.apply_to(dr_w, dec)
+    check("🔴 يصحّح **الاتجاه** فعلياً لا الموضع (ما لا يفعله الجدار الأمامي)",
+          res_w["applied"] and abs(dr_w.heading - 90.0) > 0.1
+          and dr_w.x == 1.0 and dr_w.y == 1.0,
+          f"{res_w['heading_before']}° → {res_w['heading_after']}°")
+    check("🔴 وσ الاتجاه **تصغر** — وهذا ما يكسر الحلقة المفرغة",
+          dr_w.heading_sigma_deg < 12.0
+          and abs(dr_w.heading_sigma_deg - 12.0 * WALL_HEADING_SIGMA_SHRINK) < 1e-6,
+          f"{res_w['sigma_before']}° → {res_w['sigma_after']}°")
+    check("ولا تُصفَّر (القياس نفسه فيه ضجيج — لا ثقة بلا مصدر)",
+          dr_w.heading_sigma_deg > 0)
+    # وبوابة المحاذاة تُعاد فتحها فعلاً
+    dr_g2 = DeadReckoning(room, profile, 1.0, 1.0, 0.0)
+    dr_g2.heading_sigma_deg = W_ALIGN_TOL + 6.0
+    was_lost = dr_g2.alignment_gate_lost
+    WallHeadingCorrector(side=W_R).apply_to(
+        dr_g2, {"apply": True, "correction_deg": 1.0, "n_consistent": 3})
+    check("🔴 بوابة محاذاة منهارة **تُعاد فتحها** بعد التصحيح",
+          was_lost and not dr_g2.alignment_gate_lost,
+          f"σ {W_ALIGN_TOL + 6.0:.0f}° → {dr_g2.heading_sigma_deg:.1f}°")
+    check("والسجل يحمل كل حقول التصحيح (الشفافية)",
+          set(res_w) >= {"side", "angle_deg", "heading_before", "heading_after",
+                         "sigma_before", "sigma_after"})
+
+    # ── شروط الأمان: كل رفض بسبب معلَن ──────────────────────────
+    wr = WallHeadingCorrector(side=W_R)
+    check("قراءة خارج النطاق ⇒ لا تصحيح (فتحة أو عائق لا جدار)",
+          wr.feed(WALL_FOLLOW_MAX_CM + 50, 0.0)["reason"] == R_RANGE)
+    wr2 = WallHeadingCorrector(side=W_R)
+    wr2.feed(40.0, 0.0)
+    check("مسافة غير كافية بين القراءتين ⇒ لا تصحيح (تضخيم ضجيج)",
+          wr2.feed(41.0, 0.02)["reason"] == R_TRAVEL)
+    wr3 = WallHeadingCorrector(side=W_R)
+    wr3.feed(40.0, 0.0)
+    big = wr3.feed(40.0 + math.tan(math.radians(WALL_HEADING_MAX_TILT_DEG + 15))
+                   * 50.0, 0.5)
+    check("ميل مفرط ⇒ لا تصحيح (انعطاف جدار أو عائق لا ميل روبوت)",
+          big["reason"] == R_TILT, f"{big.get('tilt_deg')}°")
+    wr4 = WallHeadingCorrector(side=W_R)
+    wr4.feed(40.0, 0.0)
+    d1 = wr4.feed(46.0, 0.3)
+    check("قراءة واحدة لا تكفي — الاتساق شرط",
+          d1["reason"] == R_INCONSISTENT and not d1["apply"])
+    # ميل متأرجح الإشارة = ضجيج لا ميل
+    wr5 = WallHeadingCorrector(side=W_R)
+    osc, seq = None, (40.0, 46.0, 40.0, 46.0, 40.0, 46.0)
+    for i, v in enumerate(seq):
+        osc = wr5.feed(v, i * 0.3)
+    check("ميل متأرجح الإشارة ⇒ لا تصحيح (ضجيج لا انحراف)",
+          not osc["apply"], f"سبب={osc['reason']}")
+    # سقف التصحيح
+    wr6 = WallHeadingCorrector(side=W_R)
+    hard = None
+    for i in range(WALL_HEADING_CONSISTENT_N + 1):
+        hard = wr6.feed(30.0 + i * 3.9, i * 0.16)
+    check("التصحيح مقصوص عند السقف (لا قفزات اتجاه)",
+          not hard["apply"] or abs(hard["correction_deg"]) <= WALL_HEADING_MAX_CORR_DEG,
+          f"{hard.get('correction_deg')}° ≤ {WALL_HEADING_MAX_CORR_DEG}°")
+    check("وكل الرفوض معدودة بأسبابها (لا رفض صامت)",
+          sum(wr.rejects.values()) + sum(wr3.rejects.values()) > 0,
+          " · ".join(f"{k}={v}" for k, v in wr3.rejects.items()))
+
+    # ── تتبّع المحيط: أربعة أضلاع وأبعاد مقاسة ───────────────────
+    from pi.nav.perimeter import (PerimeterTracker, FOLLOW, TURN, DONE,
+                                  ABORT, SEEK)
+    from pi.config import (PERIMETER_TARGET_CM, PERIMETER_MAX_SIDE_M,
+                           PERIMETER_OPENING_JUMP_CM)
+
+    def run_perimeter(w=3.0, l=4.0, step=0.1, gap_at=None, no_wall_side=None):
+        """غرفة محاكاة: يمشي الأضلاع بالترتيب ويرى الجدار على يمينه."""
+        pt = PerimeterTracker(side="right")
+        plan = [w, l, w, l]
+        odom, cmds = 0.0, []
+        for si, seg in enumerate(plan):
+            walked = 0.0
+            while walked < seg - 1e-9:
+                walked += step
+                odom += step
+                front = (seg - walked) * 100.0
+                side = PERIMETER_TARGET_CM
+                if no_wall_side == si + 1:
+                    side = None                    # ضلع بلا جدار
+                elif gap_at and si + 1 == gap_at[0] and \
+                        abs(walked - gap_at[1]) < step / 2:
+                    side = PERIMETER_TARGET_CM + PERIMETER_OPENING_JUMP_CM + 20
+                r = pt.step(side, front, odom)
+                cmds.append(r["command"])
+                if r["command"] in (DONE, ABORT):
+                    return pt, cmds
+                if r["command"] == TURN:
+                    break              # الضلع انتهى — انتقل للتالي
+        return pt, cmds
+
+    pt_ok, cmds_ok = run_perimeter()
+    check("دورة محيط في غرفة محاكاة → **أربعة أضلاع** ودورة مكتملة",
+          pt_ok.finished and len(pt_ok.sides) == 4 and pt_ok.turns == 4,
+          f"أضلاع={len(pt_ok.sides)} · لفّات={pt_ok.turns}")
+    dims = pt_ok.measured_dimensions()
+    check("والأبعاد المقاسة تطابق غرفة المحاكاة",
+          dims and abs(dims[0] - 3.0) < 0.25 and abs(dims[1] - 4.0) < 0.25,
+          f"مقاس {dims}")
+    cmp_ok = pt_ok.compare_to(3.0, 4.0)
+    check("🔴 الفحص الذاتي: المقاس مقابل المُدخل ⇒ الملاحة موثوقة",
+          cmp_ok["ok"], cmp_ok["reason"][:64])
+    cmp_bad = pt_ok.compare_to(6.0, 8.0)
+    check("واختلاف كبير ⇒ **تحذير قبل بدء المسح** لا اكتشاف لاحق",
+          not cmp_bad["ok"] and "انزلاق" in cmp_bad["reason"],
+          cmp_bad["reason"][:60])
+    check("اكتمال الدورة **بعدّ اللفّات** لا بالموضع (أصدق مع موضع تقديري)",
+          cmds_ok.count(TURN) == 3 and cmds_ok[-1] == DONE,
+          f"لفّات={cmds_ok.count(TURN)} ثم {cmds_ok[-1]}")
+    check("والاتباع تناسبي على الخطأ الجانبي",
+          FOLLOW in cmds_ok and abs(
+              PerimeterTracker(side="right").step(
+                  PERIMETER_TARGET_CM + 20, 500.0, 1.0)["steer"]) > 0)
+
+    pt_nw, _ = run_perimeter(no_wall_side=2)
+    seg2 = next((s for s in pt_nw.sides if s["index"] == 2), None)
+    check("ضلع بلا جدار ⇒ **يُكمل** ويُعلَّم «بلا مرجع» (لا فشل)",
+          pt_nw.finished and seg2 is not None
+          and seg2["has_reference"] is False
+          and all(s["has_reference"] for s in pt_nw.sides if s["index"] != 2),
+          f"الضلع 2 بلا مرجع · طوله {seg2['length_m']}م" if seg2 else "—")
+    check("و«لا جدار» يُخرج أمر SEEK لا إجهاضاً",
+          PerimeterTracker(side="right").step(None, 500.0, 0.5)["command"] == SEEK)
+
+    pt_gap, _ = run_perimeter(gap_at=(1, 1.5))
+    check("فتحة/باب ⇒ **تُسجَّل ولا تُدخَل** (المحيط أولاً)",
+          len(pt_gap.openings) >= 1 and pt_gap.finished,
+          f"{len(pt_gap.openings)} فتحة عند "
+          f"{pt_gap.openings[0]['at_odom_m']}م")
+
+    pt_lost = PerimeterTracker(side="right")
+    r_lost = None
+    for i in range(1, 200):
+        r_lost = pt_lost.step(PERIMETER_TARGET_CM, 900.0, i * 0.2)
+        if r_lost["command"] == ABORT:
+            break
+    check("ضلع أطول من الحدّ ⇒ **إجهاض بسبب معلَن** (فقدان جدار)",
+          r_lost["command"] == ABORT and "الجدار" in r_lost["reason"],
+          r_lost["reason"][:58])
+    check("الجهة ثابتة طوال الدورة (قاعدة تمنع الالتباس)",
+          all(e for e in [pt_ok.side == "right"]))
+
+    # ── تحكيم IR / الألترا سونيك الجانبي: تكامل لا تكرار ─────────
+    rs_side = ReactiveSafety(enabled=False)
+    conf = rs_side.side_arbitration(ir_side=0, us_side_cm=95.0, side="right")
+    check("🔴 تعارض IR/ألترا سونيك ⇒ **IR له الأولوية** والتعارض مسجَّل",
+          conf["blocked"] and conf["conflict"] and conf["priority"] == "ir"
+          and "مائل" in conf["reason"], conf["reason"][:66])
+    agree = rs_side.side_arbitration(ir_side=1, us_side_cm=95.0, side="right")
+    check("لا تعارض حين يتفقان (IR خالٍ والألترا سونيك بعيد)",
+          not agree["blocked"] and not agree["conflict"])
+    near = rs_side.side_arbitration(ir_side=1, us_side_cm=12.0, side="left")
+    check("وقرب الألترا سونيك بلا IR **ليس تعارضاً** (مدى IR أقصر أصلاً)",
+          not near["conflict"] and near["priority"] == "ultrasonic")
+    unk = rs_side.side_arbitration(ir_side=None, us_side_cm=None, side="left")
+    check("والغائب **مجهول لا خالٍ** في الطرفين",
+          not unk["blocked"] and set(unk["unknown"]) == {"ir", "ultrasonic"}
+          and unk["priority"] == "unknown")
+
     # ═══ (ل) 🔴 البند 0: التحقق من الحركة ═════════════════════════
     print("\nل) التحقق من الحركة (البند 0):")
     from pi.nav.motion_check import (
@@ -1382,6 +1587,107 @@ def main() -> int:
           and loc3.detector.screen_grid.n_measurements == n_before)
     check("ولا يُغلق حكم غير موجود", loc3.close_finding()["ok"] is False)
 
+    # ⑦د 🔴 اختبار تكامل: المهمة **تستدعي** تصحيح الاتجاه الجانبي فعلاً
+    #      (قاعدة CLAUDE.md §8 — لا وحدة مبنيّة معزولة)
+    class FakeArray:
+        """مصفوفة وهمية: جدار يمين يبتعد تدريجياً ⇒ ميل ثابت."""
+        ok = True
+        def __init__(self):
+            self.n = 0
+        def perpendicular_cm(self, side):
+            if side != "right":
+                return None
+            self.n += 1
+            return 40.0 + self.n * 7.0
+        def state(self):
+            return {"enabled": True, "ok": True, "channels": {}}
+
+    ms_wh = full_mission(run=False)
+    ms_wh.set_side_ultrasonic(FakeArray())
+    ms_wh.dr.heading_sigma_deg = WALL_ALIGN_TOL_DEG + 8.0   # بوابة منهارة
+    check("حقن المصفوفة يُنشئ مصحّح الاتجاه", ms_wh.wall_heading is not None)
+    for _ in range(6):
+        t = ms_wh._next_target()
+        if t is None:
+            break
+        ms_wh._advance_one_cell(t)
+    check("🔴 المهمة **تستدعي** تصحيح الاتجاه بعد كل خلية (لا وحدة معزولة)",
+          ms_wh._wall_heading_corrections > 0
+          and any(e["kind"] == "wall_heading" for e in ms_wh.events),
+          next((e["msg"][:64] for e in ms_wh.events
+                if e["kind"] == "wall_heading"), "—"))
+    check("🔴 وσ الاتجاه صغرت فعلياً ⇒ **بوابة المحاذاة أُعيد فتحها**",
+          not ms_wh.dr.alignment_gate_lost,
+          f"σ = {ms_wh.dr.heading_sigma_deg:.2f}° "
+          f"(كانت {WALL_ALIGN_TOL_DEG + 8.0:.0f}°)")
+    check("وحالة الجانبي تُبثّ في الواجهة",
+          ms_wh.state_dict()["side_us"]["corrections"] > 0)
+    # وبلا حقن: صفر تغيير في السلوك القائم
+    ms_off = full_mission(run=False)
+    for _ in range(3):
+        t = ms_off._next_target()
+        if t is None:
+            break
+        ms_off._advance_one_cell(t)
+    check("وبلا مصفوفة (العلم معطّل) **لا يتغيّر أي سلوك قائم**",
+          ms_off.wall_heading is None
+          and ms_off._wall_heading_corrections == 0
+          and ms_off.state_dict()["side_us"]["enabled"] is False)
+
+    # ⑦هـ دورة المحيط موصولة بالمهمة وترفض بسبب معلَن عند النقص
+    ms_pm = full_mission(run=False)
+    r_pm = ms_pm.run_perimeter_cycle()
+    check("دورة المحيط تُرفض **بسبب معلَن** بلا ألترا سونيك جانبي",
+          r_pm["ok"] is False and "جانبي" in r_pm["reason"], r_pm["reason"][:60])
+
+    class WallArray(FakeArray):
+        """جدار يمين ثابت على 40سم — لدورة محيط قابلة للتنفيذ."""
+        def perpendicular_cm(self, side):
+            return 40.0 if side == "right" else None
+
+    ms_pm2 = full_mission(run=False)
+    ms_pm2.set_side_ultrasonic(WallArray())
+    r_pm2 = ms_pm2.run_perimeter_cycle(max_steps=60)
+    check("🔴 ومع المصفوفة **تُنفَّذ فعلاً** وتُخرج حصيلة (لا وحدة معزولة)",
+          ms_pm2.perimeter is not None
+          and isinstance(r_pm2.get("summary"), dict)
+          and any(e["kind"] == "perimeter" for e in ms_pm2.events),
+          f"أضلاع={len(r_pm2['summary']['sides'])} · "
+          f"لفّات={r_pm2['summary']['turns']}")
+    check("والفحص الذاتي يقارن المقاس بالمُدخل ويُسجَّل",
+          ("self_check" in r_pm2) and any(
+              e["kind"] == "perimeter_check" for e in ms_pm2.events),
+          (r_pm2.get("self_check") or {}).get("reason", "—")[:58])
+
+    # ⑦و 🔴 البندان الأخيران في التدقيق: مبنيّان وصارا **مستدعَيين**
+    from pi.ai.dynamic_range import recheck_needed as _rn
+    hot_r = _rn(counts=60, duration_s=3.0, background_cpm=18.0)
+    cold_r = _rn(counts=1, duration_s=3.0, background_cpm=18.0)
+    check("`recheck_needed` يميّز الارتفاع المشبوه عن الخلفية",
+          hot_r["recheck"] and not cold_r["recheck"],
+          hot_r["reason"][:52])
+    # وفي المهمة: قراءة ساخنة ⇒ إعادة قياس أطول فعلياً
+    ms_rc = full_mission(run=False, src=(0.3, 0.3), a_cpm=4000.0)
+    n0 = len(ms_rc.locator.readings)
+    ms_rc._visit(ms_rc.current)
+    check("🔴 والمهمة **تستدعيه**: ارتفاع مشبوه ⇒ إعادة قياس أطول",
+          any(e["kind"] == "recheck" for e in ms_rc.events)
+          and len(ms_rc.locator.readings) > n0 + 1,
+          next((e["msg"][:60] for e in ms_rc.events
+                if e["kind"] == "recheck"), "—"))
+    ms_cold = full_mission(run=False, src=None, a_cpm=1.0)
+    n1 = len(ms_cold.locator.readings)
+    ms_cold._visit(ms_cold.current)
+    check("وقراءة عند الخلفية **لا** تُعاد (لا إهدار زمن المهمة)",
+          len(ms_cold.locator.readings) == n1 + 1
+          and not any(e["kind"] == "recheck" for e in ms_cold.events))
+    # set_vision_stats: العدّاد يصل التقرير
+    ms_vs = full_mission(run=False)
+    st_vs = ms_vs._push_vision_stats()
+    check("🔴 عدّاد الرؤية يصل التقرير (كان `vision_stats` فارغاً دائماً)",
+          bool(st_vs) and ms_vs.locator.report()["vision_stats"].get("provider"),
+          f"مزوّد={st_vs.get('provider')} · استدعاءات={st_vs.get('calls')}")
+
     # ⑧ بروتوكول الدخول (القسم 3): نقطة البدء تُبلَّغ للمنسّق
     proto = ms_full.locator.protocol.status()
     check("بروتوكول الدخول يُبلَّغ بنقطة البداية ويحكم على شرعيّتها",
@@ -1724,6 +2030,99 @@ def main() -> int:
           and any("اشحن البطارية" in e["msg"] for e in ms5.events),
           next((e["msg"][:70] for e in ms5.events
                 if e["kind"] == "mission_abort"), f"الحالة={ms5.state}"))
+
+    # ═══ (س) بوابة الجاهزية تفحص تماسك ثوابت الاتجاه ═══════════════
+    # ⚠ `config_sanity` كانت تعمل في selftest وسكربت المعايرة فقط — فتعديل
+    #   config على الراسبري مباشرةً كان يمرّ بلا حارس، وخطؤه يظهر على العتاد
+    #   إشباعَ محرك عند الحاجز: سلوك غير خطي لا يُشخَّص من السلوك وحده.
+    print("\nس) بوابة الجاهزية وثوابت الاتجاه:")
+    import pi.nav.heading_hold as _hh
+
+    ms_cfg = MissionSim()
+    ms_cfg.configure_room(2.0, 2.0)
+    ms_cfg.set_calibration(default_sim_profile())
+    rd_base = ms_cfg.mission_readiness()
+    check("ثوابت اتجاه متماسكة → لا حاجب إعدادات في الجاهزية",
+          not any("ثوابت الاتجاه" in b for b in rd_base["blockers"]))
+    _saved_corr = _hh.HEADING_MAX_CORR
+    try:
+        _hh.HEADING_MAX_CORR = 1.0        # إعداد مستحيل: يفوق الفراغ المتاح
+        rd_bad = ms_cfg.mission_readiness()
+        check("إعداد اتجاه غير متماسك **يحجب البدء** بسبب مقروء",
+              any("ثوابت الاتجاه" in b for b in rd_bad["blockers"]),
+              next((b[:70] for b in rd_bad["blockers"]
+                    if "ثوابت الاتجاه" in b), "لا حاجب"))
+    finally:
+        _hh.HEADING_MAX_CORR = _saved_corr
+
+    # ═══ (ع) حارس «المبنيّ غير المستدعى» — قاعدة CLAUDE.md §8 آلياً ═══
+    # النمط تكرر ست مرات: وحدة مبنيّة ومختبَرة وحدةً ولا يستدعيها أحد في
+    # مسار المهمة، واختبار الوحدة المعزول يمرّ وإن لم يستدعِها أحد. الحارس
+    # يفرض البديلين المشروعين: استدعاء إنتاجي (أي ملف غير اختباري في pi/،
+    # ومنه السيرفر) أو وسم «أداة خارجية» في السطر الأول من docstring.
+    # ⚠ فحص نصّي تقريبي: ذكر الاسم في تعليق يُحتسب استدعاءً — فهو يمسك
+    #   الاسم الذي لا يذكره أحد إطلاقاً، وهذه كانت بصمة الحالات الست كلها.
+    print("\nع) حارس التوصيل:")
+    import ast as _ast
+    import pathlib as _pl
+    import re as _re
+
+    _pi_dir = _pl.Path(__file__).resolve().parents[1]
+
+    def _is_test_path(rp: str) -> bool:
+        return "/tests/" in rp or rp.endswith("selftest.py")
+
+    _prod = {}
+    for _p in _pi_dir.rglob("*.py"):
+        _rp = _p.relative_to(_pi_dir.parent).as_posix()
+        if not _is_test_path(_rp):
+            _prod[_rp] = _p.read_text(encoding="utf-8")
+
+    # ⚠ ثلاث واجهات مهمة جاهزة ومختبَرة تنتظر ربط الواجهة (المسار الآخر).
+    #   وجودها هنا **مؤقت معلَن** لا إعفاء دائم: إن وُصلت أو وُسمت فأزل
+    #   سطرها — الفحص الثاني يصرخ على الإعفاء البائت عمداً.
+    _pending_web = {
+        "pi/nav/mission.py::request_withdraw",     # زر «انسحب» واجهة/LoRa
+        "pi/nav/mission.py::set_side_ultrasonic",  # حقن المصفوفة عند التفعيل
+        "pi/nav/mission.py::run_perimeter_cycle",  # دورة قياس أبعاد الغرفة
+    }
+
+    def _public_funcs(tree):
+        out = []
+        for node in _ast.iter_child_nodes(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                out.append(node)
+            elif isinstance(node, _ast.ClassDef):
+                out.extend(n for n in _ast.iter_child_nodes(node)
+                           if isinstance(n, (_ast.FunctionDef,
+                                             _ast.AsyncFunctionDef)))
+        return [f for f in out if not f.name.startswith("_")]
+
+    _viol, _stale = [], []
+    for _d in ("pi/ai", "pi/nav"):
+        for _f in sorted((_pi_dir.parent / _d).glob("*.py")):
+            _rp = _f.relative_to(_pi_dir.parent).as_posix()
+            if _f.name in ("__init__.py", "selftest.py", "sim_world.py"):
+                continue
+            for _fn in _public_funcs(_ast.parse(_prod[_rp])):
+                _key = f"{_rp}::{_fn.name}"
+                _tagged = "أداة خارجية" in (_ast.get_docstring(_fn) or "")
+                _name = _re.compile(r"\b" + _re.escape(_fn.name) + r"\b")
+                _defs = _re.compile(r"def\s+" + _re.escape(_fn.name) + r"\b")
+                _refs = sum(len(_name.findall(t)) - len(_defs.findall(t))
+                            for t in _prod.values())
+                if _key in _pending_web:
+                    if _refs > 0 or _tagged:
+                        _stale.append(_key)
+                    continue
+                if _refs <= 0 and not _tagged:
+                    _viol.append(_key)
+    check("كل دالة عامة في pi/ai وpi/nav مستدعاة إنتاجياً أو موسومة «أداة خارجية»",
+          not _viol,
+          " · ".join(_viol[:4]) if _viol else f"فُحصت {len(_prod)} وحدة إنتاجية")
+    check("قائمة «بانتظار ربط الواجهة» ما زالت دقيقة (لا إعفاء بائتاً)",
+          not _stale,
+          " · ".join(_stale) if _stale else f"{len(_pending_web)} واجهات معلَّقة")
 
     # الخلاصة
     passed = sum(_results)

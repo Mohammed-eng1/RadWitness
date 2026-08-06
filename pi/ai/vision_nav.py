@@ -190,11 +190,16 @@ class VisionProvider:
     # ── حماية الرصيد ─────────────────────────────────────────────
     def cooldown_ok(self, situation_key: str,
                     cooldown_s: float = VISION_COOLDOWN_S) -> bool:
-        """مانع تكرار: لا نستدعي لنفس الموقف مرتين خلال المهلة."""
+        """
+        أداة خارجية حتى توصيل BRIEF_VISUAL_NAV (بند 2 — محفّزات الاستدعاء).
+
+        مانع تكرار: لا نستدعي لنفس الموقف مرتين خلال المهلة.
+        """
         t = self._last_call_at.get(situation_key)
         return t is None or (time.time() - t) >= cooldown_s
 
     def mark_called(self, situation_key: str) -> None:
+        """أداة خارجية حتى توصيل BRIEF_VISUAL_NAV (بند 2 — محفّزات الاستدعاء)."""
         self._last_call_at[situation_key] = time.time()
 
     def budget_left(self) -> int:
@@ -362,7 +367,7 @@ def get_provider(force_simulated: bool = False, canned: dict = None):
 
 
 def reset_provider() -> None:
-    """لإعادة التقاط المفتاح بعد تعديل secrets.py (وللاختبارات)."""
+    """أداة خارجية (اختبارات/تشخيص) — إعادة التقاط المفتاح بعد تعديل secrets.py."""
     global _PROVIDER
     _PROVIDER = None
 
@@ -390,7 +395,11 @@ DIRECTIONS_SCHEMA = {
 
 
 def analyze_obstacle(images, provider=None) -> dict:
-    """«هل هذا جدار الغرفة أم عائق منفصل نلتف حوله لتغطية ما خلفه؟»"""
+    """
+    أداة خارجية حتى توصيل BRIEF_VISUAL_NAV (بند 2 — المحفّز الرئيسي).
+
+    «هل هذا جدار الغرفة أم عائق منفصل نلتف حوله لتغطية ما خلفه؟»
+    """
     p = provider or get_provider()
     prompt = (_NAV_RULES + "\n\nالسؤال: هل ما أمام الروبوت جدار غرفة "
               "(نمشي بمحاذاته) أم عائق منفصل (نلتف حوله لتغطية ما خلفه)؟\n"
@@ -402,7 +411,11 @@ def analyze_obstacle(images, provider=None) -> dict:
 
 
 def analyze_directions(images, provider=None) -> dict:
-    """مسح 360°: عدة لقطات في **طلب واحد** (أوفر) واختيار الاتجاه الأفضل."""
+    """
+    أداة خارجية حتى توصيل BRIEF_VISUAL_NAV (بند 3 — المسح البصري 360°).
+
+    مسح 360°: عدة لقطات في **طلب واحد** (أوفر) واختيار الاتجاه الأفضل.
+    """
     p = provider or get_provider()
     prompt = (_NAV_RULES + f"\n\nلديك {len(images or [])} صور مرتّبة حول "
               "الروبوت (index 0 هو الأمام، ثم بترتيب الدوران). قيّم انفتاح كل "

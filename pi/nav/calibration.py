@@ -28,7 +28,11 @@ def compute_speed_mps(distance_m: float, duration_s: float) -> float:
 
 
 def compute_turn_rate_dps(degrees_turned: float, duration_s: float) -> float:
-    """معدل الدوران: الدرجات الفعلية ÷ المدة (المستخدم يلاحظ الزيادة/النقص عن 360)."""
+    """
+    أداة خارجية (متجاوَزة — اللفّ صار حلقة مغلقة على الجايرو لا زمناً معايراً).
+
+    معدل الدوران: الدرجات الفعلية ÷ المدة (المستخدم يلاحظ الزيادة/النقص عن 360).
+    """
     if duration_s <= 0:
         raise ValueError("المدة يجب أن تكون موجبة")
     return degrees_turned / duration_s
@@ -121,11 +125,13 @@ class CalibrationStore:
             return CalibrationProfile.from_dict(json.load(f))
 
     def delete(self, name: str) -> None:
+        """أداة خارجية (إدارة ملفات المعايرة — تنتظر ربط الواجهة، المسار الآخر)."""
         path = self._path(name)
         if os.path.exists(path):
             os.remove(path)
 
     def rename(self, old: str, new: str) -> None:
+        """أداة خارجية (إدارة ملفات المعايرة — تنتظر ربط الواجهة، المسار الآخر)."""
         prof = self.load(old)
         prof.name = new
         self.save(prof)

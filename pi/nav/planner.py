@@ -56,7 +56,7 @@ def find_path(grid, start, goal):
 
 
 def reachable_cells(grid, start):
-    """مجموعة الخلايا القابلة للوصول من start (لتشخيص التغطية الممكنة)."""
+    """أداة خارجية (تشخيص) — مجموعة الخلايا القابلة للوصول من start."""
     seen = {start}
     stack = [start]
     while stack:

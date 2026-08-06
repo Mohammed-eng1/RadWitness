@@ -29,11 +29,13 @@ from pi.config import (
     MISSION_HARD_LIMIT_S, BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
     BATT_SHUTDOWN_ENABLED, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
     MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S, IR_PRESENT,
+    HEADING_SIGMA_PER_TURN_DEG,
     CONFIRM_RADIUS_M, CONFIRM_DWELL_S, CONFIRM_POSITIONS,
     APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
     BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
     RESCAN_MAX_CELLS_PER_POINT, GRADIENT_TRANSIT_STOP_M,
     MISSION_STEP_RETRY_S, MISSION_MAX_CONSECUTIVE_FAILS, TURN_NO_ROTATION_LIMIT,
+    PERIMETER_WALL_SIDE, SIDE_ULTRASONIC_ENABLED,
 )
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator, SURVEY, CONFIRM
@@ -41,7 +43,7 @@ from pi.ai.approach_document import (
     run_documentation, approach_blockers, GradientApproach, source_bearing_deg,
     MOVE, STOP, WITHDRAW,
 )
-from pi.ai.dynamic_range import dead_time_correct
+from pi.ai.dynamic_range import dead_time_correct, recheck_needed
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
 from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
@@ -50,6 +52,9 @@ from pi.nav.sim_world import SimWorld
 from pi.nav.reactive import ReactiveSafety
 from pi.nav.executor import DriveExecutor
 from pi.nav.motion_check import SHORT, OVERSHOOT, NO_MOTION
+from pi.nav.wall_heading import WallHeadingCorrector
+from pi.nav.heading_hold import config_sanity as heading_config_sanity
+from pi.nav.perimeter import PerimeterTracker, FOLLOW, TURN, DONE, ABORT, SEEK
 from pi.ai.risk import classify
 from pi.rover.bridge import WaveRoverBridge
 from pi.rover import battery as batt
@@ -68,9 +73,10 @@ IDLE, RUNNING, PAUSED, DONE, RETURNING, ESTOP = (
 PHASE_SURVEY, PHASE_SCREEN, PHASE_CONFIRM = "survey", "screen", "confirm"
 PHASE_APPROACH, PHASE_STOP, PHASE_DOCUMENT = "approach", "stop", "document"
 PHASE_WITHDRAW, PHASE_REPORT = "withdraw", "report"
+PHASE_PERIMETER = "perimeter"      # يسبق المسح: قياس نطاق الغرفة فعلياً
 PHASE_AR = {
-    PHASE_SURVEY: "١ مسح", PHASE_SCREEN: "٢ فرز", PHASE_CONFIRM: "٣ تأكيد",
-    PHASE_APPROACH: "٤ اقتراب", PHASE_STOP: "٥ توقف",
+    PHASE_PERIMETER: "٠ محيط", PHASE_SURVEY: "١ مسح", PHASE_SCREEN: "٢ فرز",
+    PHASE_CONFIRM: "٣ تأكيد", PHASE_APPROACH: "٤ اقتراب", PHASE_STOP: "٥ توقف",
     PHASE_DOCUMENT: "٦ توثيق", PHASE_WITHDRAW: "انسحاب", PHASE_REPORT: "تقرير",
 }
 
@@ -173,6 +179,12 @@ class MissionSim:
         self._ground_echo_logged = False  # أُعلن اشتباه صدى الأرض مرة
         self._last_turn = None        # نتيجة آخر لفّة (لتمييز العطل القاتل)
         self._no_rot = 0              # لفّات متتالية بلا دوران يُذكر
+        # ── الألترا سونيك الجانبي (معطّل حتى تُثبَّت المنافذ) ─────
+        self.us_array = None          # مصفوفة التناوب (تُحقن من السيرفر)
+        self.wall_heading = None      # مصحّح الاتجاه من الجدار الجانبي
+        self.perimeter = None         # متتبّع المحيط (دورة الأضلاع الأربعة)
+        self._wall_heading_corrections = 0
+        self._side_conflict_logged = {}
         self.last_reactive = None
         self.drive_motors = False
         self.executor = None
@@ -243,6 +255,7 @@ class MissionSim:
         self.profile = profile
 
     def set_source(self, x, y):
+        """أداة خارجية (محاكاة) — يضع مصدراً وهمياً في SimWorld للتجريب اليدوي."""
         if self.world is not None:
             self.world.source_xy = (float(x), float(y))
 
@@ -903,10 +916,135 @@ class MissionSim:
                                                 s.get("ultrasonic_cm"))
         if corr and corr.get("corrected"):
             self._wall_corrections += 1
+        # 🔴 تصحيح **الاتجاه** من الجدار الجانبي — يسبق فحص البوابة لأنه
+        #    قد يُعيد فتحها في هذه الخطوة نفسها.
+        self._try_wall_heading_correction()
+        self._check_side_conflict()
         self._check_alignment_gate()
         self._check_battery()
         return {"ok": True, "entered": True, "cell": nxt,
                 "low_confidence": low_conf}
+
+    # ══ الألترا سونيك الجانبي: تصحيح الاتجاه وتتبّع المحيط ═══════
+    def set_side_ultrasonic(self, array=None) -> dict:
+        """
+        يحقن مصفوفة الألترا سونيك (أمامي + جانبيان بالتناوب).
+        ⚠ معطّلة خلف `SIDE_ULTRASONIC_ENABLED` — بلا حقن لا يتغيّر أي سلوك.
+        """
+        self.us_array = array
+        if array is not None and getattr(array, "ok", False):
+            self.wall_heading = WallHeadingCorrector(side=PERIMETER_WALL_SIDE)
+            self._log("side_us",
+                      f"مصفوفة الألترا سونيك مفعّلة — تصحيح الاتجاه من جدار "
+                      f"{PERIMETER_WALL_SIDE}")
+        return {"ok": array is not None and getattr(array, "ok", False)}
+
+    def _side_distance_cm(self, side: str = None):
+        """المسافة **العمودية** من الجدار الجانبي، أو None (غائب/قديم)."""
+        arr = getattr(self, "us_array", None)
+        if arr is None or not getattr(arr, "ok", False):
+            return None
+        return arr.perpendicular_cm(side or PERIMETER_WALL_SIDE)
+
+    def _try_wall_heading_correction(self) -> dict:
+        """
+        🔴 يصحّح **الاتجاه** من الجدار الجانبي — المرجع المفقود.
+
+        يُستدعى بعد كل عبور خلية. نجاحه يُصغّر `heading_sigma_deg` فيُعيد فتح
+        بوابة محاذاة تصحيح الجدار الأمامي — أي **يكسر الحلقة المفرغة**.
+        """
+        wc = getattr(self, "wall_heading", None)
+        if wc is None or self.dr is None:
+            return {"applied": False}
+        d = self._side_distance_cm()
+        dec = wc.feed(d, self.dr.distance_total)
+        if not dec.get("apply"):
+            return {"applied": False, "reason": dec.get("reason")}
+        res = wc.apply_to(self.dr, dec)
+        if res.get("applied"):
+            self._wall_heading_corrections += 1
+            self._log("wall_heading",
+                      f"🔴 تصحيح اتجاه من جدار {wc.side}: "
+                      f"{res['heading_before']}° → {res['heading_after']}° "
+                      f"({res['angle_deg']:+.2f}°) · σ "
+                      f"{res['sigma_before']}° → {res['sigma_after']}°")
+            # بوابة المحاذاة قد تكون أُعيد فتحها — أعد السماح بإعلانها
+            if not self.dr.alignment_gate_lost:
+                self._gate_lost_logged = False
+        return res
+
+    def _check_side_conflict(self) -> None:
+        """يسجّل تعارض IR/ألترا سونيك الجانبي (قد يكشف سطحاً ماصاً أو مائلاً)."""
+        arr = getattr(self, "us_array", None)
+        if arr is None or not getattr(arr, "ok", False):
+            return
+        s = self.sensors()
+        for side, ir_key in (("right", "ir_side_right"), ("left", "ir_side_left")):
+            a = self.reactive.side_arbitration(s.get(ir_key),
+                                               arr.perpendicular_cm(side), side)
+            if a["conflict"] and not self._side_conflict_logged.get(side):
+                self._side_conflict_logged[side] = True
+                self._log("side_conflict", a["reason"])
+
+    def run_perimeter_cycle(self, max_steps: int = 600) -> dict:
+        """
+        🔴 دورة المحيط: يتبع جداراً على جهة ثابتة أربع لفّات، ويُخرج **أبعاد
+        الغرفة المقاسة فعلياً** بدل المُدخلة يدوياً.
+
+        وأثناءها مجاناً: تصحيح الاتجاه من الجدار الجانبي، وقراءات جيجر
+        بمواضع **متنوّعة جداً** — وهو ما تفضّله الشبكة البايزية.
+
+        ⚠ يحتاج المصفوفة الجانبية وقيادة محركات؛ بلاهما يُرفض **بسبب معلَن**.
+        """
+        if not self._can_drive():
+            return {"ok": False, "reason": "دورة المحيط تحتاج قيادة محركات"}
+        arr = getattr(self, "us_array", None)
+        if arr is None or not getattr(arr, "ok", False):
+            return {"ok": False,
+                    "reason": "دورة المحيط تحتاج ألترا سونيك جانبياً "
+                              f"(SIDE_ULTRASONIC_ENABLED={SIDE_ULTRASONIC_ENABLED})"}
+        self.perimeter = PerimeterTracker(side=PERIMETER_WALL_SIDE)
+        self._set_phase(PHASE_PERIMETER)
+        self._log("perimeter",
+                  f"بدء دورة المحيط — الجدار على {PERIMETER_WALL_SIDE}، "
+                  f"الاكتمال بأربع لفّات لا بالموضع")
+        for _ in range(max(1, int(max_steps))):
+            if self.state in (ESTOP, IDLE) or self._withdraw_req is not None:
+                return {"ok": False, "reason": "أُلغيت",
+                        "summary": self.perimeter.summary()}
+            s = self.sensors()
+            r = self.perimeter.step(self._side_distance_cm(),
+                                    s.get("ultrasonic_cm"),
+                                    self.dr.distance_total if self.dr else 0.0)
+            cmd = r["command"]
+            if cmd in (DONE, ABORT):
+                break
+            if cmd == TURN:
+                self._face((self.heading + r["turn_deg"]) % 360.0)
+                # ⚠ اللفّ يُبطل أدلة الميل المتراكمة: الجدار تبدّل
+                if self.wall_heading is not None:
+                    self.wall_heading.reset()
+                continue
+            # FOLLOW أو SEEK — تقدّم خطوة وقِس
+            mv = self._move_meters(APPROACH_STEP_M, direction=+1)
+            if cmd == SEEK and self.dr is not None:
+                # ضلع بلا مرجع ⇒ الشك يرتفع صراحةً (لا ادّعاء دقة)
+                self.dr.heading_sigma_deg += HEADING_SIGMA_PER_TURN_DEG * 0.5
+            self._try_wall_heading_correction()
+            # قراءة جيجر عند موضع متنوّع — تغذية مجانية للشبكة البايزية
+            if mv.get("ok") and self.grid is not None:
+                cell = self.grid.cell_index(self.dr.x, self.dr.y) if self.dr else None
+                if cell is not None:
+                    self._visit(cell, low_confidence=not mv.get(
+                        "motion", {}).get("confident", True))
+        summ = self.perimeter.summary()
+        out = {"ok": self.perimeter.finished and not self.perimeter.abort_reason,
+               "summary": summ}
+        if self.room is not None:
+            out["self_check"] = self.perimeter.compare_to(self.room.width_m,
+                                                          self.room.length_m)
+            self._log("perimeter_check", out["self_check"]["reason"][:150])
+        return out
 
     def _check_alignment_gate(self) -> None:
         """
@@ -1040,6 +1178,11 @@ class MissionSim:
         self._wall_corrections = 0
         self._last_turn = None
         self._no_rot = 0
+        self._wall_heading_corrections = 0
+        self._side_conflict_logged = {}
+        if self.wall_heading is not None:
+            self.wall_heading.reset()
+        self.perimeter = None
 
     def _motion_step_m(self, covered: float, motion: dict) -> float:
         """
@@ -1550,6 +1693,13 @@ class MissionSim:
         if self.grid is None:
             blockers.append("لم تُعرَّف الغرفة بعد")
 
+        # ⑤ تماسك ثوابت الاتجاه — كان الفحص يعمل في selftest فقط، فتعديل
+        #    config على الراسبري مباشرةً كان يمرّ بلا حارس. خطؤه يظهر إشباعَ
+        #    محرك عند الحاجز = سلوك غير خطي يصعب تشخيصه من السلوك وحده.
+        san = heading_config_sanity()
+        if not san["ok"]:
+            blockers.append("ثوابت الاتجاه غير متماسكة: " + san["reason"])
+
         missing_ir = [n for n, p in IR_PRESENT.items() if not p]
         if missing_ir:
             warnings.append("حسّاسات IR معلَنة غائبة: " + "، ".join(missing_ir))
@@ -1627,6 +1777,28 @@ class MissionSim:
         # كل قراءة مسح تدخل الشبكة البايزية أصلاً؛ لا توقف إضافي ولا مسار
         # منفصل. وعدم يقين الموقع **إلزامي** مع كل قراءة (القسم 1).
         info = self._feed_locator(px, py, m, purpose=purpose)
+        # ── الطرف **الأعلى** من التجميع التكيّفي ──────────────────
+        # ⚠ `_inconclusive_extension_s` يغطّي الطرف الأدنى وحده (نظيفة أم شلل؟).
+        #    وارتفاعٌ مشبوه فوق الخلفية يستحق إعادة قياس أطول كذلك: المرور
+        #    السريع يكفي للتغطية، والتأكيد يحتاج إحصاءً — والجمع بينهما هو
+        #    إستراتيجية «مرور سريع ثم إعادة عند الاشتباه».
+        hot = recheck_needed(m["counts"], m["duration_s"],
+                             self.locator.background_cpm if self.locator else 0.0)
+        if hot.get("recheck") and purpose == SURVEY:
+            extra_hot = max(0.0, float(hot["suggested_dwell_s"]) - m["duration_s"])
+            if extra_hot > 0:
+                self._log("recheck",
+                          f"ارتفاع مشبوه عند ({px:.2f},{py:.2f}): "
+                          f"{hot['reason']}")
+                m_hot = self._measure(px, py, extra_hot)
+                self.mission_time_s += m_hot["duration_s"]
+                self._feed_locator(px, py, m_hot, purpose=purpose)
+                # القياس الأطول أدقّ إحصائياً — يُعتمد للعرض والخريطة
+                m = m_hot
+                cpm, usvh = m_hot["cpm"], m_hot["usvh"]
+                self.grid.update_reading(x, y, cpm, usvh,
+                                         low_confidence=low_confidence)
+                risk = classify(usvh)
         # التجميع التكيّفي: يُطال الزمن **فقط** للقراءة الغامضة (نظيفة أم شلل؟)
         extra = self._inconclusive_extension_s(info)
         if extra > 0:
@@ -1869,6 +2041,10 @@ class MissionSim:
             self.documentation = run_documentation(
                 rep, robot_xy=(x, y), robot_heading_deg=self.heading,
                 camera=self.camera, turn_fn=self._doc_turn_fn())
+            # 🔴 عدّاد الرصيد يصل التقرير: كان `set_vision_stats` مبنيّاً
+            #    **ولا يستدعيه أحد**، فيبقى `vision_stats` فارغاً دائماً
+            #    ويُخفى استهلاك التوكنات عن التقرير الذي يُفترض أن يُظهره.
+            self._push_vision_stats()
             self._log("documentation",
                       self.documentation.get("statement", "")[:160])
         except Exception as e:                # noqa: BLE001 — لا يُسقط المهمة
@@ -1882,6 +2058,26 @@ class MissionSim:
             except Exception:                 # noqa: BLE001
                 pass
         return self.documentation
+
+    def _push_vision_stats(self) -> dict:
+        """
+        يمرّر عدّاد استدعاءات/توكنات مزوّد الرؤية إلى تقرير المنسّق.
+
+        ⚠ المزوّد **مشترك** بين الملاحة البصرية والتوثيق (قاعدة: مزوّد واحد
+           لا نسختان — صيانة مزدوجة ورصيد مضاعف)، فالعدّاد يعكس المهمة كلها.
+        """
+        if self.locator is None:
+            return {}
+        try:
+            from pi.ai import vision_nav as vn
+            prov = vn.get_provider() if hasattr(vn, "get_provider") else None
+            stats = prov.stats() if prov is not None else {}
+            if stats:
+                self.locator.set_vision_stats(stats)
+            return stats
+        except Exception as e:            # noqa: BLE001 — لا يُسقط التوثيق
+            self._log("vision_stats", f"⚠ تعذّر جلب عدّاد الرؤية: {e}"[:120])
+            return {}
 
     def _doc_turn_fn(self):
         """
@@ -2015,6 +2211,17 @@ class MissionSim:
             # جاهزية المسح الذاتي — تُبثّ دائماً ليعرف المشغّل **قبل** الضغط
             "readiness": self.mission_readiness(),
             "ir_present": IR_PRESENT,
+            # الألترا سونيك الجانبي — يُبثّ دائماً ولو معطّلاً (بسببه معلَناً)
+            "side_us": {
+                "enabled": SIDE_ULTRASONIC_ENABLED,
+                "array": (self.us_array.state()
+                          if getattr(self, "us_array", None) is not None else None),
+                "wall_heading": (self.wall_heading.state()
+                                 if self.wall_heading is not None else None),
+                "corrections": self._wall_heading_corrections,
+                "perimeter": (self.perimeter.summary()
+                              if self.perimeter is not None else None),
+            },
             "drive_motors": self.drive_motors,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),

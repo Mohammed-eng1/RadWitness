@@ -67,17 +67,21 @@ class Room:
 
     # ── مرجع الاتجاه (زر «صفّر الاتجاه») ───────────────────────────
     def set_heading_reference(self, current_abs_heading: float) -> None:
-        """يجعل heading الحالي (من BNO055) هو 0° المرجعي للغرفة."""
+        """
+        أداة خارجية (زر واجهة غير موصول — مرشّحة للحذف مع شقيقتيها: المهمة
+        تصفّر إطارها بنفسها عند البدء `start()` فتجعل `heading_ref` بلا أثر).
+        """
         self.heading_ref = current_abs_heading % 360.0
 
     def to_room_heading(self, abs_heading: float):
-        """يحوّل heading مطلقاً إلى زاوية نسبية للغرفة [0,360). None قبل التصفير."""
+        """أداة خارجية (غير موصولة — انظر `set_heading_reference`). None قبل التصفير."""
         if self.heading_ref is None:
             return None
         return (abs_heading - self.heading_ref) % 360.0
 
     @property
     def heading_zeroed(self) -> bool:
+        """أداة خارجية (غير موصولة — انظر `set_heading_reference`)."""
         return self.heading_ref is not None
 
     def to_dict(self) -> dict:
@@ -259,7 +263,10 @@ class OccupancyGrid:
         return grid
 
     def heatmap_cells(self) -> list:
-        """قائمة مبسّطة للواجهة: مركز كل خلية + حالتها (للخريطة الحرارية)."""
+        """
+        أداة خارجية (متجاوَزة — الواجهة تتغذّى من `MissionState.state_dict`
+        عبر `_cell_dict`/`drain_dirty`، ولا أحد يستهلك هذه القائمة).
+        """
         out = []
         for r in range(self.rows):
             for c in range(self.cols):

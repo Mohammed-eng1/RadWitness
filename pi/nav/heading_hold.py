@@ -157,8 +157,8 @@ class HeadingController:
 def config_sanity() -> dict:
     """
     فحص تماسك ثوابت config: هل السقف يتّسع داخل حدّ القوة عند أساس السير؟
-    يُستدعى في selftest وفي سكربت المعايرة — خطأ هنا يظهر كسلوك غير خطي
-    في العتاد ويصعب تشخيصه لاحقاً.
+    يُستدعى في `mission_readiness` (حاجب بدء على العتاد) وفي selftest وسكربت
+    المعايرة — خطأ هنا يظهر كسلوك غير خطي في العتاد ويصعب تشخيصه لاحقاً.
     """
     head = available_headroom(STRAIGHT_BASE_POWER)
     ok = HEADING_MAX_CORR <= head + 1e-9

@@ -127,6 +127,7 @@ class DeadReckoning:
         self.uncertainty += drift * abs(dist_m) + lateral
 
     def set_pose(self, x: float, y: float, heading: float) -> None:
+        """أداة خارجية (سكربتات/تشخيص) — المهمة تصحّح عبر مسارات الجدران لا بفرض وضعة."""
         self.x, self.y, self.heading = float(x), float(y), heading % 360.0
 
     # ── تصحيح الجدار الأمامي (الشرطان الإلزاميان) ─────────────────

@@ -33,6 +33,7 @@ from pi.config import (
     ROVER_SAFETY_TIMEOUT_S, STOP_CM, SPEED_LADDER, SPEED_NO_READING,
     DISTANCE_SAMPLES, MAX_JUMP_CM, SMART_AVOID_ENABLED, SCAN_ANGLE_DEG,
     BACK_TIME_S, BLOCKED_BOTH_CM, AVOID_TURN_DEG, IR_OBSTACLE_LEVEL,
+    IR_RANGE_CM,
 )
 
 
@@ -102,6 +103,7 @@ class EscapeSequence:
         self._step = 0
 
     def next_maneuver(self) -> dict:
+        """أداة خارجية (غير موصولة بالمهمة — مسار الحصار الحي: smart_avoid وإعادة التخطيط)."""
         if self.attempt >= self.max_attempts:
             return {"maneuver": "give_up"}
         m = self.STEPS[self._step]
@@ -143,6 +145,44 @@ class ReactiveSafety:
         return self.jump.feed(med) if filtered else med
 
     # ── البندان 2+4: القرار اللحظي ──────────────────────────────
+    def side_arbitration(self, ir_side, us_side_cm, side: str = "") -> dict:
+        """
+        🔴 تحكيم **الجانب**: الألترا سونيك **يقيس** وIR **يحرس** — تكامل لا
+        تكرار.
+
+        الألترا سونيك يعمى عن: الأسطح المائلة (الموجة ترتدّ بعيداً) · المواد
+        الماصّة (قماش، إسفنج، أثاث مبطّن) · ما هو خارج شعاعه الضيق (~15°).
+        فحين يقول IR «عائق» ويقول الألترا سونيك «بعيد»، **IR هو الصادق** —
+        والتعارض نفسه معلومة: يُرجَّح سطح مائل أو ماصّ.
+
+        ⚠ والعكس ليس تعارضاً: ألترا سونيك يرى قريباً وIR لا يراه أمر طبيعي
+           (مدى IR ~25-30سم فقط، والألترا سونيك يرى أبعد بكثير).
+        ⚠ و`None` **مجهول لا خالٍ** في الطرفين.
+        """
+        ir_obs = (ir_side == IR_OBSTACLE_LEVEL) if ir_side is not None else None
+        us_far = (us_side_cm is not None and us_side_cm > IR_RANGE_CM)
+        conflict = bool(ir_obs) and us_far
+        return {
+            "side": side,
+            # 🔴 أولوية IR مطلقة: خط الدفاع الأخير لا يُنقَض بقياس أبعد
+            "blocked": bool(ir_obs),
+            "priority": "ir" if ir_obs else ("ultrasonic" if us_side_cm
+                                             is not None else "unknown"),
+            "conflict": conflict,
+            "distance_cm": us_side_cm,
+            "unknown": [n for n, v in (("ir", ir_side),
+                                       ("ultrasonic", us_side_cm))
+                        if v is None],
+            "reason": (f"⚠ تعارض على الجانب {side}: IR يقول «عائق» والألترا "
+                       f"سونيك يقرأ {us_side_cm:.0f}سم — **IR له الأولوية**، "
+                       f"ويُرجَّح سطح مائل أو ماصّ يعمى عنه الألترا سونيك"
+                       if conflict else
+                       ("IR جانبي: عائق قريب" if ir_obs else
+                        (f"جانب {side} على {us_side_cm:.0f}سم"
+                         if us_side_cm is not None else
+                         f"جانب {side} مجهول — لا IR ولا ألترا سونيك"))),
+        }
+
     def decide(self, front_cm, ir_left, ir_right, ir_mid=None) -> dict:
         """
         أولوية مطلقة لـIR (خط الدفاع الأخير — الوقت لا يسمح بمسح دوراني)،
@@ -246,6 +286,7 @@ class ReactiveSafety:
 
     # ── السلامة العامة ──────────────────────────────────────────
     def feed_heartbeat(self) -> None:
+        """أداة خارجية (تخصّ `run_hardware_loop` المستقلة) — حارس المهمة الحي: `bridge.check_heartbeat`."""
         self._last_cmd_ts = time.time()
 
     def heartbeat_expired(self) -> bool:
@@ -253,6 +294,10 @@ class ReactiveSafety:
 
     def run_hardware_loop(self, sensors, rover):   # pragma: no cover — عتاد
         """
+        أداة خارجية (وضع تشغيل مستقل على العتاد — مسار المهمة الحي يمرّ عبر
+        `mission.poll_reactive` + `bridge.check_heartbeat`، ومن يشغّل هذه الحلقة
+        مستقلةً عليه تغذية `feed_heartbeat` بنفسه).
+
         حلقة العتاد كل REACTIVE_LOOP_S — **لا تعمل إلا إذا رُفع العلم** (البند 6).
         لها أولوية مطلقة على أي أمر من الملاحة/الرؤية/الكابتن.
         """
