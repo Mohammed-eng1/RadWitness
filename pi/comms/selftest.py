@@ -629,8 +629,9 @@ def main() -> None:
     # سطر بريء). بايثون تتحمّل العربية، ومترجم Arduino لا. هذا الفحص
     # يمسك التسرّب **قبل** أي مترجم وعلى كل منصة.
     from pathlib import Path as _P
-    _fw_root = _P(__file__).resolve().parents[2] / "firmware" / "controller_display"
-    for _f in sorted(_fw_root.rglob("*")):
+    _fw_base = _P(__file__).resolve().parents[2] / "firmware"
+    _fw_root = _fw_base / "controller_display"
+    for _f in sorted(_fw_base.rglob("*")):
         if _f.suffix not in (".ino", ".h", ".cpp"):
             continue
         _raw = _f.read_bytes()
@@ -640,15 +641,16 @@ def main() -> None:
               f"أول بايت غير ASCII عند الإزاحة {_bad[0]}" if _bad else
               f"{len(_raw)} بايت كلها ASCII")
 
-    _ino = _arduino_compile(_fw_root)
-    if _ino is None:
-        print("  ⏭  ترجمة الفيرموير الكاملة تُخطّى: لا arduino-cli أو لا نواة esp32")
-        print("     يدوياً: arduino-cli compile --fqbn esp32:esp32:esp32 "
-              "firmware/controller_display")
-    else:
-        ok_c, err_c = _ino
-        check("🔴 الفيرموير الكامل يُترجَم بلا خطأ (arduino-cli)", ok_c,
-              err_c[:120] if not ok_c else "compile OK")
+    for _sketch in ("controller_display", "lora_probe"):
+        _ino = _arduino_compile(_fw_base / _sketch)
+        if _ino is None:
+            print(f"  ⏭  ترجمة {_sketch} تُخطّى: لا arduino-cli أو لا نواة esp32")
+            print("     يدوياً: arduino-cli compile --fqbn esp32:esp32:esp32 "
+                  f"firmware/{_sketch}")
+        else:
+            ok_c, err_c = _ino
+            check(f"🔴 {_sketch} يُترجَم بلا خطأ (arduino-cli)", ok_c,
+                  err_c[:120] if not ok_c else "compile OK")
 
     firm = _run_firmware_vectors()
     if firm is None:

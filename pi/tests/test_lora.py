@@ -24,6 +24,15 @@ test_lora.py — اختبار منفرد لوصلة اللورا HC-14 على ا
     python3 pi/tests/test_lora.py /dev/ttyUSB1    # لتحديد منفذ آخر
     python3 pi/tests/test_lora.py listen          # ★★ إصغاء صرف — أقوى إثبات للوصلة
     python3 pi/tests/test_lora.py at              # ★ فحص وحدة واحدة عبر أوامر AT
+    python3 pi/tests/test_lora.py hex             # ◆ بايتات خام hex — تشريح التلف
+    python3 pi/tests/test_lora.py probe           # ◆ hex + بثّ $PROBE,<n> كل ثانيتين
+
+◆ وضعا التشريح البايتي (يقابلان firmware/lora_probe على الشاشة):
+   «إطار مرفوض» يخفي شكل العطل؛ الـhex يفرّقه: خربشة عشوائية = باود/سلك/
+   تغذية · نص سليم مبتور = تأطير · نص شبه سليم ببتات مقلوبة = RF (الأرجح
+   تشبّع: وحدتان +20dBm على نفس الطاولة — باعد مترين أو AT+P6 مؤقتاً).
+   شاشة→راسبري: lora_probe على الشاشة + `hex` هنا.
+   راسبري→شاشة: `probe` هنا + راقب RX< في شاشة lora_probe التسلسلية.
 
 ⚠⚠ **درس مقاس (2026-08-06): الصدى ليس استقبالاً** ⚠⚠
    نتيجة سابقة (PING,1 → «استُقبل PING,1») ظُنّت رداً من الشاشة — والشاشة
@@ -214,6 +223,66 @@ def listen_mode(port: str) -> None:
     _verdict(real_rx, 0, corrupt)
 
 
+def hex_mode(port: str, send_probe: bool = False) -> None:
+    """
+    ◆ تشريح بايتي: يطبع **كل** ما يصل hex + ASCII مع فارق الزمن، ويحكم
+    على كل سطر مكتمل (سليم/تالف وسبب التلف). مع `send_probe` يبثّ أيضاً
+    `$PROBE,<n>` كل ثانيتين — فيُختبر الاتجاهان بأداة واحدة.
+
+    لماذا hex؟ «إطار مرفوض» يخفي البصمة. شكل البايتات يفرّق العلل:
+    خربشة = باود/كهرباء · بتر = تأطير · بتات مقلوبة قليلة = RF/تشبّع.
+    """
+    ser = _open(port)
+    role = "probe (بثّ + تشريح)" if send_probe else "hex (تشريح صرف — لا إرسال)"
+    print(f"وضع {role} على {port} @ {BAUD}. Ctrl-C للإيقاف.\n")
+    rd = LineBuffer(ser)
+    n_probe = 0
+    last_tx = 0.0
+    last_rx = None
+    frames_ok = frames_bad = 0
+    try:
+        while True:
+            now = time.time()
+            if send_probe and (now - last_tx) >= 2.0:
+                last_tx = now
+                n_probe += 1
+                f = build_frame(f"PROBE,{n_probe}")
+                ser.write(f)
+                print(f"TX> {f.decode('ascii').strip()}")
+
+            chunk = ser.read(64)
+            if chunk:
+                dt = "" if last_rx is None else f" (+{(now - last_rx)*1000:.0f}ms)"
+                last_rx = now
+                hx = " ".join(f"{b:02X}" for b in chunk)
+                asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+                print(f"RX<{dt} hex: {hx}")
+                print(f"    ascii: \"{asc}\"")
+                # حكم على الأسطر المكتملة عبر نفس المجمّع
+                rd.buf += chunk
+                while b"\n" in rd.buf:
+                    line, rd.buf = rd.buf.split(b"\n", 1)
+                    s = line.decode("ascii", errors="replace").strip()
+                    if not s:
+                        continue
+                    p = parse_frame(s)
+                    if p is None:
+                        frames_bad += 1
+                        print(f"    ⇒ ❌ إطار تالف: {s!r}")
+                    else:
+                        frames_ok += 1
+                        print(f"    ⇒ ✅ إطار سليم: {p}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ser.close()
+    print(f"\n─── الخلاصة: سليمة {frames_ok} · تالفة {frames_bad} ───")
+    if frames_bad and not frames_ok:
+        print("كل الأطر تالفة — انظر شكل الـhex أعلاه:")
+        print("  خربشة عشوائية ⇒ باود/سلك/تغذية · نص مبتور ⇒ تأطير ·")
+        print("  بتات مقلوبة قليلة ⇒ RF: باعد الوحدتين مترين أو AT+P6 مؤقتاً.")
+
+
 def main() -> None:
     ser = _open(PORT)
     print(f"وصلة اللورا على {PORT} @ {BAUD}. يبثّ PING كل ثانية ويصغي. "
@@ -277,9 +346,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "at":
-        at_diagnostics(sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyUSB0")
-    elif len(sys.argv) > 1 and sys.argv[1] == "listen":
-        listen_mode(sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyUSB0")
+    _mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    _port = sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyUSB0"
+    if _mode == "at":
+        at_diagnostics(_port)
+    elif _mode == "listen":
+        listen_mode(_port)
+    elif _mode == "hex":
+        hex_mode(_port, send_probe=False)
+    elif _mode == "probe":
+        hex_mode(_port, send_probe=True)
     else:
         main()
