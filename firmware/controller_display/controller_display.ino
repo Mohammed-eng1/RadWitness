@@ -42,6 +42,7 @@
 
 #include "config.h"
 #include "protocol.h"
+#include "lineio.h"   // pump() lives in a header ON PURPOSE -- see its note
 
 TFT_eSPI tft = TFT_eSPI();
 SPIClass touchSpi(VSPI);
@@ -216,20 +217,8 @@ void handleUsbLine(const char *line) {
   loraSerial.print('\n');
 }
 
-// === Line reader for a port (non-blocking) ====================
-template <typename S>
-void pump(S &port, char *buf, size_t cap, size_t &len, void (*cb)(const char *)) {
-  while (port.available()) {
-    char ch = (char)port.read();
-    if (ch == '\n' || ch == '\r') {
-      if (len > 0) { buf[len] = 0; cb(buf); len = 0; }
-    } else if (len < cap - 1) {
-      buf[len++] = ch;
-    } else {
-      len = 0;                                // line exceeds cap => discard it
-    }
-  }
-}
+// (line reader pump() is in lineio.h -- the sketch preprocessor mangles
+//  its prototype when it sits in the .ino; see the note there)
 
 char usbBuf[96];  size_t usbLen  = 0;
 char loraBuf[96]; size_t loraLen = 0;

@@ -15,6 +15,12 @@
  *
  * ASCII only in this file -- see the BiDi note in controller_display.ino.
  */
+// The Arduino IDE compiles EVERY root-level .cpp in the sketch folder,
+// and this host-only tool (with its own main()) must never be part of
+// the firmware build. ARDUINO is defined by the IDE/arduino-cli and is
+// absent in the plain g++ host build, so this guard excludes the file
+// from the firmware while leaving the host test untouched.
+#if !defined(ARDUINO)
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -69,3 +75,5 @@ int main() {
   }
   return 0;
 }
+
+#endif  // !defined(ARDUINO)
