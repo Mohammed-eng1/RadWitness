@@ -197,12 +197,21 @@ def main() -> int:
                    "suggest_deg": dec.get("correction_deg", 0.0),
                    "apply": bool(dec.get("apply")), "why": dec["reason"],
                    "hold_err_deg": hh.get("final_error_deg"),
-                   "sat_pct": hh.get("saturated_pct")}
+                   "sat_pct": hh.get("saturated_pct"),
+                   "spikes": hh.get("spikes"),
+                   "heading_deg": round(hs.heading, 1)}
             rows.append(row)
             print(f"  شوط {i}/{n_seg}: أودو={row['odom_m']}م · "
                   f"جانب⊥={d}سم (Δ={row['drift_cm']}سم) · "
                   f"اقتراح={row['suggest_deg']:+.2f}° [{row['why']}]"
                   + (" ← طُبّق" if (a.correct and row["apply"]) else ""))
+            # ⚠ سطر التشخيص (مقاس 2026-08-06: انعطاف يميني حاد لم يقاومه
+            #   المتحكّم): heading المُدمَج مقابل ما تراه عينك هو الفيصل —
+            #   دوران فيزيائي واضح وheading≈0 = المرشّح رفض الدوران الحقيقي
+            #   (فخّ عتبة طور السير §1.1.3)، وعدّاد القفزات شاهده المباشر.
+            print(f"      heading={row['heading_deg']}° · "
+                  f"خطأ التثبيت={row['hold_err_deg']}° · "
+                  f"إشباع={row['sat_pct']}% · قفزات مرفوضة={row['spikes']}")
             if a.correct and dec.get("apply"):
                 heading_err = dec["correction_deg"]
                 applied += 1
