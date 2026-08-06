@@ -1110,6 +1110,16 @@ def main() -> int:
     check("أُمر بـ0.5م والمسافة لم تتغيّر → **لا حركة** (نفي قاطع)",
           v_none["verdict"] == NO_MOTION and v_none["moved"] is False
           and v_none["confident"])
+    # 🔴 مقاس 2026-08-06: جولة سير حقيقية (شوهدت بالعين) أُجهضت «لا حركة»
+    #    كاذبةً — صدى الأمامي الغالب من جسم مائل عن محور السير فلا تتغيّر
+    #    مسافته مع التقدّم. «لا حركة» قاتلة فلا تُعلَن إلا **باتفاق الشاهدين**.
+    v_conf = verify_motion(0.33, 120.0, 119.0, moving)
+    check("أمامي ثابت والتسارع يرى حركة → تعارض = ثقة منخفضة لا إجهاض",
+          v_conf["verdict"] == UNVERIFIED and v_conf["method"] == "conflict"
+          and not v_conf["confident"], v_conf["reason"][:60])
+    v_agree = verify_motion(0.33, 120.0, 119.0, still)
+    check("أمامي ثابت والتسارع ساكن → «لا حركة» تبقى قاطعة (روفر مطفأ)",
+          v_agree["verdict"] == NO_MOTION and v_agree["confident"])
     v_over = verify_motion(0.3, 200.0, 120.0)
     check("تجاوز المأمور بفارق دالّ يُكشف أيضاً",
           v_over["verdict"] == OVERSHOOT and not v_over["confident"])

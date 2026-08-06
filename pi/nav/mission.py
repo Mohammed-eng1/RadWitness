@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from pi.config import (
+    FRONT_WALL_CORRECTION_ENABLED,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -912,8 +913,11 @@ class MissionSim:
             # انسحاب: لا وقت للقياس، والخلية مزارة أصلاً على الأثر
             self.dirty.add(self.current)
         s = self.sensors()
-        corr = self.executor.maybe_wall_correct(self.dr, self.heading,
-                                                s.get("ultrasonic_cm"))
+        # ⚠ خلف علم بقرار «الأمامي للعوائق فقط» — قراءته متعددة العواكس
+        #   فتصحيح الموضع منها يحقن خطأً أسوأ من الشك المعلَن (2026-08-06).
+        corr = (self.executor.maybe_wall_correct(self.dr, self.heading,
+                                                 s.get("ultrasonic_cm"))
+                if FRONT_WALL_CORRECTION_ENABLED else None)
         if corr and corr.get("corrected"):
             self._wall_corrections += 1
         # 🔴 تصحيح **الاتجاه** من الجدار الجانبي — يسبق فحص البوابة لأنه

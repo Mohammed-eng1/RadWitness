@@ -154,6 +154,22 @@ def verify_motion(commanded_m: float, d_start_cm, d_end_cm,
                 f"حركة عكسية")
             return out
         if abs(delta) < MOTION_NO_MOTION_M:
+            # 🔴 «لا حركة» حكم قاتل (لا تُعلَّم الخلية، و3 تكرارات توقف
+            #    المهمة) — فلا يُعلَن من الأمامي وحده إذا عارضه شاهد التسارع.
+            #    مقاس 2026-08-06: جولة سير حقيقية (شوهدت بالعين) أُجهضت «لا
+            #    حركة» كاذبةً لأن صدى الأمامي الغالب جاء من جسم **مائل عن
+            #    محور السير** فلم تتغيّر مسافته مع التقدّم (Δ=4سم على أمر
+            #    33سم). التعارض ⇒ ثقة منخفضة لا إجهاض. وحالة الروفر المطفأ
+            #    تبقى مكشوفة: سكون تامّ في الشاهدين **معاً**.
+            if a_verdict is True:
+                out.update({"verdict": UNVERIFIED, "method": "conflict",
+                            "moved": True, "confident": False,
+                            "reason": (f"⚠ تعارض الشاهدين: الأمامي ثابت "
+                                       f"({abs(delta) * 100:.0f}سم على أمر "
+                                       f"{commanded:.2f}م) والتسارع يرى حركة "
+                                       f"— مرجع أمامي مشبوه (صدى مائل عن "
+                                       f"محور السير؟) ⇒ ثقة منخفضة")})
+                return out
             out.update({"verdict": NO_MOTION, "method": "ultrasonic",
                         "moved": False, "confident": True, "measured_m": 0.0,
                         "reason": f"المسافة الأمامية لم تتغيّر ({abs(delta) * 100:.0f}سم) "
