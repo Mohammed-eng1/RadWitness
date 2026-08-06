@@ -324,6 +324,44 @@ def main() -> None:
     check("وزر «قِس الأبعاد تلقائياً» موجود في إعداد الغرفة",
           'id="btnMeasure"' in html_sim and "room/measure" in html_sim)
 
+    # ═══ ك) تشغيلية اللوحة الرئيسية (دفعة ملاحظات 2026-08-06) ══════
+    section("ك) تشغيلية اللوحة الرئيسية:")
+    html = c.get("/").text
+    check("إعداد الغرفة في اللوحة الرئيسية (طول/عرض/تباعد/ركن/معايرة)",
+          'id="cardRoom"' in html and 'id="rmCorners"' in html
+          and 'id="rmCalib"' in html and 'id="rmMeasure"' in html)
+    check("إرشاد «لا غرفة» بدل خريطة سوداء", 'id="mapGuide"' in html)
+    check("لافتة الجسر البارزة في القيادة اليدوية + نتيجة كل أمر",
+          'id="bridgeBanner"' in html and 'id="cmdResult"' in html)
+    check("لوحة المصدر (حالة كشف · Λ · ثقة) + تراكب حراري",
+          'id="srcPanel"' in html and "drawHeatmap" in html)
+    check("لوحة التقرير بالتصدير CSV والطباعة",
+          'id="cardReport"' in html and "/api/mission/csv" in html)
+
+    r = c.post("/api/manual/command", json={"cmd": "STOP"}).json()
+    check("🔴 ردّ الأمر اليدوي يحمل وضع الجسر والقيم المرسلة (لا قبول صامتاً على sim)",
+          "rover" in r and "mode" in r["rover"] and "cmd_lr" in r["rover"],
+          str(r.get("rover"))[:60])
+
+    e = c.get("/api/mission/estimate").json()
+    check("الزمن التقديري مع غرفة قائمة: خلايا وثوانٍ وحكم الحاجز",
+          e.get("ok") and e.get("survey_s", 0) > 0
+          and "fits_time_limit" in e and "battery" in e,
+          f"{e.get('cells_free')} خلية ≈ {e.get('survey_s')}ث")
+
+    r = c.get("/api/doc/image/0")
+    check("صور التوثيق: 404 بسبب مقروء قبل التوثيق (كانت حبيسة الذاكرة)",
+          r.status_code == 404 and "توثيق" in r.text, r.text[:50])
+
+    st = c.get("/api/lora/status").json()
+    check("سبب آخر رفض راديو مكشوف (لا رقم عارياً)",
+          "last_reject" in st and "echoes" in st)
+
+    boot = c.get("/api/boot").json()
+    check("البطارية بمصدرها في خلاصة الإقلاع",
+          "battery" in boot["health"] and "source" in boot["health"]["battery"],
+          str(boot["health"]["battery"])[:60])
+
     print(f"\n=== النتيجة: {_passed}/{_passed + _failed} نجح ===")
     if _failed:
         sys.exit(1)

@@ -297,6 +297,9 @@ class LoRaLink:
             "frames_rx": self.frames_rx, "frames_bad": self.frames_bad,
             "commands_ok": self.commands_ok,
             "echoes": self.echoes,
+            # سبب آخر رفض — رقم «مرفوضة» العاري بلا سببه نصف معلومة
+            "last_reject": self._last_bad_reason,
+            "reject_streak": self._bad_streak,
             "last_frame": self.last_frame,
             "last_rx_ts": self.last_rx_ts,
             "seq": self.seq_guard.state(),

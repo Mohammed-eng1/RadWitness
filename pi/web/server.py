@@ -185,6 +185,9 @@ def _boot_summary() -> dict:
             "side_ultrasonic": {
                 "ok": bool(_side_us.get("ok")),
                 "error": _side_us.get("reason") or _side_us.get("error")},
+            # البطارية بمصدرها وسبب غيابه — «جهد مجهول» بلا سبب نصف معلومة
+            "battery": {k: v for k, v in mission.rover.battery_state().items()
+                        if k in ("v", "source", "source_reason", "text")},
         },
     }
 
@@ -686,7 +689,16 @@ def api_manual_command(body: ManualCmdReq):
     `def` لا `async def`: النداء يكتب على السيريال (حاجب) فيعمل في
     threadpool بلا تجميد حلقة البثّ.
     """
-    return manual.command(body.cmd, power=body.power, source=SOURCE_MANUAL)
+    res = manual.command(body.cmd, power=body.power, source=SOURCE_MANUAL)
+    # 🔴 مع كل ردّ: وضع الجسر والقيم المرسلة فعلاً — عطل مقاس (2026-08-06):
+    #    السيرفر أُقلع بلا RMS_ROVER_MODE=real فقبل كل أمر «بنجاح» وحرّك
+    #    روبوتاً وهمياً، والمستخدم أمام روبوت ساكن بلا أي رسالة. القبول
+    #    الصامت على جسر sim أسوأ من الرفض الصريح.
+    rover = mission.rover
+    res["rover"] = {"mode": rover.mode, "error": rover.error,
+                    "cmd_lr": list(getattr(rover, "_cmd_lr", (0.0, 0.0))),
+                    "link_ok": getattr(rover, "link_ok", None)}
+    return res
 
 
 @app.post("/api/manual/enable")
@@ -728,6 +740,57 @@ async def api_lora_stop():
 async def api_obstacle(req: Request):
     d = await req.json()
     return mission.toggle_obstacle(int(d["row"]), int(d["col"]))
+
+
+@app.get("/api/mission/estimate")
+async def api_mission_estimate():
+    """
+    زمن المهمة التقديري **قبل البدء**: خلايا حرّة × (توقف + حركة)، مقارناً
+    بالحاجز الزمني والبطارية — المستخدم يعرف قبل الضغط هل ستكتمل.
+
+    ⚠ تقدير صريح الحدود: لا يشمل مراحل التأكيد/الاقتراب (تعتمد على ما
+    يُكتشف) — يُقال ذلك في الرد لا يُخفى.
+    """
+    from pi.config import CELL_DWELL_S, MISSION_TIME_LIMIT_S, DRIVE_POWER_DEFAULT
+    if mission.grid is None:
+        return {"ok": False, "reason": "عرّف الغرفة أولاً"}
+    if mission.profile is None:
+        return {"ok": False, "reason": "لا ملف معايرة — السرعة مجهولة"}
+    counts = mission.grid.counts()
+    free = int(counts.get("total", 0)) - int(counts.get("blocked", 0))
+    spacing = float(getattr(mission.room, "scan_spacing_m", 0.5) or 0.5)
+    speed = float(mission.profile.speed_for_power(DRIVE_POWER_DEFAULT) or 0.3)
+    move_s = spacing / max(speed, 0.05)
+    survey_s = free * (CELL_DWELL_S + move_s)
+    batt = mission.rover.battery_state()
+    return {
+        "ok": True,
+        "cells_free": free,
+        "dwell_s": CELL_DWELL_S,
+        "move_s_per_cell": round(move_s, 2),
+        "survey_s": round(survey_s),
+        "time_limit_s": MISSION_TIME_LIMIT_S,
+        "fits_time_limit": survey_s <= MISSION_TIME_LIMIT_S,
+        "battery": {"v": batt.get("v"), "percent": batt.get("percent"),
+                    "text": batt.get("text"), "source": batt.get("source")},
+        "note": "التقدير للمسح وحده — التأكيد والاقتراب يعتمدان على ما يُكتشف",
+    }
+
+
+@app.get("/api/doc/image/{idx}")
+async def api_doc_image(idx: int):
+    """صور التوثيق الثلاث — كانت بايتات حبيسة الذاكرة بلا أي مسار يقدّمها."""
+    d = mission.documentation or {}
+    imgs = d.get("images") or []
+    if not imgs:
+        return JSONResponse({"ok": False, "error": "لا صور توثيق بعد — "
+                             "تُلتقط في مرحلة التوثيق آخر الدورة"},
+                            status_code=404)
+    if not 0 <= idx < len(imgs):
+        return JSONResponse({"ok": False,
+                             "error": f"الفهرس {idx} خارج المدى 0..{len(imgs)-1}"},
+                            status_code=404)
+    return Response(content=imgs[idx], media_type="image/jpeg")
 
 
 @app.get("/api/mission/csv")

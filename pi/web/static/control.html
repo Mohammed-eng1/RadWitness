@@ -102,6 +102,55 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
   border-radius:9px;font-size:13px;line-height:1.7;margin-top:9px}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap}
 
+/* إعداد الغرفة */
+.formgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.formgrid label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--dim)}
+.formgrid input{width:100%}
+.corners{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.corners button{padding:7px;font-size:13px}
+.corners button.sel{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+
+/* إرشاد «لا غرفة» فوق الخريطة */
+.mapguide{position:absolute;inset:0;display:none;flex-direction:column;gap:9px;
+  align-items:center;justify-content:center;text-align:center;font-size:16px;
+  background:rgba(8,12,19,.88);border-radius:10px;padding:20px;line-height:1.9}
+.mapguide.on{display:flex}
+
+/* الجاهزية والتقدير */
+.blocker{color:#fca5a5;font-size:13px;padding:3px 0}
+.warning{color:#fcd34d;font-size:13px;padding:3px 0}
+.estline{font-size:13px;color:var(--dim);padding:6px 9px;background:var(--panel2);
+  border-radius:8px;margin:8px 0;line-height:1.8}
+
+/* لافتة الجسر ونتيجة الأمر في القيادة اليدوية */
+.bridge{padding:9px 13px;border-radius:9px;font-weight:700;font-size:14px;
+  margin-bottom:10px;line-height:1.7}
+.bridge.real{background:#0c2b18;border:1px solid #166534;color:#86efac}
+.bridge.sim{background:#3a2606;border:1px solid #b45309;color:#fcd34d}
+.cmdres{margin:10px auto 0;max-width:420px;font-size:13px;padding:8px 11px;
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  text-align:center;line-height:1.7;min-height:20px}
+.cmdres.ok{border-color:#166534}
+.cmdres.bad{border-color:#b45309;color:#fcd34d}
+
+/* التقرير */
+.thumbs{display:flex;gap:9px;margin-top:10px;flex-wrap:wrap}
+.thumbs img{width:150px;height:112px;object-fit:cover;border-radius:8px;
+  border:1px solid var(--line);cursor:pointer}
+.repgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  gap:9px;margin-top:9px}
+.repbox{background:var(--panel2);border-radius:9px;padding:10px 12px}
+.repbox .k{font-size:12px;color:var(--dim)}
+.repbox .v{font-size:15px;font-weight:700;margin-top:3px;color:var(--fg)}
+@media print{
+  body.printing > :not(.wrap){display:none !important}
+  body.printing .wrap > :not(#mapcol){display:none !important}
+  body.printing #paneManual,body.printing #mapGuide{display:none !important}
+  body.printing{background:#fff;color:#000}
+  body.printing .card{border:1px solid #999;background:#fff;color:#000}
+}
+
 /* حوار التأكيد */
 .modal{position:fixed;inset:0;background:rgba(2,5,12,.82);display:none;
   align-items:center;justify-content:center;z-index:100;padding:18px}
@@ -139,15 +188,47 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
 <div class="grid2">
 
   <!-- ═══ وسط: الخريطة (محاكاة/ذاتي) أو الكاميرا (يدوي) ═══ -->
-  <div>
+  <div id="mapcol">
     <div class="card" id="paneMap">
-      <h2>الخريطة الإشعاعية</h2>
-      <canvas id="map" width="760" height="560"></canvas>
+      <h2>الخريطة الإشعاعية <span class="pill" id="srcBadge" style="display:none"></span></h2>
+      <div style="position:relative">
+        <canvas id="map" width="760" height="560"></canvas>
+        <div class="mapguide" id="mapGuide">
+          🗺️ لا غرفة معرَّفة بعد<br>
+          <span class="muted">املأ «إعداد الغرفة» في العمود الجانبي — أو اضغط
+          «قِس تلقائياً» ليقيس الروبوت الأبعاد بنفسه — ثم «ابدأ».</span>
+        </div>
+      </div>
       <div class="muted" id="coverage" style="margin-top:10px">—</div>
+      <div class="rows" id="srcPanel" style="display:none;margin-top:10px">
+        <div class="row"><span>حالة الكشف</span><b id="srcState">—</b></div>
+        <div class="row"><span>الخلاصة</span><b id="srcHead" style="font-size:13px">—</b></div>
+        <div class="row"><span>الموقع المقدَّر ± الشك</span><b id="srcPos">—</b></div>
+        <div class="row"><span>Λ (الدليل الإحصائي)</span><b id="srcLambda">—</b></div>
+        <div class="row"><span>الثقة · عدد القياسات</span><b id="srcConf">—</b></div>
+      </div>
+    </div>
+
+    <div class="card" id="cardReport" style="display:none;margin-top:14px">
+      <h2>📋 التقرير النهائي
+        <span style="float:left">
+          <button id="repCsv" style="font-size:13px;padding:6px 12px">⬇ CSV القراءات</button>
+          <button id="repPrint" style="font-size:13px;padding:6px 12px">🖨 طباعة / PDF</button>
+        </span>
+      </h2>
+      <div id="repBody" class="muted">—</div>
+      <div id="repThumbs" class="thumbs"></div>
+      <div class="muted" style="margin-top:8px;font-size:12.5px">
+        ⚠ تحفّظ منهجي: الصورة توثّق <b>الموقع</b> ولا تثبت هوية الجسم المشعّ —
+        الإثبات إحصائي (Λ والتأكيد المستقل) والصورة قرينة مكانية.
+      </div>
     </div>
 
     <div class="card hide" id="paneManual">
       <h2>القيادة اليدوية — بث مباشر</h2>
+      <!-- 🔴 وضع الجسر بارز هنا لا في التفاصيل السفلية: أوامر «تنجح» على
+           جسر محاكاة والروبوت الحقيقي ساكن — عطل صامت وقع فعلاً -->
+      <div id="bridgeBanner" class="bridge sim">جسر: —</div>
       <div class="cam" id="cam">
         <div class="camoff" id="camoff">الكاميرا متوقفة</div>
       </div>
@@ -162,6 +243,9 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
         <button data-cmd="BACK" title="S أو ↓">▼</button>
         <div></div>
       </div>
+      <!-- 🔴 نتيجة كل أمر بجانب الأزرار لا في السجل فقط: ack + السبب +
+           القيم التي خرجت فعلاً للجسر (L,R) بعد القصّ -->
+      <div id="cmdResult" class="cmdres">—</div>
       <div class="slider">
         <span class="muted" style="white-space:nowrap">السرعة</span>
         <input type="range" id="pw" min="0.1" max="0.5" step="0.05" value="0.3">
@@ -195,10 +279,38 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
       </div>
     </div>
 
+    <div class="card" id="cardRoom">
+      <h2>إعداد الغرفة</h2>
+      <div class="formgrid">
+        <label>الطول (م)<input type="number" id="rmLen" value="4" min="1" max="30" step="0.1"></label>
+        <label>العرض (م)<input type="number" id="rmWid" value="3" min="1" max="30" step="0.1"></label>
+        <label>تباعد المسح (م)<input type="number" id="rmSpace" value="0.5" min="0.25" max="2" step="0.05"></label>
+      </div>
+      <div class="muted" style="margin:8px 0 4px">ركن الانطلاق</div>
+      <div class="corners" id="rmCorners">
+        <button data-c="back_left" class="sel">خلف-يسار</button>
+        <button data-c="back_right">خلف-يمين</button>
+        <button data-c="front_left">أمام-يسار</button>
+        <button data-c="front_right">أمام-يمين</button>
+      </div>
+      <div class="slider" style="margin-top:9px">
+        <span class="muted" style="white-space:nowrap">المعايرة</span>
+        <select id="rmCalib" style="flex:1"></select>
+        <button id="rmNewCalib" title="ينشئ ملف معايرة المحاكاة (بطارية ممتلئة)">+ محاكاة</button>
+      </div>
+      <div class="btnrow" style="margin-top:10px">
+        <button id="rmCreate" class="primary">🗺️ إنشاء الغرفة</button>
+        <button id="rmMeasure" title="دورة المحيط: يتبع الجدار أربع لفّات ويقيس الأبعاد فعلياً — يحتاج ألترا سونيك جانبياً وقيادة محركات">📐 قِس تلقائياً</button>
+      </div>
+      <div id="rmMsg"></div>
+    </div>
+
     <div class="card" id="cardMission">
       <h2>المهمة</h2>
+      <div id="readiness"></div>
+      <div id="estimate"></div>
       <div class="btnrow">
-        <button data-m="start">▶ ابدأ</button>
+        <button data-m="start" id="btnStart">▶ ابدأ</button>
         <button data-m="pause">⏸ إيقاف مؤقت</button>
         <button data-m="resume">⏵ استئناف</button>
         <button data-m="return_home">🏠 عودة</button>
@@ -227,6 +339,7 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
         <div class="row"><span>مرفوضة</span><b id="rBad">0</b></div>
         <div class="row" title="العتاد يعيد ما نرسله — ليس استقبالاً لاسلكياً. تصاعده يعني صدى محلياً في المحوّل/الوحدة، ويُسقَط بلا ردّ فلا يشوّش القناة"><span>صدى محلي (مُسقَط)</span><b id="rEcho">0</b></div>
       </div>
+      <div id="rejectWhy" class="muted" style="margin-top:7px"></div>
     </div>
   </div>
 </div>
@@ -320,6 +433,7 @@ function applyMode(m){
   $("#paneManual").classList.toggle("hide", !manual);
   $("#paneMap").classList.toggle("hide", manual);
   $("#cardMission").classList.toggle("hide", manual);
+  $("#cardRoom").classList.toggle("hide", manual);
   manual ? startCam() : stopCam();
 }
 
@@ -360,13 +474,27 @@ $("#pw").oninput = () => { $("#pwv").textContent = power().toFixed(2); };
 
 async function send(cmd){
   const r = await api("/api/manual/command", {cmd, power: power()});
+  // 🔴 نتيجة كل أمر **بجانب الأزرار** لا في السجل فقط: القرار + السبب +
+  //    ما خرج للجسر فعلاً (L,R بعد القصّ) — القبول على جسر sim يُفضح هنا
+  const rv = (r && r.rover) || {};
+  const lr = rv.cmd_lr || [];
+  const box = $("#cmdResult");
   if (r && r.ok === false){
-    // 🔴 لا فشل صامت: سبب الرفض يُعرض (سلامة/نمط/عطل)
+    box.className = "cmdres bad";
+    box.innerHTML = "⛔ <b>" + esc(r.ack || "رُفض") + "</b> — " + esc(r.reason || "");
     showMsg("#manualMsg", (r.ack === "SAFE" ? "⛔ رفضته طبقة السلامة: " : "⚠ ") + r.reason, "err");
-  } else if (r && r.safety && (r.safety.unknown || []).length){
-    showMsg("#manualMsg", "⚠ حساسات مجهولة: " + r.safety.unknown.join("، ") +
-            " — لا تُحسب شهادةً بخلوّ الطريق", "info");
-  } else { $("#manualMsg").innerHTML = ""; }
+  } else if (r){
+    box.className = "cmdres ok";
+    box.innerHTML = "✅ " + esc(cmd) + (r.power != null ? " · قوة " + r.power : "")
+      + " · خرج للجسر: L=" + esc(lr[0] != null ? lr[0] : "؟")
+      + " R=" + esc(lr[1] != null ? lr[1] : "؟")
+      + (rv.mode !== "real"
+         ? ' · <b style="color:var(--warn)">جسر محاكاة — الروبوت الحقيقي لن يتحرك</b>' : "");
+    if (r.safety && (r.safety.unknown || []).length)
+      showMsg("#manualMsg", "⚠ حساسات مجهولة: " + r.safety.unknown.join("، ") +
+              " — لا تُحسب شهادةً بخلوّ الطريق", "info");
+    else $("#manualMsg").innerHTML = "";
+  }
 }
 function hold(cmd, el){
   if (heldCmd === cmd) return;
@@ -601,6 +729,14 @@ function drawMap(st){
       ctx.setLineDash([]);
     }
   }
+  // 🔴 التراكب الاحتمالي **فوق** خريطة المسح وقبل الروبوت: أهم عنصر
+  //    بصري — تراه يتركّز مع تقدّم المسح (دقته 0.25م ≠ دقة التغطية 0.5م
+  //    عمداً، فيُرسم بشبكته هو لا بشبكة الخريطة)
+  if (st.source && st.source.active){
+    try { drawHeatmap(ctx, cv, st.source); }
+    catch(e){ /* تراكب معطوب لا يُسقط الخريطة الأساسية */ }
+  }
+
   const r = st.robot;
   if (r){
     const x = (r.col+0.5)*cw, y = (g.rows-1-r.row+0.5)*ch;
@@ -612,6 +748,211 @@ function drawMap(st){
     ctx.stroke();
   }
 }
+
+/* ═══ إعداد الغرفة ═══ */
+let rmCorner = "back_left";
+document.querySelectorAll("#rmCorners button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("#rmCorners button").forEach(x => x.classList.remove("sel"));
+  b.classList.add("sel"); rmCorner = b.dataset.c;
+});
+async function loadCalib(){
+  const r = await api("/api/calibration");
+  const sel = $("#rmCalib"); sel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = ""; none.textContent = "— لا معايرة —"; sel.appendChild(none);
+  (r.names || []).forEach(n => {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n; if (n === r.active) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+$("#rmCalib").onchange = async () => {
+  if ($("#rmCalib").value)
+    await api("/api/calibration/select", {name: $("#rmCalib").value});
+  fetchEstimate(true);
+};
+$("#rmNewCalib").onclick = async () => {
+  // ⚠ {} إلزامية: api() بلا جسم يرسل GET — ونقطة new_sim تقبل POST فقط
+  await api("/api/calibration/new_sim", {});
+  await loadCalib(); fetchEstimate(true);
+};
+$("#rmCreate").onclick = async () => {
+  const r = await api("/api/room", {length_m: +$("#rmLen").value,
+    width_m: +$("#rmWid").value, scan_spacing_m: +$("#rmSpace").value,
+    start_corner: rmCorner});
+  if (r.ok){
+    showMsg("#rmMsg", "✅ الغرفة جاهزة — " + r.grid.rows + "×" + r.grid.cols + " خلية", "info");
+    GRID = null; refetchGrid(); fetchEstimate(true);
+  } else showMsg("#rmMsg", "⛔ " + (r.error || "تعذّر الإنشاء"), "err");
+};
+// قياس الأبعاد تلقائياً (دورة المحيط) — خيط خلفي على السيرفر + استطلاع
+let _measTimer = null;
+$("#rmMeasure").onclick = async () => {
+  const r = await api("/api/room/measure", {});
+  if (!r.ok){ showMsg("#rmMsg", "⛔ " + (r.error || "تعذّر البدء"), "err"); return; }
+  showMsg("#rmMsg", "⏳ دورة القياس جارية — يتبع الجدار أربع لفّات…", "info");
+  clearInterval(_measTimer);
+  _measTimer = setInterval(async () => {
+    const s = await api("/api/room/measure/status");
+    if (s.running) return;
+    clearInterval(_measTimer);
+    const res = s.result || {};
+    if (!res.ok && res.reason){ showMsg("#rmMsg", "⛔ " + res.reason, "err"); return; }
+    const sm = res.summary || {};
+    let t = "✅ اكتمل القياس";
+    if (sm.width_m != null) t += " — المقاس: " + sm.width_m + "×" + sm.length_m + " م";
+    if (res.self_check && res.self_check.reason) t += " · " + res.self_check.reason;
+    showMsg("#rmMsg", t, "info");
+  }, 1500);
+};
+
+/* ═══ الجاهزية والزمن التقديري ═══ */
+let _estKey = "", _est = null;
+async function fetchEstimate(force){
+  const key = String((ST.counts || {}).total || 0) + ":" + ($("#rmCalib").value || "");
+  if (!force && key === _estKey) return;
+  _estKey = key;
+  _est = await api("/api/mission/estimate");
+  renderEstimate();
+}
+function renderEstimate(){
+  const e = _est, box = $("#estimate");
+  if (!e){ box.innerHTML = ""; return; }
+  if (!e.ok){ box.innerHTML = '<div class="estline">⏱ الزمن التقديري: ' + esc(e.reason) + '</div>'; return; }
+  const min = Math.round(e.survey_s / 60);
+  const lim = Math.round(e.time_limit_s / 60);
+  const bt = e.battery || {};
+  box.innerHTML = '<div class="estline">⏱ مسح ' + e.cells_free + ' خلية ≈ <b>' +
+    min + ' دقيقة</b> (توقف ' + e.dwell_s + 'ث + حركة ' + e.move_s_per_cell + 'ث/خلية)' +
+    ' · الحاجز الزمني ' + lim + ' د ' + (e.fits_time_limit ? "✅" :
+      '<b style="color:var(--bad)">⛔ لن تكتمل قبل الحاجز</b>') +
+    ' · البطارية: ' + (bt.v != null ? bt.v + "V (" + (bt.percent||"؟") + "%)" :
+      '<span style="color:var(--warn)">مجهولة — ' + esc(bt.source||"") + '</span>') +
+    '<br><span style="font-size:12px">' + esc(e.note) + '</span></div>';
+}
+function renderReadiness(st){
+  const rdy = st.readiness || {}, box = $("#readiness");
+  const blockers = rdy.blockers || [], warnings = rdy.warnings || [];
+  let h = "";
+  blockers.forEach(b => h += '<div class="blocker">⛔ ' + esc(b) + '</div>');
+  warnings.forEach(w => h += '<div class="warning">' + esc(w) + '</div>');
+  box.innerHTML = h;
+  const start = $("#btnStart");
+  start.disabled = blockers.length > 0 && st.state === "idle";
+  start.title = blockers.length ? "لا بدء قبل حل الموانع أعلاه" : "";
+}
+
+/* ═══ الخريطة الحرارية الاحتمالية + لوحة المصدر ═══ */
+const DET_AR = {none:"لا شيء", screening:"فرز", confirming:"تأكيد جارٍ",
+                confirmed:"🔴 مؤكَّد", rejected:"رُفض (ضوضاء)"};
+function drawHeatmap(ctx, cv, src){
+  const hm = src.heatmap;
+  if (!hm || !hm.length || !src.grid_cols || !src.grid_rows) return;
+  const rows = src.grid_rows, cols = src.grid_cols;
+  const cellW = cv.width / cols, cellH = cv.height / rows;
+  let mx = 0;
+  for (const row of hm) for (const v of row) if (v > mx) mx = v;
+  if (mx <= 0) return;
+  for (let r = 0; r < rows && r < hm.length; r++){
+    for (let c = 0; c < cols && c < hm[r].length; c++){
+      const f = hm[r][c] / mx;
+      if (f < 0.04) continue;               // لا نلطّخ الخريطة بذيل شفاف
+      ctx.fillStyle = "rgba(239,68,68," + (f * 0.55).toFixed(3) + ")";
+      ctx.fillRect(c * cellW, (rows - 1 - r) * cellH, cellW, cellH);
+    }
+  }
+  // الموقع المقدَّر + دائرة عدم اليقين (متران بالأمتار على أبعاد الشبكة)
+  if (src.position){
+    const wM = cols * src.grid_res_m, hM = rows * src.grid_res_m;
+    const px = src.position[0] / wM * cv.width;
+    const py = cv.height - src.position[1] / hM * cv.height;
+    if (src.uncertainty_m != null){
+      ctx.strokeStyle = "rgba(252,211,77,.85)"; ctx.lineWidth = 2;
+      ctx.setLineDash([6,4]);
+      ctx.beginPath();
+      ctx.arc(px, py, src.uncertainty_m / wM * cv.width, 0, 7); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = "#fde047"; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px-9, py-9); ctx.lineTo(px+9, py+9);
+    ctx.moveTo(px-9, py+9); ctx.lineTo(px+9, py-9); ctx.stroke();
+  }
+}
+function renderSource(st){
+  const src = st.source || {};
+  const on = !!src.active;
+  $("#srcPanel").style.display = on ? "" : "none";
+  const badge = $("#srcBadge");
+  if (on){
+    const det = src.detection_state || "none";
+    badge.style.display = "";
+    badge.textContent = DET_AR[det] || det;
+    badge.style.color = det === "confirmed" ? "#fca5a5" :
+                        det === "confirming" ? "#fcd34d" : "var(--dim)";
+    $("#srcState").textContent = DET_AR[det] || det;
+    $("#srcHead").textContent = src.headline || "—";
+    $("#srcPos").textContent = (src.found && src.position)
+      ? src.position[0].toFixed(2) + " , " + src.position[1].toFixed(2) + " م ± " +
+        (src.uncertainty_m != null ? src.uncertainty_m.toFixed(2) : "؟") + " م"
+      : "غير محدَّد — لا دليل كافٍ بعد";
+    $("#srcLambda").textContent = src.lambda_stat != null
+      ? Math.round(src.lambda_stat).toLocaleString("en") +
+        (src.threshold ? " / عتبة " + Math.round(src.threshold) : "") : "—";
+    $("#srcConf").textContent =
+      (src.confidence != null ? Math.round(src.confidence * 100) + "%" : "—") +
+      " · " + (src.n_readings || 0) + " قياساً";
+  } else badge.style.display = "none";
+}
+
+/* ═══ التقرير النهائي ═══ */
+let _repShown = false;
+async function maybeShowReport(st){
+  const done = st.state === "done" || st.phase === "report";
+  if (!done){ if (st.state === "running") { _repShown = false; $("#cardReport").style.display = "none"; } return; }
+  if (_repShown) return;
+  _repShown = true;
+  const rep = await api("/api/mission/report");
+  const src = rep.source || {};
+  const mx = rep.max_reading || null;
+  const doc = rep.documentation || {};
+  let h = '<div class="repgrid">';
+  h += '<div class="repbox"><div class="k">الخلاصة</div><div class="v" style="font-size:13.5px">' + esc(src.headline || "—") + '</div></div>';
+  h += '<div class="repbox"><div class="k">الموقع ± الشك</div><div class="v">' +
+    // ⚠ found شرط لازم: بلا دليل يوجد «موضع» رياضي (مركز التوزيع) وعرضه
+    //   يوحي بمصدر حيث لا شيء — نفس درس المحدِّد نفسه
+    (src.found && src.position
+      ? src.position[0].toFixed(2) + "," + src.position[1].toFixed(2) +
+        " م ± " + (src.uncertainty_m != null ? src.uncertainty_m.toFixed(2) : "؟") + " م"
+      : "لا موقع — لا دليل إحصائي على مصدر") + '</div></div>';
+  h += '<div class="repbox"><div class="k">الثقة · Λ</div><div class="v">' +
+    (src.confidence != null ? Math.round(src.confidence*100) + "%" : "—") + " · " +
+    (src.lambda_stat != null ? Math.round(src.lambda_stat).toLocaleString("en") : "—") + '</div></div>';
+  h += '<div class="repbox"><div class="k">أعلى جرعة</div><div class="v">' +
+    (mx ? mx.usvh + " µSv/h (" + esc(mx.risk||"") + ")" : "—") + '</div></div>';
+  h += '<div class="repbox"><div class="k">التغطية</div><div class="v" style="font-size:13px">' + esc(rep.coverage_text || "—") + '</div></div>';
+  h += '<div class="repbox"><div class="k">المدة</div><div class="v">' + Math.round((rep.duration_s||0)/60) + " دقيقة" + '</div></div>';
+  h += '</div>';
+  if (doc && doc.statement)
+    h += '<div class="info" style="margin-top:10px">📷 ' + esc(doc.statement) + '</div>';
+  if (rep.state && !src.headline)
+    h += '<div class="estline">لا بيانات محدِّد مصدر — المهمة انتهت قبل مرحلة الفرز.</div>';
+  $("#repBody").innerHTML = h;
+  const th = $("#repThumbs"); th.innerHTML = "";
+  for (let i = 0; i < (doc.n_images || 0); i++){
+    const im = document.createElement("img");
+    im.src = "/api/doc/image/" + i;
+    im.title = "صورة التوثيق " + (i+1) + " — انقر للتكبير";
+    im.onclick = () => window.open(im.src, "_blank");
+    th.appendChild(im);
+  }
+  $("#cardReport").style.display = "";
+}
+$("#repCsv").onclick = () => { location.href = "/api/mission/csv"; };
+$("#repPrint").onclick = () => {
+  document.body.classList.add("printing");
+  setTimeout(() => { window.print(); document.body.classList.remove("printing"); }, 60);
+};
 
 /* ═══ تحديث الحالة ═══ */
 function apply(st){
@@ -659,9 +1000,55 @@ function apply(st){
   $("#rEcho").textContent = lo.echoes || 0;
   $("#rEcho").style.color = (lo.echoes || 0) > 0 ? "var(--warn)" : "";
 
-  const rdy = st.readiness || {};
-  if (rdy.blockers && rdy.blockers.length && st.state === "idle")
-    showMsg("#readyMsg", "⛔ " + rdy.blockers.join(" · "), "err");
+  $("#rejectWhy").innerHTML = lo.last_reject
+    ? "⚠ سبب آخر رفض: " + esc(lo.last_reject) +
+      ((lo.reject_streak || 0) > 1 ? " (×" + lo.reject_streak + ")" : "")
+    : "";
+
+  renderReadiness(st);
+  if (st.state === "idle" && st.counts) fetchEstimate(false);
+
+  // صفوف التفاصيل — كانت في HTML بلا أي سطر يملؤها (لهذا «—» في كل شيء)
+  const rov = st.rover || {};
+  const hs = rov.heading_source || {};
+  $("#dHead").textContent = hs.name || "—";
+  $("#dHead").style.color = hs.ok === false ? "var(--bad)" : "";
+  $("#dHead").title = hs.error || "";
+  $("#dBias").textContent = rov.gyro_bias != null
+    ? rov.gyro_bias + (rov.bias_calibrated ? "" : " (غير معاير)") : "—";
+  const mo = st.motion || {};
+  $("#dLow").textContent = mo.unverified_cells != null ? mo.unverified_cells : 0;
+  $("#dStuck").textContent = mo.stuck_streak || 0;
+  $("#dRover").textContent = rov.mode
+    ? (rov.mode === "real" ? "real — عتاد حقيقي" : "sim — محاكاة")
+      + (rov.error ? " ⚠" : "") : "—";
+  $("#dRover").style.color = rov.mode === "real" ? "var(--ok)" : "var(--warn)";
+  $("#dRover").title = rov.error || "";
+  $("#dBsrc").textContent = b.source
+    ? b.source + (b.source_reason ? " — " + b.source_reason : "") : "—";
+  $("#dSeq").textContent = lo.seq ? (lo.seq.last_seq != null ? lo.seq.last_seq : "—")
+    + " (قبول " + (lo.seq.accepted||0) + " · رفض " + (lo.seq.rejected||0) + ")" : "—";
+
+  // لافتة الجسر في القيادة اليدوية — القبول الصامت على sim وقع فعلاً
+  const bb = $("#bridgeBanner");
+  const man = st.manual || {};
+  if (rov.mode === "real"){
+    bb.className = "bridge real";
+    bb.innerHTML = "✅ جسر <b>حقيقي</b> — المحركات ستتحرك فعلياً · البوابة: " +
+      (man.enabled ? "مفتوحة" : "مغلقة (بدّل إلى نمط القيادة اليدوية)") +
+      (rov.error ? " · ⚠ " + esc(rov.error) : "");
+  } else {
+    bb.className = "bridge sim";
+    bb.innerHTML = "⚠ جسر <b>محاكاة</b> — الأوامر تُقبل لكن الروبوت الحقيقي" +
+      " <b>لن يتحرك</b>. شغّل السيرفر بـ<code>RMS_ROVER_MODE=real</code>" +
+      " أو بدّل من صفحة <a href='/sim' style='color:inherit'>الإعداد</a>." +
+      (rov.error ? " (سبب السقوط: " + esc(rov.error) + ")" : "");
+  }
+
+  renderSource(st);
+  maybeShowReport(st);
+  $("#mapGuide").classList.toggle("on",
+    st.state === "no_room" && MODE !== "manual");
 
   if (st.events) renderLog(st.events);
   syncGrid(st);
@@ -688,6 +1075,7 @@ function connect(){
 buildModes();
 initSerial();
 camOpts();
+loadCalib();
 api("/api/mode").then(m => applyMode(m.mode || "sim"));
 api("/api/sim/status").then(apply);
 connect();
