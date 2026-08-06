@@ -222,7 +222,9 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
           <option value="claude" selected>Claude</option>
           <option value="gemini">Gemini</option>
         </select>
-        <input type="text" id="aiModel" value="claude-opus-5" style="flex:1" title="اسم النموذج">
+        <input type="text" id="aiModel" value="claude-opus-5" list="aiModelList" style="flex:1" title="اسم النموذج">
+        <datalist id="aiModelList"></datalist>
+        <button id="aiModels" title="يجلب قائمة النماذج المتاحة لمفتاحك من المزوّد مباشرة">📋</button>
         <input type="password" id="aiKey" placeholder="مفتاح API — يبقى في متصفحك" style="flex:2">
       </div>
       <div class="btnrow" style="margin-top:9px">
@@ -1140,12 +1142,50 @@ async function aiTurn(userText, image){
     aiHistory.push({role: "assistant", text: reply || "(ردّ فارغ)"});
   } catch(e){
     aiHistory.pop();                       // لا نترك سؤالاً بلا جواب في السياق
-    showMsg("#aiMsg", "⛔ فشل النداء: " + esc(e.message) +
-      (String(e.message).includes("Failed to fetch")
-        ? " — تحقق من الإنترنت (النداء من متصفحك لا من الراسبري) أو من صلاحية المفتاح للنداء المتصفحي" : ""), "err");
+    const em = String(e.message);
+    showMsg("#aiMsg", "⛔ فشل النداء: " + esc(em) +
+      (em.includes("Failed to fetch")
+        ? " — تحقق من الإنترنت (النداء من متصفحك لا من الراسبري) أو من صلاحية المفتاح للنداء المتصفحي" : "") +
+      (/not.?found|not supported/i.test(em)
+        ? " — اسم النموذج متقادم على الأرجح: اضغط 📋 لجلب النماذج المتاحة لمفتاحك" : ""), "err");
   }
   aiBusy = false; aiRender();
 }
+
+/* ── جلب قائمة النماذج الحية من المزوّد (أسماء النماذج تتقادم —
+      المصدر الصادق الوحيد هو مفتاح المستخدم نفسه) ── */
+$("#aiModels").onclick = async () => {
+  const key = $("#aiKey").value.trim();
+  if (!key){ showMsg("#aiMsg", "⚠ أدخل مفتاح API أولاً ثم اجلب النماذج.", "err"); return; }
+  $("#aiMsg").innerHTML = '<div class="info">⏳ يجلب النماذج المتاحة لمفتاحك…</div>';
+  try {
+    let names = [];
+    if ($("#aiProvider").value === "gemini"){
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?key="
+                            + encodeURIComponent(key) + "&pageSize=200");
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+      names = (j.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+        .map(m => m.name.replace(/^models\//, ""));
+    } else {
+      const r = await fetch("https://api.anthropic.com/v1/models?limit=50", {
+        headers: {"x-api-key": key, "anthropic-version": "2023-06-01",
+                  "anthropic-dangerous-direct-browser-access": "true"},
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+      names = (j.data || []).map(m => m.id);
+    }
+    if (!names.length) throw new Error("القائمة عادت فارغة");
+    $("#aiModelList").innerHTML =
+      names.map(n => '<option value="' + esc(n) + '">').join("");
+    showMsg("#aiMsg", "✅ " + names.length + " نموذجاً متاحاً — افتح حقل النموذج "
+            + "واختر (أوائل القائمة: " + esc(names.slice(0, 4).join("، ")) + ")", "info");
+  } catch(e){
+    showMsg("#aiMsg", "⛔ تعذّر جلب النماذج: " + esc(e.message), "err");
+  }
+};
 
 $("#aiConsult").onclick = async () => {
   // فحص المفتاح **قبل** التقاط اللقطة — الالتقاط قد يستغرق ثواني بلا كاميرا
