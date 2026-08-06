@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 from pi.comms.control import ManualControl, SOURCE_RADIO
 from pi.comms.protocol import (
     ProtocolError, SequenceGuard, decode_command, encode_ack, encode_telemetry,
-    parse_frame, ACK_BADCRC, ACK_BADSEQ, CMD_STATUS,
+    parse_frame, ACK_BADCRC, ACK_BADCMD, ACK_BADSEQ, CMD_STATUS,
 )
 from pi.config import (
     LORA_ENABLED, LORA_PORT, LORA_BAUD, LORA_TELEMETRY_PERIOD_S,
@@ -77,6 +78,12 @@ class LoRaLink:
         # وتسجيل كلٍّ منها يدفن **أول سبب** وهو ما يُبحث عنه أصلاً.
         self._last_bad_reason = ""
         self._bad_streak = 0
+        # 🔴 كشف الصدى المحلي (مقاس 2026-08-06): المحوّل/الوحدة قد يعيد
+        #    كل ما نرسله. بلا هذا الكشف كان **الرد على الصدى يولّد صدى
+        #    الردّ**: تيليمتري ← صدى ← إقرار رفض ← صدى الإقرار ← إقرار…
+        #    2473 إطاراً في دقائق، كلها مرفوضة، والقناة الهوائية مشوَّشة.
+        self._tx_recent = deque(maxlen=32)   # (إطار مُرسَل، وقت إرساله)
+        self.echoes = 0
 
     # ── دورة الحياة ─────────────────────────────────────────────
     def start(self) -> dict:
@@ -153,21 +160,45 @@ class LoRaLink:
         line = (line or "").strip()
         if not line:
             return {"ok": False, "ignored": True}
+
+        # ٠) 🔴 صدى محلي: نفس ما أرسلناه للتوّ يعود إلينا (المحوّل/الوحدة).
+        #    يُسقَط **قبل أي معالجة وبلا أي ردّ** — الرد على الصدى يولّد
+        #    صدى الردّ فحلقة لا تنتهي (قِيست: 2473 إطاراً في دقائق).
+        for sent, ts in self._tx_recent:
+            if line == sent and (now - ts) <= 3.0:
+                self.echoes += 1
+                if self.echoes in (1, 100, 10000):
+                    self._log("lora_echo",
+                              f"⚠ صدى محلي ×{self.echoes}: العتاد يعيد ما "
+                              "نرسله — ليس استقبالاً لاسلكياً")
+                return {"ok": False, "echo": True}
+
         self.frames_rx += 1
         self.last_rx_ts = now
         self.last_frame = line[:64]
 
-        # ١) التأطير و الـchecksum
+        # ١) التأطير و الـchecksum — 🔴 **بلا إقرار**: إطار لا نثق حتى
+        #    بتسلسله لا يستحق ردّاً، والرد على الضجيج في قناة فيها صدى
+        #    وقودُ الحلقة أعلاه.
         try:
             payload = parse_frame(line)
         except ProtocolError as e:
-            return self._bad(ACK_BADCRC, str(e), seq=0)
+            return self._bad(ACK_BADCRC, str(e), seq=0, send_ack=False)
 
-        # ٢) فكّ الأمر (القائمة المغلقة تُفرض هنا)
+        # ١.٥) 🔴 ليست حمولة أمر أصلاً (تيليمتري/إقرار من طرف آخر — أو
+        #    صدى فات نافذة الكشف): تُسقَط صامتة معدودة. **لا إقرار أبداً**:
+        #    الإقرار على `T`/`A` هو بالضبط ما يجعل الصدى حلقة أبدية.
+        if not payload.startswith("C,"):
+            return self._bad(ACK_BADCRC,
+                             f"حمولة ليست أمراً ({payload[:12]!r}) — أُسقطت بلا ردّ",
+                             seq=0, send_ack=False)
+
+        # ٢) فكّ الأمر (القائمة المغلقة تُفرض هنا) — الإطار سليم التأطير
+        #    وبادئته `C,` ⇒ مرسله وحدة تحكم فعلية تستحق ردّاً بالرفض.
         try:
             cmd = decode_command(payload)
         except ProtocolError as e:
-            return self._bad(ACK_BADCRC, str(e), seq=0)
+            return self._bad(ACK_BADCMD, str(e), seq=0)
 
         # ٣) 🔴 منع إعادة الإرسال
         if not self.seq_guard.check(cmd.seq, now):
@@ -188,8 +219,15 @@ class LoRaLink:
             self._send_telemetry(now)
         return res
 
-    def _bad(self, ack: str, reason: str, seq: int = 0) -> dict:
-        """يسجّل رفضاً **مضغوطاً** ويردّ به على وحدة التحكم."""
+    def _bad(self, ack: str, reason: str, seq: int = 0,
+             send_ack: bool = True) -> dict:
+        """
+        يسجّل رفضاً **مضغوطاً**، ويردّ بإقرار **لأطر الأوامر وحدها**.
+
+        🔴 `send_ack=False` لكل ما ليس أمر `C,` سليم التأطير: الرد على
+        ضجيج/تيليمتري/إقرارات في قناة فيها صدى يولّد حلقة ذاتية التغذية
+        (قِيست). الإقرار حقّ وحدة تحكم حقيقية تنتظر نتيجة أمرها — فقط.
+        """
         self.frames_bad += 1
         if reason == self._last_bad_reason:
             self._bad_streak += 1
@@ -200,12 +238,15 @@ class LoRaLink:
             self._last_bad_reason = reason
             self._bad_streak = 1
             self._log("lora_reject", f"⚠ إطار راديو مرفوض — {reason}")
-        self._send(encode_ack(seq, ack))
+        if send_ack:
+            self._send(encode_ack(seq, ack))
         return {"ok": False, "ack": ack, "reason": reason}
 
     # ── الإرسال ─────────────────────────────────────────────────
     def _send(self, frame: str) -> None:
         """إرسال لا يرمي أبداً (§6.3 — الاستثناء يقتل الإيقاف المضمون)."""
+        # يُسجَّل قبل الكتابة كي يُكشف صداه حتى لو عاد في نفس الدورة
+        self._tx_recent.append((frame.strip(), self._clock()))
         if self._ser is None:
             return
         try:
@@ -242,6 +283,7 @@ class LoRaLink:
             "port": self.port, "baud": self.baud,
             "frames_rx": self.frames_rx, "frames_bad": self.frames_bad,
             "commands_ok": self.commands_ok,
+            "echoes": self.echoes,
             "last_frame": self.last_frame,
             "last_rx_ts": self.last_rx_ts,
             "seq": self.seq_guard.state(),

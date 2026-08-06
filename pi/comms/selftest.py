@@ -482,6 +482,52 @@ def main() -> None:
     check("التيليمتري يُبنى إطاراً صالحاً", parse_frame(tel).startswith("T,"),
           tel.strip())
 
+    # ── 🔴 كسر حلقة الصدى (عطل مقاس 2026-08-06) ──────────────────
+    # العتاد أعاد كل ما يُرسل، وكان الرد بإقرار على كل إطار مرفوض يولّد
+    # صدى الإقرار فإقراراً جديداً: 2473 إطاراً في دقائق كلها مرفوضة
+    # والقناة الهوائية مشوَّشة. القاعدة الآن: الإقرار لأطر `C,` سليمة
+    # التأطير حصراً، والصدى يُسقَط قبل أي معالجة.
+    rx0, tx0 = link.frames_rx, len(link._tx_recent)
+    res = link.handle_line(tel, now=clk5.t)
+    check("🔴 صدى تيليمترينا يُكشف ويُسقَط **قبل أي معالجة**",
+          res.get("echo") is True and link.echoes >= 1, str(res))
+    check("ولا يُحسب استقبالاً (لا تضليل في العدّادات)",
+          link.frames_rx == rx0, f"rx={link.frames_rx}")
+    check("🔴 **ولا يولّد أي إرسال** — الحلقة مكسورة من جذرها",
+          len(link._tx_recent) == tx0, f"tx={len(link._tx_recent) - tx0:+}")
+    check("والصدى معلَن حدثاً مقروءاً في السجل",
+          "lora_echo" in m5.log_kinds())
+
+    # صدى فات نافذة الكشف (3ث) ⇒ يمرّ كإطار وارد، لكنه ليس `C,` ⇒
+    # يُسقَط معدوداً **بلا إقرار** — فلا وقود للحلقة من أي طريق.
+    clk5.advance(4.0)
+    tx0 = len(link._tx_recent)
+    res = link.handle_line(tel, now=clk5.t)
+    check("🔴 حمولة ليست أمراً (T/A) تُرفض **بلا أي ردّ** ولو فاتت نافذة الصدى",
+          not res["ok"] and not res.get("echo")
+          and len(link._tx_recent) == tx0, str(res.get("reason"))[:60])
+
+    # إطار تالف الـchecksum ⇒ يُرفض ويُسجَّل، وبلا إقرار أيضاً
+    tx0 = len(link._tx_recent)
+    link.handle_line("$PING,42*00", now=clk5.t)
+    check("🔴 checksum خاطئ ⇒ رفض مسجَّل **بلا إقرار** (لا ردّ على ضجيج)",
+          len(link._tx_recent) == tx0)
+
+    # وأمر `C,` سليم التأطير مرفوض الفكّ ⇒ **يستحق** إقرار BADCMD:
+    # مرسله وحدة تحكم حقيقية، وصداه إن عاد `A,` فيُسقَط صامتاً — لا حلقة.
+    tx0 = len(link._tx_recent)
+    res = link.handle_line("$C,3,REBOOT,0,0*"
+                           + f"{xor_checksum('C,3,REBOOT,0,0'):02X}", now=clk5.t)
+    check("أمر سليم التأطير خارج القائمة ⇒ إقرار BADCMD يُرسل (حقّ وحدة التحكم)",
+          len(link._tx_recent) == tx0 + 1 and res["ack"] == ACK_BADCMD,
+          res["reason"][:50])
+    ack_frame = link._tx_recent[-1][0]
+    clk5.advance(4.0)                     # حتى صدى الإقرار المتأخر
+    tx0 = len(link._tx_recent)
+    link.handle_line(ack_frame, now=clk5.t)
+    check("🔴 وصدى ذلك الإقرار (حتى المتأخر) لا يولّد إقراراً جديداً — **لا حلقة**",
+          len(link._tx_recent) == tx0)
+
     link2 = LoRaLink(FakeMission(), mc6, enabled=False)
     st = link2.start()
     check("🔴 الراديو معطّل ⇒ سبب مقروء لا فشل صامت",

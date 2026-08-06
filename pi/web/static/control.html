@@ -225,6 +225,7 @@ canvas{width:100%;height:auto;display:block;background:#080c13;
       <div class="rows" style="margin-top:9px">
         <div class="row"><span>أطر مستقبَلة</span><b id="rRx">0</b></div>
         <div class="row"><span>مرفوضة</span><b id="rBad">0</b></div>
+        <div class="row" title="العتاد يعيد ما نرسله — ليس استقبالاً لاسلكياً. تصاعده يعني صدى محلياً في المحوّل/الوحدة، ويُسقَط بلا ردّ فلا يشوّش القناة"><span>صدى محلي (مُسقَط)</span><b id="rEcho">0</b></div>
       </div>
     </div>
   </div>
@@ -655,6 +656,8 @@ function apply(st){
   $("#tRadio").title = lo.error || "";
   $("#rRx").textContent = lo.frames_rx || 0;
   $("#rBad").textContent = lo.frames_bad || 0;
+  $("#rEcho").textContent = lo.echoes || 0;
+  $("#rEcho").style.color = (lo.echoes || 0) > 0 ? "var(--warn)" : "";
 
   const rdy = st.readiness || {};
   if (rdy.blockers && rdy.blockers.length && st.state === "idle")
