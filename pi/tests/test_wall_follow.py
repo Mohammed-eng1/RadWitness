@@ -50,6 +50,7 @@ from pi.config import (
 )
 from pi.nav.calibration import CalibrationStore, CalibrationProfile
 from pi.nav.executor import DriveExecutor
+from pi.nav.motion_check import NO_MOTION
 from pi.nav.reactive import ReactiveSafety
 from pi.nav.wall_heading import WallHeadingCorrector
 from pi.rover.bridge import WaveRoverBridge
@@ -100,6 +101,11 @@ def main() -> int:
                  f"فوق 0.5 التفاف فيرموير صامت (CLAUDE.md §2.1)")
 
     # ── الجسر ومصدر الاتجاه ─────────────────────────────────────
+    # ⚠ فتح المنفذ التسلسلي لا يثبت أن الروفر مُشغَّل: الكتابة على UART تنجح
+    #    وإن كان ESP32 مطفأً، فتتكامل الأودومترية على روبوت ساكن. الحارس
+    #    الفعلي هو حكم التحقق من الحركة بعد أول شوط (أدناه).
+    print("⚠ تأكّد أن مفتاح هيكل Wave Rover مُشغَّل — بدونه تُرسل الأوامر "
+          "إلى الفراغ بلا أي خطأ.")
     rover = WaveRoverBridge(mode="real")
     if rover.mode != "real":
         sys.exit(f"خطأ: الجسر لم يفتح المنفذ الحقيقي ({rover.error}) — "
@@ -170,6 +176,15 @@ def main() -> int:
             if not r["ok"]:
                 aborted = f"شوط {i} أُجهض: {r.get('aborted') or r.get('reason')}"
                 break
+            # 🔴 حكم التحقق من الحركة — CLAUDE.md §2.2: الأودومترية تقدير
+            #    مفتوح الحلقة، وقد ادّعت جولة كاملة 3.11م على روبوت **ساكن**
+            #    (مقاس 2026-08-06: الروفر مطفأ والسكربت أكمل بلا إنذار).
+            mv = r.get("motion") or {}
+            if mv.get("verdict") == NO_MOTION:
+                aborted = (f"لا حركة متحقَّقة في الشوط {i} — الروبوت لم "
+                           "يتحرك فعلاً (روفر مطفأ؟ كابل UART؟ عجلة عالقة؟). "
+                           f"شاهد التحقق: {mv.get('reason', '؟')}")
+                break
             odom += r["covered_m"]
             time.sleep(SIDE_SETTLE_S)
             d = side_median_cm(arr, a.side)
@@ -210,7 +225,8 @@ def main() -> int:
         return 1
     final = valid[-1]
     max_abs = max(abs(r["drift_cm"]) for r in valid)
-    print(f"  الوضع: {mode} · قُطع {final['odom_m']}م من {a.distance}م")
+    print(f"  الوضع: {mode} · قُطع {final['odom_m']}م من {a.distance}م "
+          f"(وصلة الروفر: {'سليمة' if rover.link_ok else '⛔ منقطعة'})")
     print(f"  الانحراف الجانبي النهائي: {final['drift_cm']:+.1f}سم · "
           f"الأقصى: {max_abs:.1f}سم")
     print(f"  تصحيحات مطبَّقة: {applied} · "

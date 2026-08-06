@@ -93,6 +93,7 @@ class UltrasonicChannel:
         self.last_value_cm = None
         self.last_ts = 0.0            # لحظة آخر قراءة **صالحة**
         self.measurements = 0
+        self.stuck = 0                # مرات وُجد ECHO مرتفعاً قبل التحفيز
         self._h = chip_handle
         self._cb = None
         self._st = {"rise": 0, "width": None}
@@ -123,6 +124,21 @@ class UltrasonicChannel:
         """نبضة واحدة + انتظار الصدى. يُحدّث المرشّح والطابع الزمني."""
         if not self.ok:
             return None
+        # 🔴 حارس الانحشار (مقاس على العتاد 2026-08-06): HC-SR04 الذي ضاعت
+        #    نبضته يُبقي ECHO مرتفعاً حتى ~200ms، وتحفيزه في هذه الحالة
+        #    يعمّيه **نهائياً** — قناة اليمين ماتت 0/124 في التناوب بينما
+        #    تعمل منفردةً بهذه البصمة بالضبط. ننتظر هبوطه بدل التحفيز فوقه.
+        try:
+            t_g = time.time()
+            while lgpio.gpio_read(self._h, self.echo) == 1:
+                if time.time() - t_g > 0.03:       # لم يهبط — دورة ضائعة معلَنة
+                    self.stuck += 1
+                    self.measurements += 1
+                    self.quality.add(False)
+                    return None
+                time.sleep(0.002)
+        except Exception:             # noqa: BLE001
+            pass                      # تعذُّر القراءة لا يمنع محاولة القياس
         self._st["rise"], self._st["width"] = 0, None
         try:
             lgpio.gpio_write(self._h, self.trig, 1)
@@ -179,6 +195,7 @@ class UltrasonicChannel:
                 "tilt_deg": CHANNEL_TILT_DEG.get(self.name, 0.0),
                 "age_s": round(min(self.age_s, 999.0), 2), "stale": self.stale,
                 "quality": self.quality.percent, "n": self.measurements,
+                "stuck": self.stuck,
                 "ground_echo": self.ground_echo.state()}
 
     def close(self):

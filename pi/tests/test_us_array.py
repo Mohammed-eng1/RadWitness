@@ -133,9 +133,12 @@ def run_single(name: str, seconds: float, truth_cm) -> int:
             samples.append(ch.raw_cm)
             time.sleep(SINGLE_GAP_S)
     finally:
+        stuck = ch.stuck
         ch.close()
         lgpio.gpiochip_close(h)
     ok = print_stats(channel_stats(name, samples, truth_cm))
+    if stuck:
+        print(f"  ⚠ انحشار ECHO: {stuck} دورة وُجد فيها مرتفعاً قبل التحفيز")
     return 0 if ok else 1
 
 
@@ -164,11 +167,15 @@ def run_round_robin(seconds: float, truths: dict) -> int:
                     samples[n].append(ch.raw_cm)
             time.sleep(0.01)
     finally:
+        stuck = {n: ch.stuck for n, ch in arr.channels.items()}
         arr.close()
     all_ok = True
     for n in ROBIN_ORDER:
         if n in samples:
             all_ok &= print_stats(channel_stats(n, samples[n], truths.get(n)))
+            if stuck.get(n):
+                print(f"     ⚠ انحشار ECHO في {n}: {stuck[n]} دورة "
+                      f"(الوحدة كانت عالقة والحارس تخطّاها بدل تعميتها)")
     rate = arr.cycles / max(seconds, 1e-9)
     print(f"\n  دورات تناوب كاملة: {arr.cycles} (≈{rate:.1f}/ث · المتوقَّع "
           f"{1.0/(3*US_ROUND_ROBIN_GAP_S+0.05):.0f}–"
