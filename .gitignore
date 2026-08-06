@@ -37,3 +37,11 @@ desktop.ini
 *~
 .vscode/
 .idea/
+
+# ثنائي اختبار البروتوكول (يُترجَم عند الحاجة — لا يُرفع)
+firmware/controller_display/test_protocol
+firmware/controller_display/test_protocol.exe
+
+# ملفات الطباعة ثلاثية الأبعاد (نواتج تصميم لا كود — تُحفظ خارج المستودع)
+*.3mf
+*.gcode

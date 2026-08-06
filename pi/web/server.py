@@ -14,6 +14,7 @@ pi/nav حيّاً عبر محرّك mission.py — تعمل بالكامل عل�
 """
 import asyncio
 import json
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,7 +25,12 @@ from pydantic import BaseModel
 
 from pi.config import (
     WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
+    LORA_ENABLED, LORA_PORT,
 )
+from pi.comms.control import ManualControl, SOURCE_MANUAL, SOURCE_RADIO
+from pi.comms.lora import LoRaLink
+from pi.web.modes import ModeManager, MODE_MANUAL
+from pi.web.stream import mjpeg_frames, resolution_options
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
 from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
@@ -56,21 +62,40 @@ _STATIC = Path(__file__).parent / "static"
 _BOOT = []
 
 
+def _say(msg: str) -> None:
+    """
+    طباعة **لا تُسقط الإقلاع بترميز الطرفية**.
+
+    ⚠ عطل حقيقي على ويندوز: الطرفية الافتراضية cp1256 لا تُرمّز `⚠` ولا
+    `✅`، فكان `print` يرمي `UnicodeEncodeError` **أثناء استيراد الوحدة**
+    — أي يموت السيرفر قبل أن يطبع حرفاً، والرسالة الوحيدة الظاهرة هي
+    انهيار في سطر طباعة لافتة الإقلاع نفسها. وهذا يكسر وعد المشروع
+    «يعمل كاملاً على ويندوز بلا عتاد».
+    البديل: تجريد ما يعجز الترميز عنه بدل إسقاط كل شيء.
+    """
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"),
+              flush=True)
+
+
 def _boot(label: str, factory):
     """يبني نظاماً فرعياً ويطبع زمنه فوراً (flush) — لا يُسقط الإقلاع بفشله."""
     t0 = time.time()
-    print(f"[إقلاع] {label} …", flush=True)
+    _say(f"[إقلاع] {label} …")
     try:
         obj = factory()
         dt = time.time() - t0
         _BOOT.append({"name": label, "seconds": round(dt, 2), "ok": True})
-        print(f"[إقلاع] {label}: تم في {dt:.2f}ث", flush=True)
+        _say(f"[إقلاع] {label}: تم في {dt:.2f}ث")
         return obj
     except Exception as e:                     # noqa: BLE001
         dt = time.time() - t0
         _BOOT.append({"name": label, "seconds": round(dt, 2),
                       "ok": False, "error": str(e)})
-        print(f"[إقلاع] {label}: ⚠ فشل بعد {dt:.2f}ث — {e}", flush=True)
+        _say(f"[إقلاع] {label}: ⚠ فشل بعد {dt:.2f}ث — {e}")
         raise
 
 
@@ -98,6 +123,17 @@ mission.set_geiger(geiger)
 _sensor_clients: set[WebSocket] = set()
 _last_sensor_loop = time.time()
 
+# ── بوابة الأوامر اليدوية + وصلة الراديو ─────────────────────────
+# 🔴 **بوابة واحدة**: القيادة من الواجهة وأوامر الراديو تمرّان من هنا معاً
+#    فوق كائنات السلامة التي تملكها المهمة (`sensors()` و`reactive`).
+manual = ManualControl(mission)
+lora = _boot(f"وصلة الراديو HC-14 ({LORA_PORT})",
+             lambda: LoRaLink(mission, manual))
+if LORA_ENABLED:
+    lora.start()          # يُعلن سببه إن فشل — لا يُسقط الإقلاع
+# الأنماط الثلاثة الحصرية (طبقة واجهة — منطق الملاحة يبقى في mission)
+modes = ModeManager(mission, manual, camera)
+
 
 def _boot_summary() -> dict:
     """خلاصة الإقلاع: زمن كل نظام وحالته — تُطبع وتُعرض عبر /api/boot."""
@@ -114,15 +150,17 @@ def _boot_summary() -> dict:
             "ir": {"ok": ir_sensors.ok, "error": ir_sensors.error},
             "rover": {"mode": mission.rover.mode, "error": mission.rover.error,
                       "heading_source": mission.rover.heading_source.name},
+            "lora": {"ok": lora.ok, "error": lora.error,
+                     "enabled": lora.enabled, "port": lora.port},
         },
     }
 
 
-print(f"[إقلاع] اكتمل تجهيز الأنظمة في "
-      f"{time.time() - _T_BOOT:.2f}ث — يبدأ uvicorn الآن", flush=True)
+_say(f"[إقلاع] اكتمل تجهيز الأنظمة في "
+     f"{time.time() - _T_BOOT:.2f}ث — يبدأ uvicorn الآن")
 for _k, _v in _boot_summary()["health"].items():
     if _v.get("error"):
-        print(f"[إقلاع] ⚠ {_k}: {_v['error']}", flush=True)
+        _say(f"[إقلاع] ⚠ {_k}: {_v['error']}")
 
 
 # ═══ حلقات الخلفية ═══════════════════════════════════════════════
@@ -136,6 +174,10 @@ async def _sim_loop() -> None:
             if mission.state == "running" and (now - last_tick) >= mission.tick_period():
                 mission.tick()
                 last_tick = now
+            # 🔴 حارس مهلة الأوامر — **كل دورة لا كل بثّة**: انقطاع أوامر
+            #    القيادة اليدوية/الراديو يجب أن يوقف المحركات خلال 0.8/2.0ث،
+            #    وتأخيره إلى دورة البثّ (0.2ث) يضيف زمناً بلا داعٍ.
+            manual.poll(now)
             if (now - last_bcast) >= 0.2:
                 last_bcast = now
                 mission.poll_battery()     # الجهد يُعرض دائماً لا أثناء المسح فقط
@@ -143,7 +185,7 @@ async def _sim_loop() -> None:
                 mission.poll_power_clamp() # أحداث الجسر + heartbeat → السجل
                 mission.poll_reactive()    # بثّ السرعة وسببها (البند 3)
                 if _sim_clients:
-                    msg = json.dumps(mission.state_dict(include_full_grid=False))
+                    msg = json.dumps(_full_state(include_full_grid=False))
                     for ws in list(_sim_clients):
                         try:
                             await ws.send_text(msg)
@@ -152,6 +194,19 @@ async def _sim_loop() -> None:
         except Exception:                      # noqa: BLE001 — لا نُسقط الحلقة
             pass
         await asyncio.sleep(0.01)
+
+
+def _full_state(include_full_grid: bool = False) -> dict:
+    """
+    حالة المهمة + طبقة الواجهة (النمط · البوابة · الراديو) في رسالة واحدة.
+
+    ⚠ الدمج هنا لا في `mission.state_dict()`: النمط والراديو مفهوما
+    **واجهة** لا ملاحة، وحشرهما في محرّك المهمة يخلط الطبقات.
+    """
+    return {**mission.state_dict(include_full_grid=include_full_grid),
+            "ui_mode": modes.state(),
+            "manual": manual.state(),
+            "lora": lora.state()}
 
 
 def _sensor_telemetry() -> dict:
@@ -205,6 +260,8 @@ async def lifespan(_app: FastAPI):
     t2 = asyncio.create_task(_sensor_loop())
     yield
     t1.cancel(); t2.cancel()
+    lora.stop()                # ⚠ يوقف المحركات إن كان الراديو آمرها
+    manual.set_enabled(False)  # ولا تُترك عجلة تدور عند إغلاق السيرفر
     geiger.close(); gps.close(); camera.close()
     ultrasonic.close(); ir_sensors.close()
 
@@ -220,9 +277,26 @@ def _page(name: str) -> HTMLResponse:
     return HTMLResponse((_STATIC / name).read_text(encoding="utf-8"))
 
 
+def _dir_to_cmd(d: str) -> str:
+    """يحوّل اتجاه الواجهة القديم (F/B/L/R/S) إلى القائمة المغلقة."""
+    return {"F": "FWD", "B": "BACK", "L": "LEFT", "R": "RIGHT",
+            "S": "STOP"}.get(str(d).upper()[:1], "STOP")
+
+
 # ═══ الصفحات ═════════════════════════════════════════════════════
 @app.get("/")
 async def index():
+    """لوحة التحكم الموحّدة — الأنماط الثلاثة بمبدّل واحد."""
+    return _page("control.html")
+
+
+@app.get("/sim")
+async def sim_page():
+    """
+    الواجهة التفصيلية السابقة — **مُبقاة عمداً** لا مهجورة: فيها ضبط
+    الغرفة والمعايرة واختبارات العتاد التي لا مكان لها في لوحة تشغيل
+    مبسّطة. اللوحة الجديدة للتشغيل، وهذه للإعداد والتشخيص.
+    """
     return _page("sim.html")
 
 
@@ -493,6 +567,79 @@ async def api_mission(action: str, req: Request):
     return JSONResponse({"ok": False, "error": "أمر غير معروف"}, status_code=400)
 
 
+# ═══ الأنماط الثلاثة ═════════════════════════════════════════════
+@app.get("/api/mode")
+async def api_mode_get():
+    return modes.state()
+
+
+@app.post("/api/mode")
+async def api_mode_set(req: Request):
+    """
+    تبديل النمط. مهمة جارية ⇒ يُعيد `needs_confirm` فتسأل الواجهة، ثم
+    يُعاد النداء بـ`confirm: true` فيُنفَّذ **إيقافاً مؤقتاً لا إلغاء**.
+    """
+    d = await req.json()
+    res = modes.switch(str(d.get("mode", "")), confirm=bool(d.get("confirm")))
+    if not res.get("ok") and not res.get("needs_confirm"):
+        return JSONResponse(res, status_code=400)
+    return res
+
+
+# ═══ القيادة اليدوية والراديو (بوابة واحدة) ══════════════════════
+class ManualCmdReq(BaseModel):
+    """أمر قيادة يدوية — نموذج صريح ليعمل على كل إصدارات FastAPI."""
+    cmd: str = "STOP"
+    power: float = None
+
+
+@app.post("/api/manual/command")
+def api_manual_command(body: ManualCmdReq):
+    """
+    🔴 **المسار الوحيد** للقيادة اليدوية من الواجهة — نفس بوابة الراديو.
+    طبقة السلامة تسبق الأمر: عائق أمامي ⇒ رفض التقدّم وإيقاف المحركات.
+
+    `def` لا `async def`: النداء يكتب على السيريال (حاجب) فيعمل في
+    threadpool بلا تجميد حلقة البثّ.
+    """
+    return manual.command(body.cmd, power=body.power, source=SOURCE_MANUAL)
+
+
+@app.post("/api/manual/enable")
+async def api_manual_enable(req: Request):
+    """يفتح/يغلق نمط القيادة اليدوية (الإغلاق يوقف المحركات دائماً)."""
+    d = await req.json()
+    return manual.set_enabled(bool(d.get("on", False)))
+
+
+@app.get("/api/manual/status")
+async def api_manual_status():
+    return {"manual": manual.state(), "lora": lora.state()}
+
+
+@app.get("/api/lora/status")
+async def api_lora_status():
+    """
+    حالة وصلة الراديو — **تفرّق بين أسباب التعطّل** (معطّل بالإعداد ·
+    pyserial غائبة · منفذ مفقود) فيظهر السبب في الواجهة لا «لا يعمل».
+    """
+    return lora.state()
+
+
+@app.post("/api/lora/start")
+async def api_lora_start():
+    """محاولة فتح الوصلة يدوياً (زر «أعِد المحاولة» في الواجهة)."""
+    lora.enabled = True
+    return lora.start()
+
+
+@app.post("/api/lora/stop")
+async def api_lora_stop():
+    lora.stop()
+    lora.enabled = False
+    return lora.state()
+
+
 @app.post("/api/obstacle")
 async def api_obstacle(req: Request):
     d = await req.json()
@@ -512,7 +659,7 @@ async def api_mission_report():
 
 @app.get("/api/sim/status")
 async def api_sim_status():
-    return mission.state_dict(include_full_grid=True)
+    return _full_state(include_full_grid=True)
 
 
 @app.websocket("/ws")
@@ -521,7 +668,7 @@ async def ws_sim(ws: WebSocket):
     _sim_clients.add(ws)
     try:
         await ws.send_text(json.dumps({**platform_banner(),
-                                       **mission.state_dict(include_full_grid=True)}))
+                                       **_full_state(include_full_grid=True)}))
         while True:
             await ws.receive_text()            # الأوامر عبر REST؛ نبقي الاتصال حيّاً
     except WebSocketDisconnect:
@@ -542,11 +689,32 @@ def snapshot() -> Response:
 
 
 @app.get("/stream.mjpg")
-def stream() -> Response:
+def stream(res: str = None) -> Response:
+    """
+    بثّ MJPEG **عند الطلب فقط**: يعمل في نمط القيادة اليدوية وحده ويتوقف
+    فور مغادرته (`is_active`) — لا ينتظر انقطاع المتصفح.
+
+    ⚠ سبب الرفض **مقروء** لا 503 صامتة: «الكاميرا غير متاحة» و«لست في
+    نمط القيادة اليدوية» عطلان مختلفان تماماً وعلاجهما مختلف.
+    """
+    if modes.mode != MODE_MANUAL:
+        return Response(status_code=409,
+                        content="البثّ يعمل في نمط «القيادة اليدوية» فقط",
+                        media_type="text/plain; charset=utf-8")
     if not camera.state()["available"]:
-        return Response(status_code=503, content="camera unavailable")
-    return StreamingResponse(camera.mjpeg_frames(),
-                             media_type="multipart/x-mixed-replace; boundary=frame")
+        return Response(status_code=503,
+                        content=f"الكاميرا غير متاحة: {camera.error or 'سبب غير معروف'}",
+                        media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        mjpeg_frames(camera, res, is_active=lambda: modes.camera_streaming),
+        media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/camera/options")
+async def api_camera_options():
+    """الدقّات المتاحة + حالة الكاميرا (وسبب تعذّرها إن وُجد)."""
+    return {**resolution_options(), "camera": camera.state(),
+            "error": camera.error, "streaming": modes.camera_streaming}
 
 
 @app.post("/api/snapshot/save")
@@ -572,10 +740,17 @@ async def ws_sensors(ws: WebSocket) -> None:
             raw = await ws.receive_text()
             try:
                 cmd = json.loads(raw)
+                # ⚠⚠ **أُزيل مسار تجاوز طبقة السلامة** ⚠⚠
+                # كان هنا `rover.command(...)` يقود **نسخة جسر ثانية**
+                # (`RoverBridge(mode="sim")`) لا جسر المهمة — بلا فحص
+                # حساسات ولا heartbeat ولا حدّ قوة. صار كل شيء يمرّ
+                # ببوابة `manual` الواحدة.
                 if cmd.get("c") == "drive":
-                    rover.command(cmd.get("dir", "S"), cmd.get("power", 70))
+                    manual.command(_dir_to_cmd(cmd.get("dir", "S")),
+                                   power=cmd.get("power"),
+                                   source=SOURCE_MANUAL)
                 elif cmd.get("c") == "estop":
-                    rover.command("S", 0)
+                    manual.command("ESTOP", source=SOURCE_MANUAL)
             except Exception:                  # noqa: BLE001
                 continue
     except WebSocketDisconnect:

@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RMS Rover v2 — لوحة التحكم</title>
+<!-- ⚠ بلا أي CDN: قد نعمل بلا إنترنت تماماً (خطوط النظام وحدها) -->
+<style>
+:root{
+  --bg:#0b0f17; --panel:#131a26; --panel2:#182131; --line:#243149;
+  --fg:#e6ecf7; --dim:#8a93a6; --accent:#3b82f6;
+  --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --idle:#64748b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  font-family:"Segoe UI","Tahoma",system-ui,sans-serif;font-size:15px}
+body{padding-bottom:12px}
+button{font-family:inherit;font-size:inherit;cursor:pointer;color:var(--fg);
+  background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px 14px}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+select,input{font-family:inherit;font-size:inherit;background:var(--panel2);
+  color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 9px}
+h2{font-size:15px;margin:0 0 10px;color:var(--dim);font-weight:600}
+
+/* ═══ الشريط العلوي: الحالة والتحكم دائماً أعلى الصفحة ═══ */
+.top{position:sticky;top:0;z-index:50;background:var(--panel);
+  border-bottom:1px solid var(--line);padding:10px 14px;
+  display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.modes{display:flex;gap:6px;background:var(--bg);padding:4px;border-radius:11px}
+.modes button{padding:8px 15px;border:1px solid transparent;background:transparent;font-weight:600}
+.modes button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.spacer{flex:1}
+.chip{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:999px;padding:6px 13px;font-size:13.5px;
+  white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--idle);flex:none}
+#estop{background:var(--bad);border-color:#7f1d1d;color:#fff;font-weight:800;
+  padding:11px 22px;font-size:16px;letter-spacing:.3px}
+#estop:hover{background:#dc2626}
+
+/* لافتة «المحركات مفعّلة» — الأبرز على الصفحة حين تظهر */
+.live{display:none;background:linear-gradient(90deg,#7f1d1d,#b91c1c);color:#fff;
+  padding:11px 16px;font-weight:700;text-align:center;letter-spacing:.2px;
+  border-bottom:2px solid #fecaca}
+.live.on{display:block;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{filter:brightness(1.28)}}
+
+/* ═══ الشبكة: الخريطة/الكاميرا وسطاً · السجل أسفل ═══ */
+.wrap{max-width:1500px;margin:0 auto;padding:14px}
+.grid2{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px}
+canvas{width:100%;height:auto;display:block;background:#080c13;
+  border:1px solid var(--line);border-radius:10px}
+.rows{display:flex;flex-direction:column;gap:9px}
+.row{display:flex;justify-content:space-between;gap:10px;align-items:center;
+  padding:7px 10px;background:var(--panel2);border-radius:8px;font-size:14px}
+.row b{font-variant-numeric:tabular-nums}
+.muted{color:var(--dim);font-size:13px;line-height:1.7}
+
+/* ═══ القيادة اليدوية ═══ */
+.cam{position:relative;background:#080c13;border:1px solid var(--line);
+  border-radius:10px;overflow:hidden;aspect-ratio:4/3;
+  display:flex;align-items:center;justify-content:center}
+.cam img{width:100%;height:100%;object-fit:contain;display:block}
+.camoff{color:var(--dim);text-align:center;padding:22px;font-size:14px;line-height:1.8}
+.dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:290px;margin:14px auto 0}
+.dpad button{aspect-ratio:1;font-size:24px;font-weight:700;padding:0;
+  touch-action:none;user-select:none;-webkit-user-select:none}
+.dpad button:active,.dpad button.held{background:var(--accent);border-color:var(--accent)}
+.dpad .stop{background:#7f1d1d;border-color:#991b1b;font-size:15px}
+.slider{display:flex;align-items:center;gap:11px;margin-top:13px}
+.slider input[type=range]{flex:1;accent-color:var(--accent)}
+
+/* ═══ السجل: يميّز المصدر ═══ */
+.log{height:250px;overflow-y:auto;background:#080c13;border:1px solid var(--line);
+  border-radius:10px;padding:9px;font-size:13px;line-height:1.65}
+.ev{display:flex;gap:9px;padding:5px 7px;border-bottom:1px solid #131a26}
+.ev:last-child{border-bottom:none}
+.ev .src{flex:none;font-size:11px;font-weight:700;padding:2px 8px;border-radius:5px;
+  align-self:flex-start;margin-top:1px;min-width:52px;text-align:center}
+.src-auto{background:#1e3a5f;color:#93c5fd}
+.src-manual{background:#3f2d12;color:#fcd34d}
+.src-radio{background:#3b1d4d;color:#e9d5ff}
+.src-vision{background:#12352a;color:#6ee7b7}
+.src-sys{background:#25304a;color:#a5b4c8}
+.ev .msg{flex:1;word-break:break-word}
+.ev .ts{flex:none;color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+
+.pill{font-size:11.5px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);
+  color:var(--dim);white-space:nowrap}
+.hide{display:none !important}
+.err{color:#fca5a5;background:#2a1215;border:1px solid #7f1d1d;padding:10px 12px;
+  border-radius:9px;font-size:13px;line-height:1.7;margin-top:9px}
+.info{color:#bfdbfe;background:#12233d;border:1px solid #1e3a5f;padding:10px 12px;
+  border-radius:9px;font-size:13px;line-height:1.7;margin-top:9px}
+.btnrow{display:flex;gap:8px;flex-wrap:wrap}
+
+/* حوار التأكيد */
+.modal{position:fixed;inset:0;background:rgba(2,5,12,.82);display:none;
+  align-items:center;justify-content:center;z-index:100;padding:18px}
+.modal.on{display:flex}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:15px;
+  padding:22px;max-width:470px;width:100%}
+.modal h3{margin:0 0 12px;font-size:17px}
+.modal p{color:var(--dim);line-height:1.85;margin:0 0 18px;font-size:14px}
+
+@media(max-width:960px){
+  .grid2{grid-template-columns:1fr}
+  .top{padding:9px 11px;gap:8px}
+  .modes button{padding:8px 11px;font-size:13.5px}
+  #estop{padding:10px 16px;font-size:14.5px}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ أعلى: النمط · الحالة · إيقاف الطوارئ (بارزة دائماً) ═══ -->
+<div class="top">
+  <div class="modes" id="modes"></div>
+  <span class="chip"><span class="dot" id="dNet"></span><span id="tNet">الشبكة…</span></span>
+  <span class="chip"><span class="dot" id="dRadio"></span><span id="tRadio">الراديو</span></span>
+  <span class="chip"><span class="dot" id="dBatt"></span><b id="tBatt">—</b></span>
+  <span class="chip" id="cState">—</span>
+  <div class="spacer"></div>
+  <button id="estop">⛔ إيقاف طوارئ</button>
+</div>
+<div class="live" id="liveWarn">⚠ المحركات مفعّلة — الروبوت سيتحرك فعلياً</div>
+
+<div class="wrap">
+<div class="grid2">
+
+  <!-- ═══ وسط: الخريطة (محاكاة/ذاتي) أو الكاميرا (يدوي) ═══ -->
+  <div>
+    <div class="card" id="paneMap">
+      <h2>الخريطة الإشعاعية</h2>
+      <canvas id="map" width="760" height="560"></canvas>
+      <div class="muted" id="coverage" style="margin-top:10px">—</div>
+    </div>
+
+    <div class="card hide" id="paneManual">
+      <h2>القيادة اليدوية — بث مباشر</h2>
+      <div class="cam" id="cam">
+        <div class="camoff" id="camoff">الكاميرا متوقفة</div>
+      </div>
+      <div class="dpad">
+        <div></div>
+        <button data-cmd="FWD" title="W أو ↑">▲</button>
+        <div></div>
+        <button data-cmd="LEFT" title="A أو ←">◀</button>
+        <button class="stop" data-cmd="STOP">إيقاف</button>
+        <button data-cmd="RIGHT" title="D أو →">▶</button>
+        <div></div>
+        <button data-cmd="BACK" title="S أو ↓">▼</button>
+        <div></div>
+      </div>
+      <div class="slider">
+        <span class="muted" style="white-space:nowrap">السرعة</span>
+        <input type="range" id="pw" min="0.1" max="0.5" step="0.05" value="0.3">
+        <b id="pwv" style="min-width:42px;text-align:center">0.30</b>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        الحدّ الأقصى <b>0.5</b> — فوقه يلتفّ فيرموير Wave Rover على القيمة صامتاً
+        (0.6 تصير 0.1). التحكم أيضاً بـ<b>WASD</b> أو الأسهم، والضغط المستمر يحرّك.
+      </div>
+      <div class="slider">
+        <span class="muted" style="white-space:nowrap">دقة البث</span>
+        <select id="camres"></select>
+        <button id="camtoggle">إيقاف البث</button>
+      </div>
+      <div id="camNote"></div>
+      <div id="manualMsg"></div>
+    </div>
+  </div>
+
+  <!-- ═══ اللوحة الجانبية: القراءات والتحكم ═══ -->
+  <div class="rows">
+    <div class="card">
+      <h2>القراءة الحية</h2>
+      <div class="rows">
+        <div class="row"><span>العدّ (CPM)</span><b id="rCpm">0</b></div>
+        <div class="row"><span>الجرعة (µSv/h)</span><b id="rUsvh">0.00</b></div>
+        <div class="row"><span>الخطورة</span><b id="rRisk">—</b></div>
+        <div class="row"><span>المسافة الأمامية</span><b id="rFront">—</b></div>
+        <div class="row"><span>الموضع</span><b id="rPos">—</b></div>
+        <div class="row"><span>الاتجاه</span><b id="rHead">—</b></div>
+      </div>
+    </div>
+
+    <div class="card" id="cardMission">
+      <h2>المهمة</h2>
+      <div class="btnrow">
+        <button data-m="start">▶ ابدأ</button>
+        <button data-m="pause">⏸ إيقاف مؤقت</button>
+        <button data-m="resume">⏵ استئناف</button>
+        <button data-m="return_home">🏠 عودة</button>
+      </div>
+      <div class="rows" style="margin-top:11px">
+        <div class="row"><span>المرحلة</span><b id="rPhase">—</b></div>
+        <div class="row"><span>التغطية</span><b id="rCov">0%</b></div>
+        <div class="row"><span>الزمن المتبقي</span><b id="rTime">—</b></div>
+      </div>
+      <div id="readyMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>الراديو (LoRa) — قناة الطوارئ</h2>
+      <div id="serialMsg"></div>
+      <div class="btnrow" style="margin-top:9px">
+        <button id="serialBtn">🔌 وصل الشاشة (USB)</button>
+        <button id="serialSend" disabled>إرسال STATUS</button>
+      </div>
+      <div class="muted" style="margin-top:9px">
+        مسار مستقل عن الإنترنت وTailscale: المتصفح → شاشة CYD عبر USB →
+        LoRa → الروبوت. قناة ضيقة: أوامر قصيرة وتيليمتري فقط.
+      </div>
+      <div class="rows" style="margin-top:9px">
+        <div class="row"><span>أطر مستقبَلة</span><b id="rRx">0</b></div>
+        <div class="row"><span>مرفوضة</span><b id="rBad">0</b></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ أسفل: السجل والتفاصيل ═══ -->
+<div class="grid2" style="margin-top:14px">
+  <div class="card">
+    <h2>سجل الأحداث
+      <span class="pill src-auto">ذاتي</span>
+      <span class="pill src-manual">يدوي</span>
+      <span class="pill src-radio">راديو</span>
+      <span class="pill src-vision">رؤية</span>
+      <span class="pill src-sys">نظام</span>
+    </h2>
+    <div class="log" id="log"></div>
+  </div>
+  <div class="card">
+    <h2>التفاصيل</h2>
+    <div class="rows">
+      <div class="row"><span>مصدر الاتجاه</span><b id="dHead">—</b></div>
+      <div class="row"><span>انحياز الجايرو</span><b id="dBias">—</b></div>
+      <div class="row"><span>خلايا بثقة منخفضة</span><b id="dLow">0</b></div>
+      <div class="row"><span>انعدام حركة متتالٍ</span><b id="dStuck">0</b></div>
+      <div class="row"><span>وضع الجسر</span><b id="dRover">—</b></div>
+      <div class="row"><span>مصدر حماية البطارية</span><b id="dBsrc">—</b></div>
+      <div class="row"><span>تسلسل الراديو</span><b id="dSeq">—</b></div>
+    </div>
+    <div id="warnMsg"></div>
+  </div>
+</div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="box">
+    <h3 id="mTitle">تأكيد</h3>
+    <p id="mBody"></p>
+    <div class="btnrow" style="justify-content:flex-end">
+      <button id="mNo">إلغاء</button>
+      <button id="mYes" style="background:var(--accent);border-color:var(--accent);color:#fff">تأكيد</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const api = async (u, b) => {
+  const o = b === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(b)};
+  const r = await fetch(u, o);
+  try { return await r.json(); } catch(e){ return {ok:false, error:"ردّ غير صالح"}; }
+};
+let ST = {};              // آخر حالة كاملة من السيرفر
+let MODE = "sim";
+
+/* ═══ حوار التأكيد ═══ */
+let _resolve = null;
+function confirmBox(title, body){
+  $("#mTitle").textContent = title; $("#mBody").textContent = body;
+  $("#modal").classList.add("on");
+  return new Promise(res => { _resolve = res; });
+}
+$("#mNo").onclick = () => { $("#modal").classList.remove("on"); _resolve && _resolve(false); };
+$("#mYes").onclick = () => { $("#modal").classList.remove("on"); _resolve && _resolve(true); };
+
+/* ═══ الأنماط الثلاثة ═══ */
+const MODE_AR = {sim:"محاكاة", manual:"قيادة يدوية", auto:"قيادة ذاتية"};
+function buildModes(){
+  $("#modes").innerHTML = "";
+  for (const id of ["sim","manual","auto"]){
+    const b = document.createElement("button");
+    b.textContent = MODE_AR[id]; b.dataset.mode = id;
+    b.onclick = () => switchMode(id);
+    $("#modes").appendChild(b);
+  }
+}
+async function switchMode(id, confirmed){
+  const r = await api("/api/mode", {mode:id, confirm: !!confirmed});
+  if (r.needs_confirm){
+    // 🔴 مهمة جارية: تأكيد صريح، والتبديل **إيقاف مؤقت لا إلغاء**
+    const yes = await confirmBox("تبديل النمط أثناء مهمة جارية", r.error);
+    if (yes) return switchMode(id, true);
+    return;
+  }
+  if (r.ok) applyMode(r.mode);
+}
+function applyMode(m){
+  MODE = m;
+  document.querySelectorAll("#modes button").forEach(b =>
+    b.classList.toggle("on", b.dataset.mode === m));
+  const manual = (m === "manual");
+  $("#paneManual").classList.toggle("hide", !manual);
+  $("#paneMap").classList.toggle("hide", manual);
+  $("#cardMission").classList.toggle("hide", manual);
+  manual ? startCam() : stopCam();
+}
+
+/* ═══ إيقاف الطوارئ — يعمل في الأنماط الثلاثة ═══ */
+$("#estop").onclick = async () => {
+  releaseAll();
+  await api("/api/manual/command", {cmd:"ESTOP"});   // البوابة نفسها
+  await api("/api/mission/estop", {});               // ومسار المهمة
+};
+
+/* ═══ أوامر المهمة ═══ */
+document.querySelectorAll("[data-m]").forEach(b => {
+  b.onclick = async () => {
+    const r = await api("/api/mission/" + b.dataset.m, {});
+    if (r && r.ok === false && r.error) showMsg("#readyMsg", r.error, "err");
+    else if (r && r.blockers && r.blockers.length) showMsg("#readyMsg", "⛔ " + r.blockers.join(" · "), "err");
+    else $("#readyMsg").innerHTML = "";
+  };
+});
+function showMsg(sel, text, cls){
+  $(sel).innerHTML = '<div class="' + cls + '">' + esc(text) + '</div>';
+}
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ═══ القيادة اليدوية: ضغط مستمر + لوحة مفاتيح + لمس ═══ */
+let heldCmd = null, hbTimer = null;
+const power = () => parseFloat($("#pw").value);
+$("#pw").oninput = () => { $("#pwv").textContent = power().toFixed(2); };
+
+async function send(cmd){
+  const r = await api("/api/manual/command", {cmd, power: power()});
+  if (r && r.ok === false){
+    // 🔴 لا فشل صامت: سبب الرفض يُعرض (سلامة/نمط/عطل)
+    showMsg("#manualMsg", (r.ack === "SAFE" ? "⛔ رفضته طبقة السلامة: " : "⚠ ") + r.reason, "err");
+  } else if (r && r.safety && (r.safety.unknown || []).length){
+    showMsg("#manualMsg", "⚠ حساسات مجهولة: " + r.safety.unknown.join("، ") +
+            " — لا تُحسب شهادةً بخلوّ الطريق", "info");
+  } else { $("#manualMsg").innerHTML = ""; }
+}
+function hold(cmd, el){
+  if (heldCmd === cmd) return;
+  releaseAll();
+  heldCmd = cmd; el && el.classList.add("held");
+  send(cmd);
+  // heartbeat: تكرار دون مهلة السيرفر (0.8ث) وإلا أوقف المحركات
+  hbTimer = setInterval(() => send(cmd), 300);
+}
+function releaseAll(){
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  if (heldCmd){ heldCmd = null; api("/api/manual/command", {cmd:"STOP"}); }
+  document.querySelectorAll(".dpad button").forEach(b => b.classList.remove("held"));
+}
+document.querySelectorAll(".dpad button").forEach(b => {
+  const cmd = b.dataset.cmd;
+  if (cmd === "STOP"){ b.onclick = () => { releaseAll(); send("STOP"); }; return; }
+  b.addEventListener("pointerdown", e => { e.preventDefault(); hold(cmd, b); });
+  b.addEventListener("pointerup",   e => { e.preventDefault(); releaseAll(); });
+  b.addEventListener("pointerleave",() => releaseAll());
+  b.addEventListener("pointercancel",() => releaseAll());
+});
+const KEYS = {KeyW:"FWD", ArrowUp:"FWD", KeyS:"BACK", ArrowDown:"BACK",
+              KeyA:"LEFT", ArrowLeft:"LEFT", KeyD:"RIGHT", ArrowRight:"RIGHT"};
+addEventListener("keydown", e => {
+  if (MODE !== "manual" || e.repeat || e.target.tagName === "INPUT") return;
+  if (e.code === "Space"){ e.preventDefault(); $("#estop").click(); return; }
+  const c = KEYS[e.code];
+  if (c){ e.preventDefault();
+    hold(c, document.querySelector('.dpad [data-cmd="'+c+'"]')); }
+});
+addEventListener("keyup", e => { if (KEYS[e.code]) releaseAll(); });
+addEventListener("blur", releaseAll);   // فقد التركيز ⇒ لا أمر معلّق
+
+/* ═══ الكاميرا: بثّ عند الطلب فقط ═══ */
+let camOn = false;
+async function camOpts(){
+  const o = await api("/api/camera/options");
+  const sel = $("#camres"); sel.innerHTML = "";
+  (o.options || []).forEach(r => {
+    const op = document.createElement("option");
+    op.value = r; op.textContent = r; if (r === o.default) op.selected = true;
+    sel.appendChild(op);
+  });
+  if (o.note) showMsg("#camNote", "⚠ " + o.note, "info");
+  else $("#camNote").innerHTML = "";
+  return o;
+}
+function startCam(){
+  camOn = true; $("#camtoggle").textContent = "إيقاف البث";
+  const img = document.createElement("img");
+  img.alt = "بث الكاميرا";
+  img.onerror = () => {
+    // غياب الكاميرا ⇒ صورة بديلة برسالة، لا انهيار
+    $("#cam").innerHTML = '<div class="camoff">📷 لا بث<br>' +
+      'الكاميرا غير متاحة أو غير موصولة (<code>/dev/video0</code>).' +
+      '<br>القيادة والقراءات تعمل بدونها.</div>';
+  };
+  img.src = "/stream.mjpg?res=" + encodeURIComponent($("#camres").value || "640x480") +
+            "&t=" + Date.now();
+  $("#cam").innerHTML = ""; $("#cam").appendChild(img);
+}
+function stopCam(){
+  camOn = false; $("#camtoggle").textContent = "تشغيل البث";
+  // ⚠ إفراغ src يقطع الاتصال فعلاً فيتحرر الجهاز (لا يكفي إخفاء العنصر)
+  $("#cam").innerHTML = '<div class="camoff">الكاميرا متوقفة</div>';
+}
+$("#camtoggle").onclick = () => camOn ? stopCam() : startCam();
+$("#camres").onchange = () => { if (camOn) startCam(); };
+
+/* ═══ الراديو عبر Web Serial ═══ */
+/* 🔴 نكشف `navigator.serial` ولا نفترض localhost: فإن توفّر يعمل الراديو
+   أياً كان مصدر الصفحة، وإن غاب نفرّق بين السببين. */
+let port = null, writer = null, txSeq = 0;
+function serialStatus(){
+  if ("serial" in navigator)
+    return {ok:true, msg:"Web Serial متاح — اضغط «وصل الشاشة» واختر منفذ CYD."};
+  if (!window.isSecureContext)
+    return {ok:false, why:"insecure",
+      msg:"⛔ سياق غير آمن: الصفحة على HTTP (عبر Tailscale غالباً). Web Serial " +
+          "يتطلب HTTPS أو localhost. الحل: افتح الصفحة من localhost على " +
+          "الراسبري، أو أضف شهادة Tailscale — وعندها يعمل الراديو بلا تعديل كود."};
+  return {ok:false, why:"unsupported",
+    msg:"⛔ المتصفح لا يدعم Web Serial: مدعوم في Chrome وEdge فقط (لا Firefox ولا Safari)."};
+}
+function xorck(s){ let c = 0; for (const b of new TextEncoder().encode(s)) c ^= b; return c; }
+function frame(payload){
+  return "$" + payload + "*" + xorck(payload).toString(16).toUpperCase().padStart(2,"0") + "\n";
+}
+function cmdFrame(cmd, p1){        // يطابق pi/comms/protocol.py
+  txSeq = (txSeq + 1) % 1000;
+  const n = v => (v === Math.trunc(v) ? String(Math.trunc(v)) : String(v));
+  return frame("C," + txSeq + "," + cmd + "," + n(p1 || 0) + ",0");
+}
+function initSerial(){
+  const s = serialStatus();
+  showMsg("#serialMsg", s.msg, s.ok ? "info" : "err");
+  $("#serialBtn").disabled = !s.ok;
+  if (!s.ok) $("#serialBtn").title = "الشاشة غير قابلة للوصل: " + s.why;
+}
+$("#serialBtn").onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate: 9600});
+    writer = port.writable.getWriter();
+    showMsg("#serialMsg", "✅ الشاشة موصولة — أوامر الراديو متاحة.", "info");
+    $("#serialSend").disabled = false;
+    readLoop();
+  } catch(e){
+    // المستخدم ألغى الاختيار أو تعذّر الفتح — السبب يُعرض لا يُبتلع
+    showMsg("#serialMsg", "⚠ تعذّر الوصل: " + e.message, "err");
+  }
+};
+$("#serialSend").onclick = async () => {
+  if (!writer) return;
+  await writer.write(new TextEncoder().encode(cmdFrame("STATUS", 0)));
+};
+async function readLoop(){
+  const dec = new TextDecoderStream();
+  port.readable.pipeTo(dec.writable).catch(()=>{});
+  const rd = dec.readable.getReader();
+  let buf = "";
+  try {
+    while (true){
+      const {value, done} = await rd.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0){
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (line) addEvent("radio", line, Date.now()/1000);
+      }
+    }
+  } catch(e){ showMsg("#serialMsg", "⚠ انقطعت وصلة الشاشة: " + e.message, "err"); }
+}
+
+/* ═══ السجل: يميّز المصدر ═══ */
+const SRC_AR = {auto:"ذاتي", manual:"يدوي", radio:"راديو", vision:"رؤية", sys:"نظام"};
+function evSource(kind){
+  const k = String(kind || "");
+  if (k.startsWith("lora")) return "radio";
+  if (k === "manual_mode" || k === "manual_timeout" || k === "safety_block") return "manual";
+  if (k.startsWith("vision") || k === "documentation") return "vision";
+  if (["mode","rover_mode","drive_mode","battery","battery_source","shutdown",
+       "heartbeat","time_limit","boot"].includes(k)) return "sys";
+  return "auto";
+}
+let lastLogKey = "";
+function renderLog(events){
+  const key = events.length + ":" + (events.length ? events[events.length-1].t : 0);
+  if (key === lastLogKey) return;      // لا إعادة رسم بلا جديد
+  lastLogKey = key;
+  const box = $("#log");
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.innerHTML = events.slice(-120).map(e => {
+    const s = evSource(e.kind);
+    const t = new Date((e.t || 0) * 1000).toLocaleTimeString("ar-EG",{hour12:false});
+    return '<div class="ev"><span class="src src-'+s+'">'+SRC_AR[s]+'</span>' +
+           '<span class="msg">'+esc(e.msg)+'</span><span class="ts">'+t+'</span></div>';
+  }).join("");
+  if (atEnd) box.scrollTop = box.scrollHeight;
+}
+function addEvent(src, msg, t){
+  const box = $("#log");
+  const d = document.createElement("div"); d.className = "ev";
+  d.innerHTML = '<span class="src src-'+src+'">'+SRC_AR[src]+'</span>' +
+    '<span class="msg">'+esc(msg)+'</span><span class="ts">' +
+    new Date(t*1000).toLocaleTimeString("ar-EG",{hour12:false})+'</span>';
+  box.appendChild(d); box.scrollTop = box.scrollHeight;
+  lastLogKey = "";     // أُضيف سطر خارجي ⇒ أعد الرسم في الدورة القادمة
+}
+
+/* ═══ الخريطة ═══ */
+/* ⚠ البثّ الدوري **لا يحمل الشبكة كاملة** — فيه `cells` (المتغيّرة فقط)
+   بلا مفتاح `grid` إطلاقاً (`drain_dirty`). فلو رسمنا من `st.grid` وحدها
+   لبقيت الخريطة فارغة بعد تعريف الغرفة: أول رسالة كاملة تصل قبل وجود
+   غرفة، وكل ما بعدها جزئي. لذا نحتفظ بنسخة ونُدمج فيها المتغيّر. */
+let GRID = null, _refetching = false, _lastRefetch = 0;
+function syncGrid(st){
+  if (st.grid && st.grid.cells){ GRID = st.grid; return; }
+  /* ⚠ بلا غرفة معرَّفة لا `grid` ولا `counts` في البثّ إطلاقاً — وإعادة
+     الجلب حينها حلقة بلا نهاية: ~5 طلبات/ثانية لا تعود بشيء (قِيست على
+     السيرفر). لا جلب إلا حين توجد غرفة فعلاً. */
+  if (st.state === "no_room" || st.counts == null) return;
+  if (!GRID){ refetchGrid(); return; }
+  // تغيّر عدد الخلايا ⇒ أُعيد تعريف الغرفة تحتنا ⇒ اطلب الشبكة كاملة
+  const tot = (st.counts || {}).total;
+  if (tot != null && GRID.cells && tot !== GRID.cells.length){ refetchGrid(); return; }
+  const dirty = st.cells;
+  if (dirty && dirty.length && GRID.cells){
+    const idx = new Map(GRID.cells.map((c,i) => [c.row+","+c.col, i]));
+    for (const c of dirty){
+      const k = c.row+","+c.col;
+      if (idx.has(k)) GRID.cells[idx.get(k)] = c; else GRID.cells.push(c);
+    }
+  }
+}
+function refetchGrid(){
+  if (_refetching) return;
+  /* طبقة دفاع ثانية مستقلة عن الشرط أعلاه: مهما كانت الحالة لا يُطلب
+     `/api/sim/status` أكثر من مرة كل ثانيتين — الشبكة الكاملة قد تكون
+     كبيرة والسيرفر على راسبري 2GB. */
+  const now = Date.now();
+  if (now - _lastRefetch < 2000) return;
+  _lastRefetch = now;
+  _refetching = true;
+  api("/api/sim/status").then(s => {
+    if (s && s.grid && s.grid.cells) GRID = s.grid;
+    _refetching = false;
+  }).catch(() => { _refetching = false; });
+}
+function drawMap(st){
+  const cv = $("#map"), g = GRID;
+  if (!g || !g.cells || !g.cells.length) return;
+  const ctx = cv.getContext("2d");
+  const cw = cv.width / g.cols, ch = cv.height / g.rows;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const maxU = Math.max(0.01, ...g.cells.map(c => c.max_usvh || 0));
+  for (const c of g.cells){
+    const x = c.col*cw, y = (g.rows-1-c.row)*ch;
+    let fill = "#0e1420";
+    if (c.blocked) fill = "#3f1d1d";
+    else if (c.unreachable) fill = "#1a1a22";
+    else if (c.visited){
+      const f = (c.max_usvh || 0)/maxU;
+      fill = f > .66 ? "#b91c1c" : f > .33 ? "#b45309" : "#166534";
+    }
+    ctx.fillStyle = fill; ctx.fillRect(x+1, y+1, cw-2, ch-2);
+    if (c.low_confidence && c.visited){    // ثقة منخفضة ⇒ لون مختلف معلَن
+      ctx.strokeStyle = "#f59e0b"; ctx.lineWidth = 2;
+      ctx.setLineDash([4,3]); ctx.strokeRect(x+2, y+2, cw-4, ch-4);
+      ctx.setLineDash([]);
+    }
+  }
+  const r = st.robot;
+  if (r){
+    const x = (r.col+0.5)*cw, y = (g.rows-1-r.row+0.5)*ch;
+    ctx.fillStyle = "#3b82f6";
+    ctx.beginPath(); ctx.arc(x, y, Math.min(cw,ch)*0.28, 0, 7); ctx.fill();
+    const a = (r.heading||0) * Math.PI/180;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(x,y); ctx.lineTo(x + Math.sin(a)*cw*0.42, y - Math.cos(a)*ch*0.42);
+    ctx.stroke();
+  }
+}
+
+/* ═══ تحديث الحالة ═══ */
+function apply(st){
+  ST = st;
+  if (st.ui_mode && st.ui_mode.mode !== MODE) applyMode(st.ui_mode.mode);
+  $("#liveWarn").classList.toggle("on", !!(st.ui_mode && st.ui_mode.motors_live));
+
+  // 🔴 الجهد المجهول يُقال «مجهول» لا يُعرض صفراً (الفرق هو كل شيء)
+  const b = st.battery || {};
+  $("#tBatt").textContent = b.v != null
+    ? b.v.toFixed(2)+"V · " + (b.percent||0) + "%" + (b.charging ? " ⚡" : "")
+    : "جهد مجهول";
+  $("#tBatt").title = (b.text || "") + (b.source_reason ? " — " + b.source_reason : "");
+  $("#dBatt").style.background = b.color || "#8a93a6";
+  $("#cState").textContent = (st.ui_mode ? st.ui_mode.mode_ar : "") + " · " + (st.state || "—");
+
+  const rd = st.reading || {};
+  $("#rCpm").textContent = Math.round(rd.cpm || 0);
+  $("#rUsvh").textContent = (rd.usvh || 0).toFixed(2);
+  $("#rRisk").textContent = rd.risk || "—";
+  $("#rRisk").style.color = rd.color || "var(--fg)";
+  const sn = st.sensors || {};
+  $("#rFront").textContent = sn.ultrasonic_cm != null ? sn.ultrasonic_cm+" سم" : "مجهول";
+  const ro = st.robot || {};
+  $("#rPos").textContent = ro.x != null ? ro.x.toFixed(2)+" , "+ro.y.toFixed(2)+" م" : "—";
+  $("#rHead").textContent = ro.heading != null ? Math.round(ro.heading)+"°" : "—";
+  $("#rPhase").textContent = st.phase_ar || "—";
+  $("#rCov").textContent = Math.round(st.coverage_pct || 0)+"%";
+  $("#coverage").textContent = st.coverage_text || "";
+  const tl = st.time_limit || {};
+  $("#rTime").textContent = tl.remaining_s != null ? Math.round(tl.remaining_s)+" ث" : "—";
+
+  const lo = st.lora || {};
+  $("#dRadio").style.background = lo.ok ? "var(--ok)" : (lo.enabled ? "var(--warn)" : "var(--idle)");
+  $("#tRadio").textContent = lo.ok ? "راديو متصل" : (lo.enabled ? "راديو معطّل" : "راديو مغلق");
+  $("#tRadio").title = lo.error || "";
+  $("#rRx").textContent = lo.frames_rx || 0;
+  $("#rBad").textContent = lo.frames_bad || 0;
+
+  const rdy = st.readiness || {};
+  if (rdy.blockers && rdy.blockers.length && st.state === "idle")
+    showMsg("#readyMsg", "⛔ " + rdy.blockers.join(" · "), "err");
+
+  if (st.events) renderLog(st.events);
+  syncGrid(st);
+  if (MODE !== "manual") drawMap(st);
+}
+
+/* ═══ WebSocket ═══ */
+let ws = null;
+function connect(){
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => {
+    $("#dNet").style.background = "var(--ok)"; $("#tNet").textContent = "الشبكة متصلة";
+  };
+  ws.onmessage = e => { try { apply(JSON.parse(e.data)); } catch(err){} };
+  ws.onclose = () => {
+    $("#dNet").style.background = "var(--bad)"; $("#tNet").textContent = "غير متصل";
+    releaseAll();                       // ⚠ فقد الاتصال ⇒ لا أمر حركة معلّق
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+}
+
+/* ═══ الإقلاع ═══ */
+buildModes();
+initSerial();
+camOpts();
+api("/api/mode").then(m => applyMode(m.mode || "sim"));
+api("/api/sim/status").then(apply);
+connect();
+</script>
+</body>
+</html>

@@ -2,9 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "rms-sim",
+      "name": "rms-rover",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "pi.web.server"],
+      "runtimeArgs": ["-m", "uvicorn", "pi.web.server:app", "--port", "8000"],
       "port": 8000
     }
   ]
