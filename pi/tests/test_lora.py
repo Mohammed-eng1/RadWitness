@@ -157,6 +157,35 @@ def _open(port: str):
                  "تحقق من توصيل محول USB-Serial (lsusb / ls /dev/ttyUSB*).")
 
 
+class LineBuffer:
+    """
+    تجميع يدوي حتى `\\n` — لا `readline` بمهلة.
+
+    ⚠ LoRa بطيء المعدل الهوائي والوحدة تسلّم الإطار على دفعات؛ `readline`
+    بمهلة يقطع الإطار نصفين عند أي فجوة فيفشل كل نصف في الـchecksum
+    ويبدو الإطار السليم ضجيجاً (نفس إصلاح `pi/comms/lora.py` و`pump()`
+    في فيرموير الشاشة).
+    """
+
+    def __init__(self, ser):
+        self.ser = ser
+        self.buf = b""
+
+    def lines(self):
+        """يُعيد قائمة الأسطر المكتملة المتاحة الآن (قد تكون فارغة)."""
+        chunk = self.ser.read(64)
+        out = []
+        if chunk:
+            self.buf += chunk
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if line.strip():
+                    out.append(line.decode("ascii", errors="replace"))
+            if len(self.buf) > 512:
+                self.buf = b""
+        return out
+
+
 def listen_mode(port: str) -> None:
     """
     ★★ إصغاء صرف — **لا يبثّ بايتاً واحداً** ⇒ يستحيل الصدى بالبناء.
@@ -167,18 +196,17 @@ def listen_mode(port: str) -> None:
     print(f"إصغاء صرف على {port} @ {BAUD} — لا إرسال إطلاقاً. "
           "اضغط أزرار الشاشة الآن. Ctrl-C للإيقاف.\n")
     real_rx = corrupt = 0
+    rd = LineBuffer(ser)
     try:
         while True:
-            raw = ser.readline().decode("ascii", errors="replace")
-            if not raw.strip():
-                continue
-            payload = parse_frame(raw)
-            if payload is None:
-                corrupt += 1
-                print(f"← تالف/checksum خاطئ: {raw.strip()!r}")
-                continue
-            real_rx += 1
-            print(f"← استُقبل {payload} ✅ (لا إرسال منا ⇒ ليس صدى)")
+            for raw in rd.lines():
+                payload = parse_frame(raw)
+                if payload is None:
+                    corrupt += 1
+                    print(f"← تالف/checksum خاطئ: {raw.strip()!r}")
+                    continue
+                real_rx += 1
+                print(f"← استُقبل {payload} ✅ (لا إرسال منا ⇒ ليس صدى)")
     except KeyboardInterrupt:
         pass
     finally:
@@ -196,6 +224,7 @@ def main() -> None:
     sent_recently = {}            # payload → وقت الإرسال (لكشف الصدى)
     real_rx = echoes = corrupt = 0
     echo_explained = False
+    rd = LineBuffer(ser)
     try:
         while True:
             now = time.time()
@@ -211,37 +240,35 @@ def main() -> None:
             sent_recently = {p: t for p, t in sent_recently.items()
                              if (now - t) <= ECHO_WINDOW_S}
 
-            raw = ser.readline().decode("ascii", errors="replace")
-            if not raw.strip():
-                continue
-            payload = parse_frame(raw)
-            if payload is None:
-                corrupt += 1
-                print(f"← تالف/checksum خاطئ: {raw.strip()!r}")
-                continue
+            for raw in rd.lines():
+                payload = parse_frame(raw)
+                if payload is None:
+                    corrupt += 1
+                    print(f"← تالف/checksum خاطئ: {raw.strip()!r}")
+                    continue
 
-            # 🔴 نفس ما أرسلناه للتوّ = صدى — تحذير لا استقبال
-            if payload in sent_recently:
-                echoes += 1
-                print(f"← ⚠ صدى: {payload} (نفس ما أرسلناه — ليس رداً)")
-                if not echo_explained:
-                    echo_explained = True
-                    print("   ⚠ الصدى من HC-14/المحوّل نفسه ولا يثبت أي وصلة"
-                          " لاسلكية (درس 2026-08-06).")
-                continue
+                # 🔴 نفس ما أرسلناه للتوّ = صدى — تحذير لا استقبال
+                if payload in sent_recently:
+                    echoes += 1
+                    print(f"← ⚠ صدى: {payload} (نفس ما أرسلناه — ليس رداً)")
+                    if not echo_explained:
+                        echo_explained = True
+                        print("   ⚠ الصدى من HC-14/المحوّل نفسه ولا يثبت أي"
+                              " وصلة لاسلكية (درس 2026-08-06).")
+                    continue
 
-            # رد PONG,<seq> → مختلف الصيغة عن PING ⇒ حقيقي، واحسب RTT
-            if payload.startswith("PONG,"):
-                real_rx += 1
-                try:
-                    rseq = int(payload.split(",")[1])
-                    rtt_ms = (now - ping_sent_at.pop(rseq, now)) * 1000.0
-                    print(f"← PONG seq={rseq}  RTT={rtt_ms:.0f}ms ✅")
-                except (IndexError, ValueError):
-                    print(f"← {payload}")
-            else:
-                real_rx += 1
-                print(f"← استُقبل {payload} ✅ (صيغة مختلفة عن المرسَل)")
+                # رد PONG,<seq> → مختلف الصيغة عن PING ⇒ حقيقي، واحسب RTT
+                if payload.startswith("PONG,"):
+                    real_rx += 1
+                    try:
+                        rseq = int(payload.split(",")[1])
+                        rtt_ms = (now - ping_sent_at.pop(rseq, now)) * 1000.0
+                        print(f"← PONG seq={rseq}  RTT={rtt_ms:.0f}ms ✅")
+                    except (IndexError, ValueError):
+                        print(f"← {payload}")
+                else:
+                    real_rx += 1
+                    print(f"← استُقبل {payload} ✅ (صيغة مختلفة عن المرسَل)")
     except KeyboardInterrupt:
         pass
     finally:

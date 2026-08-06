@@ -133,12 +133,25 @@ class LoRaLink:
         """
         تقرأ الأسطر وتبثّ التيليمتري. **لا تسقط بأي استثناء** — أي عطل
         يُعلَن في `error` وتتباطأ الحلقة بدل أن تموت أو تلتهم المعالج.
+
+        ⚠ **تجميع يدوي حتى `\\n` — لا `readline` بمهلة**: LoRa بطيء المعدل
+        الهوائي (وضع S3) والوحدة تسلّم الإطار على دفعات؛ `readline` بمهلة
+        0.3ث يقطع الإطار نصفين عند أي فجوة، فيفشل كل نصف في الـchecksum
+        ويبدو ضجيجاً — بينما الإطار سليم. (فيرموير الشاشة محصّن بنفس
+        الأسلوب في `pump()` — هذه مرآته.)
         """
+        buf = b""
         while not self._stop.is_set():
             try:
-                raw = self._ser.readline()
-                if raw:
-                    self.handle_line(raw.decode("ascii", errors="replace"))
+                chunk = self._ser.read(64)           # المهلة 0.3ث تحكم الدورة
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self.handle_line(line.decode("ascii", errors="replace"))
+                    if len(buf) > 512:
+                        # ضجيج متدفق بلا نهاية سطر — أفرغه ولا تكدّسه
+                        buf = b""
                 self._maybe_send_telemetry()
             except Exception as e:                   # noqa: BLE001
                 self.ok = False
