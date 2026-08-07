@@ -151,6 +151,11 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
   body.printing .card{border:1px solid #999;background:#fff;color:#000}
 }
 
+/* ماركداون ردود الـAI */
+.mdh{color:#93c5fd;font-weight:700}
+.msg code{background:#1c2740;border:1px solid var(--line);border-radius:5px;
+  padding:0 5px;font-size:12.5px;direction:ltr;unicode-bidi:embed}
+
 /* حوار التأكيد */
 .modal{position:fixed;inset:0;background:rgba(2,5,12,.82);display:none;
   align-items:center;justify-content:center;z-index:100;padding:18px}
@@ -1115,16 +1120,30 @@ async function aiCallGemini(key, model){
   return cand.content.parts.map(p => p.text || "").join("\n");
 }
 
+/* مصيّر ماركداون مصغّر وآمن: تهريب HTML **أولاً** ثم تحويلات إنلاين فقط
+   (عناوين/غامق/مائل/كود/قوائم) — لا مكتبة خارجية (قاعدة بلا CDN)،
+   وpre-wrap يتكفل بالأسطر فلا عناصر كتلية تضاعف التباعد. */
+function aiMd(t){
+  let h = esc(t);
+  h = h.replace(/^#{1,6}\s*(.+)$/gm, '<span class="mdh">$1</span>');
+  h = h.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  h = h.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,:؛،]|$)/gm, "$1<i>$2</i>");
+  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  h = h.replace(/^[*\-•]\s+/gm, "&nbsp;• ");
+  return h;
+}
+
 function aiRender(){
   const box = $("#aiChat");
   box.style.display = "";
   $("#aiAskRow").style.display = "";
-  box.innerHTML = aiHistory.map(m =>
-    '<div class="ev"><span class="src ' + (m.role === "user" ? "src-manual" : "src-vision") + '">' +
-    (m.role === "user" ? "أنت" : "AI") + '</span><span class="msg" style="white-space:pre-wrap">' +
-    esc(m.text.length > 4000 ? m.text.slice(0, 4000) + "…" : m.text) +
-    (m.image ? " 📷" : "") + '</span></div>'
-  ).join("") + (aiBusy ? '<div class="ev"><span class="src src-vision">AI</span><span class="msg">⏳ يفكّر…</span></div>' : "");
+  box.innerHTML = aiHistory.map(m => {
+    const raw = m.text.length > 6000 ? m.text.slice(0, 6000) + "…" : m.text;
+    return '<div class="ev"><span class="src ' + (m.role === "user" ? "src-manual" : "src-vision") + '">' +
+      (m.role === "user" ? "أنت" : "AI") + '</span><span class="msg" style="white-space:pre-wrap">' +
+      (m.role === "assistant" ? aiMd(raw) : esc(raw)) +
+      (m.image ? " 📷" : "") + '</span></div>';
+  }).join("") + (aiBusy ? '<div class="ev"><span class="src src-vision">AI</span><span class="msg">⏳ يفكّر…</span></div>' : "");
   box.scrollTop = box.scrollHeight;
 }
 
@@ -1135,57 +1154,90 @@ async function aiTurn(userText, image){
   aiBusy = true; $("#aiMsg").innerHTML = "";
   aiHistory.push({role: "user", text: userText, image: image || undefined});
   aiRender();
+  const call = m => $("#aiProvider").value === "gemini"
+      ? aiCallGemini(key, m) : aiCallClaude(key, m);
   try {
     const model = $("#aiModel").value.trim() || AI_DEFAULTS[$("#aiProvider").value];
-    const reply = $("#aiProvider").value === "gemini"
-      ? await aiCallGemini(key, model) : await aiCallClaude(key, model);
+    let reply;
+    try {
+      reply = await call(model);
+    } catch(e){
+      // 🔴 تصحيح ذاتي: اسم نموذج متقادم ⇒ اجلب القائمة الحية، اختر
+      //    الأنسب آلياً، وأعد النداء مرة واحدة — بلا أي تدخل من المستخدم
+      //    (وقع فعلاً: gemini-1.5-flash المتقاعد أفشل أول استشارة).
+      if (!/not.?found|not supported/i.test(String(e.message))) throw e;
+      const best = await aiRefreshModels(true);
+      if (!best || best === model) throw e;
+      showMsg("#aiMsg", "ℹ النموذج «" + esc(model) + "» متقادم — بُدّل تلقائياً إلى <b>"
+              + esc(best) + "</b>.", "info");
+      reply = await call(best);
+    }
     aiHistory.push({role: "assistant", text: reply || "(ردّ فارغ)"});
   } catch(e){
     aiHistory.pop();                       // لا نترك سؤالاً بلا جواب في السياق
     const em = String(e.message);
     showMsg("#aiMsg", "⛔ فشل النداء: " + esc(em) +
       (em.includes("Failed to fetch")
-        ? " — تحقق من الإنترنت (النداء من متصفحك لا من الراسبري) أو من صلاحية المفتاح للنداء المتصفحي" : "") +
-      (/not.?found|not supported/i.test(em)
-        ? " — اسم النموذج متقادم على الأرجح: اضغط 📋 لجلب النماذج المتاحة لمفتاحك" : ""), "err");
+        ? " — تحقق من الإنترنت (النداء من متصفحك لا من الراسبري) أو من صلاحية المفتاح للنداء المتصفحي" : ""), "err");
   }
   aiBusy = false; aiRender();
 }
 
-/* ── جلب قائمة النماذج الحية من المزوّد (أسماء النماذج تتقادم —
-      المصدر الصادق الوحيد هو مفتاح المستخدم نفسه) ── */
-$("#aiModels").onclick = async () => {
-  const key = $("#aiKey").value.trim();
-  if (!key){ showMsg("#aiMsg", "⚠ أدخل مفتاح API أولاً ثم اجلب النماذج.", "err"); return; }
-  $("#aiMsg").innerHTML = '<div class="info">⏳ يجلب النماذج المتاحة لمفتاحك…</div>';
-  try {
-    let names = [];
-    if ($("#aiProvider").value === "gemini"){
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?key="
-                            + encodeURIComponent(key) + "&pageSize=200");
-      const j = await r.json();
-      if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
-      names = (j.models || [])
-        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
-        .map(m => m.name.replace(/^models\//, ""));
-    } else {
-      const r = await fetch("https://api.anthropic.com/v1/models?limit=50", {
-        headers: {"x-api-key": key, "anthropic-version": "2023-06-01",
-                  "anthropic-dangerous-direct-browser-access": "true"},
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
-      names = (j.data || []).map(m => m.id);
-    }
-    if (!names.length) throw new Error("القائمة عادت فارغة");
-    $("#aiModelList").innerHTML =
-      names.map(n => '<option value="' + esc(n) + '">').join("");
-    showMsg("#aiMsg", "✅ " + names.length + " نموذجاً متاحاً — افتح حقل النموذج "
-            + "واختر (أوائل القائمة: " + esc(names.slice(0, 4).join("، ")) + ")", "info");
-  } catch(e){
-    showMsg("#aiMsg", "⛔ تعذّر جلب النماذج: " + esc(e.message), "err");
+/* ── جلب قائمة النماذج الحية + اختيار تلقائي ذكي ──
+   أسماء النماذج تتقادم، والقوائم مليئة بنسخ تجريبية مضلِّلة (robotics/
+   preview/tts…) — فالمصدر الصادق مفتاح المستخدم، والاختيار آلي. */
+async function aiFetchModels(key){
+  if ($("#aiProvider").value === "gemini"){
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?key="
+                          + encodeURIComponent(key) + "&pageSize=200");
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+    return (j.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map(m => m.name.replace(/^models\//, ""));
   }
-};
+  const r = await fetch("https://api.anthropic.com/v1/models?limit=50", {
+    headers: {"x-api-key": key, "anthropic-version": "2023-06-01",
+              "anthropic-dangerous-direct-browser-access": "true"},
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+  return (j.data || []).map(m => m.id);
+}
+
+function aiAutoPick(names){
+  if ($("#aiProvider").value === "gemini"){
+    // استبعاد النسخ المتخصصة/التجريبية، ثم الأحدث إصداراً وflash أولاً
+    const stable = names.filter(n => /^gemini-\d/.test(n) &&
+      !/(preview|exp|embedding|tts|image|audio|live|robotics|thinking|lite|8b)/i.test(n));
+    const pool = stable.length ? stable : names;
+    const score = n => {
+      const m = n.match(/^gemini-(\d+(?:\.\d+)?)/);
+      return (m ? parseFloat(m[1]) : 0) * 10 + (/flash/.test(n) ? 2 : /pro/.test(n) ? 1 : 0);
+    };
+    return pool.slice().sort((a, b) => score(b) - score(a))[0];
+  }
+  return names.find(n => n === "claude-opus-5")
+      || names.find(n => /opus/.test(n)) || names[0];
+}
+
+async function aiRefreshModels(silent){
+  const key = $("#aiKey").value.trim();
+  if (!key){ if (!silent) showMsg("#aiMsg", "⚠ أدخل مفتاح API أولاً.", "err"); return null; }
+  if (!silent) $("#aiMsg").innerHTML = '<div class="info">⏳ يجلب النماذج المتاحة لمفتاحك…</div>';
+  const names = await aiFetchModels(key);
+  if (!names.length) throw new Error("القائمة عادت فارغة");
+  $("#aiModelList").innerHTML = names.map(n => '<option value="' + esc(n) + '">').join("");
+  const best = aiAutoPick(names);
+  $("#aiModel").value = best;
+  localStorage.setItem("ai_model_" + $("#aiProvider").value, best);
+  if (!silent)
+    showMsg("#aiMsg", "✅ اختير <b>" + esc(best) + "</b> تلقائياً من " + names.length +
+            " نموذجاً — وحقل النموذج صار قائمة إن أردت غيره.", "info");
+  return best;
+}
+$("#aiModels").onclick = () =>
+  aiRefreshModels(false).catch(e => showMsg("#aiMsg", "⛔ تعذّر الجلب: " + esc(e.message), "err"));
 
 $("#aiConsult").onclick = async () => {
   // فحص المفتاح **قبل** التقاط اللقطة — الالتقاط قد يستغرق ثواني بلا كاميرا
