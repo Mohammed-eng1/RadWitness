@@ -640,6 +640,14 @@ class MissionSim:
         arr = getattr(self, "us_array", None)
         arr_front = (arr is not None and getattr(arr, "ok", False)
                      and getattr(arr, "channels", {}).get("front") is not None)
+        # 🔴 القراءة الحية من قارئ الجيجر المحقون (مقاس 2026-08-08): اللوحة
+        #    الخاملة كانت تعرض CPM=0 أبدياً — `last_reading` لا يتحدّث إلا
+        #    أثناء مهمة، بينما السيرفر يدحرج نافذة القارئ كل ثانية والأنبوب
+        #    يعدّ فعلاً (تحقق بالسكربت المنفرد). الحيّ يُقدَّم على الأثري.
+        gg = getattr(self, "geiger", None)
+        live_cpm = (gg.state()["cpm"] if (gg is not None
+                                          and getattr(gg, "ok", False))
+                    else None)
         us_ok = bool(real_us is not None and real_us.ok) or arr_front
         ir_ok = bool(real_ir is not None and real_ir.ok)
         if us_ok or ir_ok:
@@ -656,16 +664,18 @@ class MissionSim:
                     "ir_mid": vals["front_mid"],
                     "ir_side_left": vals["side_left"],
                     "ir_side_right": vals["side_right"],
-                    "cpm": self.last_reading["cpm"], "source": "real",
-                    "quality": q}
+                    "cpm": (live_cpm if live_cpm is not None
+                            else self.last_reading["cpm"]),
+                    "source": "real", "quality": q}
         # 🔴 **لا سقوط إلى نموذج المحاكاة على عتاد حقيقي**: كان الفشل الكامل
         #    لقراءة الحساسات يُسقط المسار إلى `SimWorld` — أي **مسافات
         #    مُختلَقة تقود محركات حقيقية**. الآن نُعلن الجهل صراحةً.
         if self.rover.mode == "real":
             return {"ultrasonic_cm": None, "ir_left": None, "ir_right": None,
                     "ir_mid": None, "ir_side_left": None, "ir_side_right": None,
-                    "cpm": self.last_reading["cpm"], "source": "unavailable",
-                    "quality": 0}
+                    "cpm": (live_cpm if live_cpm is not None
+                            else self.last_reading["cpm"]),
+                    "source": "unavailable", "quality": 0}
         if self.grid is None or self.dr is None:
             return {"ultrasonic_cm": None, "ir_left": 1, "ir_right": 1,
                     "cpm": self.last_reading["cpm"]}
