@@ -882,8 +882,9 @@ def main() -> int:
         WALL_ALIGN_TOL_DEG as W_ALIGN_TOL,
     )
 
-    check("🔴 العلم معطّل افتراضياً (المنافذ وσ غير مؤكَّدة بعد)",
-          SIDE_ULTRASONIC_ENABLED is False)
+    check("✅ العلم مفعّل بعد اكتمال بوابة القياس (2026-08-07: σ 0.26–0.55سم "
+          "+ جهة مثبتة + جولتا سير حقيقيتان)",
+          SIDE_ULTRASONIC_ENABLED is True)
     check("ميل التركيب يُحوَّل إلى مسافة عمودية (لا تُستعمل القراءة خاماً)",
           abs(perpendicular_cm(100.0, 0.0) - 100.0) < 1e-9
           and perpendicular_cm(100.0, US_SIDE_TILT_DEG) < 100.0,
@@ -1613,7 +1614,13 @@ def main() -> int:
     # ⑦د 🔴 اختبار تكامل: المهمة **تستدعي** تصحيح الاتجاه الجانبي فعلاً
     #      (قاعدة CLAUDE.md §8 — لا وحدة مبنيّة معزولة)
     class FakeArray:
-        """مصفوفة وهمية: جدار يمين يبتعد تدريجياً ⇒ ميل ثابت."""
+        """
+        مصفوفة وهمية: جدار يمين يبتعد تدريجياً ⇒ ميل ثابت.
+        ⚠ الخطوة 2.5سم/استدعاء لا 7: المهمة تستدعي القناة مرتين لكل خلية
+          (تصحيح + تحكيم جانبي) ⇒ Δ=5سم/0.5م = ميل ~5.7° — واقعي وتحت سقف
+          WALL_HEADING_MAX_TILT_DEG المشدود (12° منذ 2026-08-07؛ الخطوة
+          القديمة 7 أنتجت 15.6° فرُفضت كلها R_TILT وانكسر الاختبار).
+        """
         ok = True
         def __init__(self):
             self.n = 0
@@ -1621,7 +1628,7 @@ def main() -> int:
             if side != "right":
                 return None
             self.n += 1
-            return 40.0 + self.n * 7.0
+            return 40.0 + self.n * 2.5
         def state(self):
             return {"enabled": True, "ok": True, "channels": {}}
 
@@ -1652,10 +1659,10 @@ def main() -> int:
         if t is None:
             break
         ms_off._advance_one_cell(t)
-    check("وبلا مصفوفة (العلم معطّل) **لا يتغيّر أي سلوك قائم**",
+    check("وبلا **حقن** مصفوفة لا يتغيّر أي سلوك قائم (العلم وحده لا يكفي)",
           ms_off.wall_heading is None
           and ms_off._wall_heading_corrections == 0
-          and ms_off.state_dict()["side_us"]["enabled"] is False)
+          and ms_off.state_dict()["side_us"]["array"] is None)
 
     # ⑦هـ دورة المحيط موصولة بالمهمة وترفض بسبب معلَن عند النقص
     ms_pm = full_mission(run=False)
