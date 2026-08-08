@@ -2135,6 +2135,23 @@ class MissionSim:
             return ok
         return _turn
 
+    def _live_reading(self) -> dict:
+        """
+        قراءة لوحة «القراءة الحية»: الحيّة من القارئ الحقيقي تُقدَّم على
+        الأثرية (مقاس 2026-08-08: لوحة خاملة تعرض CPM=0 أبدياً والأنبوب
+        يعدّ — `last_reading` لا يتحدّث إلا أثناء قياسات مهمة).
+        ⚠ التفضيل مشروط بالجسر الحقيقي: في المحاكاة يولّد عالم sim القراءة
+          عبر `last_reading`، وخلفية الأنبوب الحقيقي الخامل تطمسها.
+        """
+        gg = getattr(self, "geiger", None)
+        if (self.rover.mode == "real" and gg is not None
+                and getattr(gg, "ok", False)):
+            s = gg.state()
+            rk = classify(s["usvh"])
+            return {"cpm": s["cpm"], "usvh": s["usvh"],
+                    "risk": rk["risk"], "color": rk["color"]}
+        return self.last_reading
+
     def _log(self, kind, msg):
         self.events.append({"t": round(time.time(), 2), "kind": kind, "msg": msg})
         if len(self.events) > 300:
@@ -2214,7 +2231,7 @@ class MissionSim:
             "coverage_pct": round(self.grid.coverage_pct(), 1),
             "coverage_text": self.grid.coverage_text(),
             "counts": counts,
-            "reading": self.last_reading,
+            "reading": self._live_reading(),
             "mission_time_s": round(self.mission_time_s, 1),
             "corrections": len(self.dr.corrections) if self.dr else 0,
             "anomalies": len(self.anomalies),
