@@ -33,7 +33,8 @@ import sys
 import time
 
 from pi.config import (
-    ROVER_MODE, MOTOR_INVERT, BNO055_GYRO_Z_SIGN, BNO055_READ_PERIOD_S,
+    ROVER_MODE, MOTOR_INVERT, MOTOR_SWAP_LR, BNO055_GYRO_Z_SIGN,
+    BNO055_READ_PERIOD_S,
 )
 from pi.rover.bridge import WaveRoverBridge
 
@@ -200,11 +201,19 @@ def _verdict(g: dict, f: dict, t: dict) -> None:
     # تقاطع (ب) و(ج): انعكاس عام أم محرك واحد؟
     if f.get("ok") and t.get("ok"):
         if f["needed_invert"] != t["needed_invert"]:
-            print("  ⛔ **تناقض بين التقدّم والدوران** — الانعكاس ليس عاماً.")
-            print("     الأرجح أن **أحد المحركين موصول بقطبية مقلوبة**.")
-            print("     ⚠ لا يصلحها أي ثابت في config: اعكس سلكَي ذلك المحرك")
-            print("     عتادياً ثم أعد هذا السكربت. (عرَض مميّز: الأمر بالتقدّم")
-            print("     يجعله يدور بالمكان بدل أن يتقدّم.)")
+            # 🔴 مقاس 2026-08-07: تقدّم معكوس ودوران صحيح = تخطيط **مرآتي**
+            #    في الفيرموير (تبديل القناتين + قلب القطبية معاً) — يصلحه
+            #    زوج الثابتين، لا الأسلاك. (كان النص القديم يحيل للأسلاك
+            #    حصراً — صحيح فقط حين يدور بالمكان عند أمر التقدّم.)
+            print("  ⛔ **تناقض بين التقدّم والدوران** — انعكاس غير عام.")
+            print("     بصمة تخطيط **مرآتي** في الفيرموير. العلاج في config:")
+            print(f"       MOTOR_SWAP_LR = {not MOTOR_SWAP_LR}"
+                  f"   # قلب الحالي ({MOTOR_SWAP_LR})")
+            print(f"       MOTOR_INVERT  = {f['needed_invert']:+d}"
+                  f"   # من قياس التقدّم (مستقل عن التبديل)")
+            print("     ثم أعد هذا السكربت للتحقق.")
+            print("     ⚠ أما إن كان أمر التقدّم يجعله **يدور بالمكان**: محرك")
+            print("     واحد بقطبية مقلوبة — أسلاك، لا يصلحها config.")
             print("═" * 62)
             return
         if not f["matches"]:
@@ -252,6 +261,7 @@ def main(argv=None) -> int:
     print("═" * 62)
     print(f"فحص الاتجاهات · جسر: {rover.mode} · مصدر: {rover.heading_source.name}")
     print(f"  الحالي: MOTOR_INVERT={MOTOR_INVERT:+d} · "
+          f"MOTOR_SWAP_LR={MOTOR_SWAP_LR} · "
           f"BNO055_GYRO_Z_SIGN={BNO055_GYRO_Z_SIGN:+d}")
     if rover.error:
         print(f"  ⚠ {rover.error}")

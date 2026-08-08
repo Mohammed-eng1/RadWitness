@@ -6,7 +6,8 @@ bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / 
 - `WaveRoverBridge`  : **جسر Wave Rover الحقيقي** ببروتوكول Waveshare المكتشف
                        تجريبياً، مع بديل محاكاة كامل ليعمل على ويندوز بلا عتاد.
 
-بروتوكول Waveshare (JSON سطري + \\n على /dev/serial0 @115200):
+بروتوكول Waveshare (JSON سطري + \\n على ROVER_PORT @115200 — uart3
+`/dev/ttyAMA3` منذ 2026-08-08 بعد موت TXD0، انظر config):
     إرسال:  {"T":1,"L":<-1..1>,"R":<-1..1>}   حركة (تُضرب في MOTOR_INVERT)
             {"T":126}                          طلب IMU كامل
             {"T":130}                          طلب حالة مختصرة
@@ -14,8 +15,10 @@ bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / 
             {"T":1001, L,R, r,p,y, temp, v}                    ردّ 130
 
 ⚠ ملاحظات مثبتة على العتاد:
-  - الفيرموير **يردّد الأمر المُرسل صدىً** قبل الرد الفعلي → تجاهل أي سطر
-    يحمل نفس T المُرسل، وانتظر 1002/1001.
+  - الفيرموير كان **يردّد الأمر المُرسل صدىً** قبل الرد الفعلي. أُطفئ الصدى
+    نهائياً (2026-08-07) بخطوة {"T":143,"cmd":0} في boot.mission على ESP32،
+    ومنطق تجاهله في `_read_until` **باقٍ دفاعياً**: لوحة بديلة أو مسح
+    boot.mission يعيدان الصدى (افتراضيه في الفيرموير مفعّل).
   - `y` (yaw) **للعرض فقط لا للملاحة** — الملاحة من `gz` (انظر CLAUDE.md).
   - `T=131`, `T=4`, `T=71` بلا رد — لا تعتمد عليها.
   - **الأمر المرتد لا يعني التنفيذ** — تحقق من الحركة عبر gz/التسارع.
@@ -31,7 +34,7 @@ import time
 from pi.config import (
     DRIVE_SPEED_MPS, TURN_RATE_DPS, ROVER_SAFETY_TIMEOUT_S,
     SIM_HOME_LAT, SIM_HOME_LNG,
-    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, TURN_POWER,
+    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, MOTOR_SWAP_LR, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
     MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
     TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED,
@@ -40,6 +43,8 @@ from pi.config import (
     TURN_COAST_TAU_S, TURN_COAST_TAU_ALPHA, TURN_COAST_TAU_MAX_S,
     TURN_MAX_LEAD_DEG, TURN_MIN_ACHIEVABLE_DEG, ROVER_LINK_REOPEN_S,
     TURN_RATE_FADE_WARN,
+    ESP32_BOOT_WAIT_S, ESP32_STUCK_ZERO_BYTES, ESP32_STUCK_RETRY_S,
+    ESP32_STUCK_RETRIES,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
@@ -162,6 +167,14 @@ class WaveRoverBridge:
         self.link_ok = True
         self.link_error = None
         self._last_reopen_ts = 0.0
+        # كاشف «ESP32 عالق في الإقلاع» (تدفق أصفار — انظر config §ESP32)
+        # ⚠ حالة مستقلة عن link_ok عمداً: المنفذ سليم والكتابة تنجح، لكن
+        #   الطرف الآخر يبثّ أصفاراً — عرَض مختلف عن «لا رد» وعلاجه مختلف.
+        self.esp32_stuck = False
+        self._zero_run = 0
+        self._stuck_attempts = 0
+        self._stuck_cooldown_until = 0.0
+        self._port_ready_ts = 0.0
         # ذروة معدل الدوران لأول لفّة — مرجع كشف إنهاك البطارية سلوكياً
         # ⚠ يبقى **طبقة ثانية** بعد عودة INA219: يكشف الإنهاك سلوكياً بلا
         #   فولتميتر (الدوران بالمكان أول ما يسقط)، والحارسان لا يتعارضان.
@@ -180,6 +193,12 @@ class WaveRoverBridge:
                 try:
                     self._ser = serial.Serial(port, baud, timeout=0.3)
                     self.mode = "real"
+                    # ⚠ لا أمر قبل اكتمال إقلاع ESP32 (~3ث): الإرسال أثناءه
+                    #   قد يعلّقه في وضع الإقلاع (يبثّ أصفاراً، علاجه Reset
+                    #   يدوي). الانتظار كسول في `_wait_esp32_boot` — عند أول
+                    #   أمر فعلي لا هنا، وغالباً تكون المدة انقضت أصلاً في
+                    #   تهيئة بقية الأنظمة.
+                    self._port_ready_ts = time.time() + ESP32_BOOT_WAIT_S
                 except Exception as e:      # noqa: BLE001
                     self.error = f"تعذّر فتح {port}: {e} — وضع المحاكاة"
 
@@ -234,6 +253,79 @@ class WaveRoverBridge:
         evs, self.events = self.events, []
         return evs
 
+    # ── إقلاع ESP32 وكاشف العلق ─────────────────────────────────
+    def _wait_esp32_boot(self) -> None:
+        """
+        ينتظر اكتمال إقلاع ESP32 قبل **أول** أمر بعد فتح المنفذ.
+
+        عطل مشخَّص (2026-08-07): الإرسال على TX أثناء الإقلاع (~3ث مقاسة) قد
+        يعبث بأطراف وضع الإقلاع (GPIO0 ونحوها) فيعلق ESP32 يبثّ أصفاراً
+        متدفقة ولا يخرج منه إلا زرّ Reset. الانتظار مرة واحدة، ويُقتطع منه
+        ما انقضى منذ فتح المنفذ (تهيئة بقية الأنظمة تستهلك المدة غالباً).
+        """
+        if not self._port_ready_ts:
+            return
+        wait = self._port_ready_ts - time.time()
+        self._port_ready_ts = 0.0
+        if wait > 0:
+            self._event("esp32_boot_wait",
+                        f"انتظار اكتمال إقلاع ESP32 ({wait:.1f}ث) قبل أول أمر")
+            time.sleep(wait)
+
+    def _mark_esp32_alive(self) -> None:
+        """أي JSON صالح من الفيرموير يصفّر الكاشف ويرفع إعلان العلق إن وُجد."""
+        self._zero_run = 0
+        self._stuck_attempts = 0
+        if self.esp32_stuck:
+            self.esp32_stuck = False
+            self._event("esp32_recovered",
+                        "✅ عاد ESP32 يستجيب (يبدو أن زرّ Reset ضُغط) — "
+                        "الوصلة سليمة")
+
+    def _note_zero_bytes(self, n: int) -> None:
+        """
+        كاشف «ESP32 عالق في الإقلاع» — العرَض المقاس: **تدفق أصفار** مستمر
+        على UART (لا صمت ولا بيانات)، والعلاج زرّ Reset على اللوحة.
+
+        ⚠ **ليس** «لا رد»: الصمت عرَض وصلة/heartbeat وعلاجه مختلف — خلط
+           التشخيصين يضيّعهما معاً، لذلك حالة مستقلة (`esp32_stuck`) لا
+           `link_ok`.
+        ⚠ إعادة الفحص **موزَّعة على الاستدعاءات** لا حلقة نوم واحدة: القراءة
+           الدورية (poll_battery كل 200ms) هي المحاولة التالية أصلاً، وحلقة
+           نوم 3×2ث داخل مسار القراءة كانت ستجمّد حلقة السيرفر كلها.
+        """
+        if self.esp32_stuck:
+            return                  # مُعلَن — بانتظار Reset يدوي، لا تكرار
+        now = time.time()
+        if now < self._stuck_cooldown_until:
+            return                  # مهلة بين المحاولات — أصفارها لا تُحسب
+        self._zero_run += n
+        if self._zero_run < ESP32_STUCK_ZERO_BYTES:
+            return
+        self._zero_run = 0
+        self._stuck_attempts += 1
+        if self._stuck_attempts < ESP32_STUCK_RETRIES:
+            self._stuck_cooldown_until = now + ESP32_STUCK_RETRY_S
+            self._event("esp32_stuck_suspect",
+                        f"⚠ ESP32 يبثّ أصفاراً (عالق في الإقلاع؟) — إعادة "
+                        f"الفحص بعد {ESP32_STUCK_RETRY_S:.0f}ث "
+                        f"(محاولة {self._stuck_attempts}/{ESP32_STUCK_RETRIES})")
+            # تفريغ المتراكم حتى لا تُحسب أصفار قديمة على المحاولة التالية
+            try:
+                self._ser.reset_input_buffer()
+            except Exception:        # noqa: BLE001
+                pass
+            return
+        self.esp32_stuck = True
+        # ⚠ مؤشر «شبكة UGV تظهر عند الإقلاع السليم» بطل منذ تعطيل راديو
+        #   WiFi في الفيرموير (DISABLE_WIFI_RADIO — الهوائي محترق): الشبكة
+        #   لا تظهر أبداً الآن، وظهورها يعني فيرموير قديماً على اللوحة.
+        self._event("esp32_stuck",
+                    "🔴 ESP32 عالق في الإقلاع — اضغط زر Reset على لوحة "
+                    "الروبوت. (الوقاية: شغّل الروبوت أولاً وانتظر 5 ثوانٍ "
+                    "قبل الراسبري/الأوامر. ومؤشر شبكة UGV لم يعد صالحاً "
+                    "بعد تعطيل راديو WiFi في الفيرموير)")
+
     # ── الإرسال/الاستقبال ────────────────────────────────────────
     def _reopen(self) -> bool:
         """
@@ -267,6 +359,7 @@ class WaveRoverBridge:
         """
         if self.mode != "real" or self._ser is None:
             return
+        self._wait_esp32_boot()
         payload = (json.dumps(obj) + "\n").encode("ascii")
         try:
             self._ser.write(payload)
@@ -303,9 +396,17 @@ class WaveRoverBridge:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                line = self._ser.readline().decode("ascii", errors="replace").strip()
+                raw = self._ser.readline()
             except Exception:               # noqa: BLE001
                 break
+            if not raw:
+                continue
+            # كاشف العلق: عدّ الأصفار من البايتات **الخام** قبل فكّ الترميز —
+            # ESP32 العالق في الإقلاع يبثّ b'\x00...' متدفقة لا JSON ولا صمتاً.
+            zeros = raw.count(b"\x00")
+            if zeros:
+                self._note_zero_bytes(zeros)
+            line = raw.decode("ascii", errors="replace").strip("\x00 \t\r\n")
             if not line:
                 continue
             try:
@@ -317,6 +418,7 @@ class WaveRoverBridge:
             # بـ'int' object has no attribute 'get' وتُسقط المهمة كلها.
             if not isinstance(d, dict):
                 continue
+            self._mark_esp32_alive()
             t = d.get("T")
             if t == request_t:
                 continue                    # صدى الأمر — تجاهل
@@ -330,13 +432,20 @@ class WaveRoverBridge:
         **المسار الوحيد لإرسال أي أمر حركة** (تقدّم/رجوع/لفّ/أوامر الواجهة).
         يطبّق MOTOR_INVERT ثم **حاجزاً صارماً** عند ±MAX_MOTOR_POWER.
 
-        ⚠ الحاجز إلزامي: فيرموير Wave Rover يلتفّ عددياً فوق 0.5 (يطرح 0.5)،
-        فإرسال 0.8 يُنتج قوة فعّالة 0.3 — زحف صامت يفسد حساب المسافة في
-        deadreckoning بلا أي إنذار. القصّ يحفظ الإشارة ويُسجَّل تحذيراً.
+        ⚠ الحاجز إلزامي: الفيرموير يضرب المدخل في 512 على PWM بدقة 8 بت
+        (256 عدّة)، فما فوق 0.5 يلتفّ (يُطرح 0.5): إرسال 0.8 يُنتج قوة فعّالة
+        0.3 — زحف صامت يفسد حساب المسافة في deadreckoning بلا أي إنذار.
+        القصّ يحفظ الإشارة ويُسجَّل تحذيراً.
+        🔴 والحدّ ليس تقييداً: 0.5×512 = 256 = duty كامل 100% — أي كامل قدرة
+        الروبوت أصلاً، فلا شيء فوق 0.5 يُخسر (CLAUDE.md §2.1).
         """
         li = max(-1.0, min(1.0, float(l)))
         ri = max(-1.0, min(1.0, float(r)))
-        lw, rw = li * MOTOR_INVERT, ri * MOTOR_INVERT      # قيم السلك
+        # 🔴 تعويض تخطيط الفيرموير المرآتي (مقاس 2026-08-07): الفيرموير
+        #    المفلوش بدّل القناتين وعكس القطبية معاً — التقدّم كان يرجع
+        #    للخلف والدوران يميناً يبقى يميناً. التعويض: تبديل ثم نفي.
+        sw_l, sw_r = (ri, li) if MOTOR_SWAP_LR else (li, ri)
+        lw, rw = sw_l * MOTOR_INVERT, sw_r * MOTOR_INVERT  # قيم السلك
 
         # الحاجز الصارم — **بعد** MOTOR_INVERT، مع الحفاظ على الإشارة
         lc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, lw))
@@ -355,8 +464,10 @@ class WaveRoverBridge:
         self._last_cmd_ts = time.time()
         self._send({"T": 1, "L": round(lc, 3), "R": round(rc, 3)})
         if self.mode == "sim":
-            # معدل الدوران من القوة **الفعّالة بعد القصّ**، مُعاداً لإطار النية
-            eff_l, eff_r = lc * MOTOR_INVERT, rc * MOTOR_INVERT
+            # معدل الدوران من القوة **الفعّالة بعد القصّ**، مُعاداً لإطار
+            # النية بعكس التحويل كاملاً (النفي ثم التبديل)
+            un_l, un_r = (rc, lc) if MOTOR_SWAP_LR else (lc, rc)
+            eff_l, eff_r = un_l * MOTOR_INVERT, un_r * MOTOR_INVERT
             self._sim_turn_rate = (eff_l - eff_r) * TURN_RATE_DPS
         return {"L": lc, "R": rc, "clamped": (lc != lw or rc != rw)}
 
@@ -903,6 +1014,9 @@ class WaveRoverBridge:
             "gyro_bias": round(self.gyro_bias, 4),
             "bias_calibrated": self.bias_calibrated,
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
+            "link_ok": self.link_ok, "link_error": self.link_error,
+            # علق إقلاع ESP32 — حالة مستقلة عن link_ok (العلاج: زرّ Reset)
+            "esp32_stuck": self.esp32_stuck,
             "battery": (self.battery_state() if BATTERY_MONITOR_ENABLED
                         else batt.classify(None)),
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
