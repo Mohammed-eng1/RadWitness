@@ -632,14 +632,24 @@ class MissionSim:
         """
         real_us = getattr(self, "ultrasonic", None)
         real_ir = getattr(self, "ir", None)
-        us_ok = bool(real_us is not None and real_us.ok)
+        # 🔴 توحيد الأمامي في مجدول المصفوفة متى امتلكت قناته (2026-08-08):
+        #    مجدولان مستقلان (قارئ قديم + تناوب المصفوفة) = نبضتان قد
+        #    تتزامنان فيلتقط كلٌّ صدى الآخر **بلا إنذار** (§1.2). إن حجزت
+        #    المصفوفة القناة الأمامية تُقرأ منها حصراً؛ وإن بقيت للقارئ
+        #    القديم ('GPIO busy' — سبقه بالحجز) بقي هو المصدر كما كان.
+        arr = getattr(self, "us_array", None)
+        arr_front = (arr is not None and getattr(arr, "ok", False)
+                     and getattr(arr, "channels", {}).get("front") is not None)
+        us_ok = bool(real_us is not None and real_us.ok) or arr_front
         ir_ok = bool(real_ir is not None and real_ir.ok)
         if us_ok or ir_ok:
-            us = real_us.distance_cm if us_ok else None
+            us = (arr.distance_cm("front") if arr_front
+                  else (real_us.distance_cm if us_ok else None))
             vals = real_ir.read_all() if (ir_ok and hasattr(real_ir, "read_all")) \
                 else {"front_left": None, "front_right": None, "front_mid": None,
                       "side_left": None, "side_right": None}
-            q = getattr(real_us, "quality", None) if us_ok else None
+            q = (arr.channels["front"].quality.percent if arr_front
+                 else (getattr(real_us, "quality", None) if us_ok else None))
             return {"ultrasonic_cm": us,
                     # 🔴 `None` = **مجهول** لا «خالٍ» (البند: الغائب لا يُفترض سالماً)
                     "ir_left": vals["front_left"], "ir_right": vals["front_right"],
@@ -1669,6 +1679,16 @@ class MissionSim:
             why = (getattr(src, "error", None) or "غير متاح") if src else "غير مُنشأ"
             blockers.append(f"لا مصدر اتجاه صالح ({why}) — "
                             f"المسح الذاتي يتطلب اتجاهاً موثوقاً")
+        # ①ب 🔴 جسر حقيقي بمصدر اتجاه **محاكى** (مقاس 2026-08-08): سيرفر أقلع
+        #    بلا RMS_ROVER_MODE=real ثم بُدّل الوضع من الواجهة — والتبديل لا
+        #    يعيد بناء مصدر الاتجاه. المصدر الوهمي `ok=True` فيمرّ من ① بينما
+        #    اللفّات «تكتمل» على جايرو يوافق الأوامر دائماً والروبوت الحقيقي
+        #    يفعل ما يشاء. لا حركة حقيقية على اتجاه وهمي.
+        elif (getattr(self.rover, "mode", "sim") == "real"
+                and getattr(src, "name", "") == "sim"):
+            blockers.append("مصدر الاتجاه محاكى على جسر حقيقي — أعد تشغيل "
+                            "السيرفر بـRMS_ROVER_MODE=real (تبديل الوضع من "
+                            "الواجهة لا يعيد بناء مصدر الاتجاه)")
 
         # ② استشعار أمامي — الروبوت بلا مدى أمامي يصطدم
         s = self.sensors()

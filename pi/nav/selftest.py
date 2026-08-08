@@ -2085,6 +2085,22 @@ def main() -> int:
     finally:
         _hh.HEADING_MAX_CORR = _saved_corr
 
+    # ── ①ب: جسر حقيقي بمصدر اتجاه محاكى ⇒ البدء محجوب ──────────────
+    # ⚠ مقاس 2026-08-08 على العتاد: سيرفر أقلع بلا RMS_ROVER_MODE=real ثم
+    #   بُدّل الوضع من الواجهة — heading_source بقي «sim» على جسر real،
+    #   والمصدر الوهمي ok=True فيمرّ من فحص الصلاحية العادي.
+    ms_hd = MissionSim()
+    ms_hd.configure_room(2.0, 2.0)
+    ms_hd.set_calibration(default_sim_profile())
+    ms_hd.rover.mode = "real"
+    rd_sim = ms_hd.mission_readiness()
+    check("🔴 جسر حقيقي بمصدر اتجاه محاكى → البدء محجوب بسبب مقروء",
+          any("محاكى" in b for b in rd_sim["blockers"]),
+          next((b[:64] for b in rd_sim["blockers"] if "محاكى" in b), "لا حاجب"))
+    ms_hd.rover.mode = "sim"
+    check("وعلى جسر sim يبقى المصدر المحاكى مشروعاً (لا حجب زائفاً)",
+          not any("محاكى" in b for b in ms_hd.mission_readiness()["blockers"]))
+
     # ═══ (ع) حارس «المبنيّ غير المستدعى» — قاعدة CLAUDE.md §8 آلياً ═══
     # النمط تكرر ست مرات: وحدة مبنيّة ومختبَرة وحدةً ولا يستدعيها أحد في
     # مسار المهمة، واختبار الوحدة المعزول يمرّ وإن لم يستدعِها أحد. الحارس
