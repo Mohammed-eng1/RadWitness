@@ -312,6 +312,11 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <div class="row"><span>الجرعة (µSv/h)</span><b id="rUsvh">0.00</b></div>
         <div class="row"><span>الخطورة</span><b id="rRisk">—</b></div>
         <div class="row"><span>المسافة الأمامية</span><b id="rFront">—</b></div>
+        <div class="row" title="● أخضر = خالٍ · ● أحمر = عائق · ○ رمادي = مجهول (غائب/مفصول)">
+          <span>IR أمامي (يسار·وسط·يمين)</span><b id="rIrFront" style="letter-spacing:4px">—</b></div>
+        <div class="row" title="● أخضر = خالٍ · ● أحمر = عائق · ○ رمادي = مجهول">
+          <span>IR جانبي (يسار·يمين)</span><b id="rIrSide" style="letter-spacing:4px">—</b></div>
+        <div class="row"><span>الجانبي ⊥ (يمين·يسار)</span><b id="rSideUs">—</b></div>
         <div class="row"><span>الموضع</span><b id="rPos">—</b></div>
         <div class="row"><span>الاتجاه</span><b id="rHead">—</b></div>
       </div>
@@ -347,6 +352,15 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
       <h2>المهمة</h2>
       <div id="readiness"></div>
       <div id="estimate"></div>
+      <!-- 🔴 مفتاح القيادة الفعلية — كان في /sim فقط، فكل «ابدأ» من هذه
+           اللوحة كان مسحاً منطقياً: الخريطة تتقدّم والروبوت ساكن (§6.1:
+           لا قيادة محركات إلا بطلب صريح — فالمفتاح ظاهر لا مضمر) -->
+      <label class="row" style="cursor:pointer;margin-bottom:6px"
+             title="بدونه المسح منطقي: الخريطة تتقدّم والروبوت لا يتحرك">
+        <span>🔩 قيادة المحركات فعلياً</span>
+        <input type="checkbox" id="driveMotors" style="width:17px;height:17px;accent-color:var(--acc)">
+      </label>
+      <div id="driveMsg"></div>
       <div class="btnrow">
         <button data-m="start" id="btnStart">▶ ابدأ</button>
         <button data-m="pause">⏸ إيقاف مؤقت</button>
@@ -488,6 +502,20 @@ $("#withdraw").onclick = async () => {
   // الرفض يُعرض بسببه (لا مهمة نشطة · بلا قيادة محركات) لا يُبتلع
   if (r && r.ok === false)
     addEvent("sys", "⚠ رُفض الانسحاب: " + (r.reason || "سبب مجهول"), Date.now()/1000);
+};
+
+/* ═══ مفتاح قيادة المحركات — الرفض يُعرض بسببه ويعود المفتاح لحاله ═══ */
+$("#driveMotors").onchange = async e => {
+  const want = e.target.checked;
+  const r = await api("/api/mission/drive_mode", {motors: want});
+  if (!r || r.ok === false){
+    e.target.checked = !want;      // لا نوهم المستخدم بحالة لم تتحقق
+    showMsg("#driveMsg", "⛔ " + ((r && r.error) || "رُفض التبديل"), "err");
+  } else {
+    $("#driveMsg").innerHTML = "";
+    addEvent("sys", want ? "🔩 قيادة المحركات مفعّلة — «ابدأ» سيحرّك الروبوت فعلياً"
+                         : "قيادة المحركات مطفأة — المسح منطقي", Date.now()/1000);
+  }
 };
 
 /* ═══ أوامر المهمة ═══ */
@@ -1297,6 +1325,27 @@ function apply(st){
   $("#rRisk").style.color = rd.color || "var(--fg)";
   const sn = st.sensors || {};
   $("#rFront").textContent = sn.ultrasonic_cm != null ? sn.ultrasonic_cm+" سم" : "مجهول";
+  // IR الخمسة: 0 = عائق (المنطق المعكوس المثبت) · 1 = خالٍ · null = مجهول —
+  // «المجهول» يُعرض رمادياً لا أخضر (الغائب ليس شهادة خلوّ — §6.1)
+  const irDot = v => v == null ? '<span style="color:#8a93a6">○</span>'
+    : (v === 0 ? '<span style="color:var(--bad)">●</span>'
+                : '<span style="color:var(--ok)">●</span>');
+  $("#rIrFront").innerHTML = irDot(sn.ir_left) + irDot(sn.ir_mid) + irDot(sn.ir_right);
+  $("#rIrSide").innerHTML  = irDot(sn.ir_side_left) + irDot(sn.ir_side_right);
+  // الجانبيان العموديان من بثّ المصفوفة — «قديم» يُعرض مجهولاً لا كأنه حيّ
+  const suCh = ((st.side_us || {}).array || {}).channels || {};
+  const suD = c => (c && c.perpendicular_cm != null && !c.stale)
+    ? c.perpendicular_cm + " سم" : "—";
+  $("#rSideUs").textContent = suD(suCh.right) + " · " + suD(suCh.left);
+  // مزامنة مفتاح المحركات من البثّ (بلا دهس تفاعل المستخدم الجاري)
+  const dm = $("#driveMotors");
+  if (document.activeElement !== dm && dm.checked !== !!st.drive_motors)
+    dm.checked = !!st.drive_motors;
+  if (st.state === "running" && !st.drive_motors)
+    showMsg("#driveMsg", "⚠ المسح الجاري منطقي — الخريطة تتقدّم والروبوت ساكن. أوقفه وفعّل المفتاح ثم ابدأ من جديد.", "err");
+  else if (!st.drive_motors && st.state === "idle")
+    showMsg("#driveMsg", "المفتاح مطفأ ⇒ «ابدأ» ينفّذ مسحاً منطقياً بلا حركة.", "muted");
+  else $("#driveMsg").innerHTML = "";
   const ro = st.robot || {};
   $("#rPos").textContent = ro.x != null ? ro.x.toFixed(2)+" , "+ro.y.toFixed(2)+" م" : "—";
   $("#rHead").textContent = ro.heading != null ? Math.round(ro.heading)+"°" : "—";
