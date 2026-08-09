@@ -71,6 +71,9 @@ def main() -> int:
     ap.add_argument("--wheels", action="store_true",
                     help="🔍 فحص العجلات الموجّه: نبضة ثم سؤال بسيط (f/b/n/w) — "
                          "الروبوت مرفوع والعجلات حرة")
+    ap.add_argument("--map", action="store_true",
+                    help="🧭 حسم الخريطة بمعلم فيزيائي (أنبوب الجيجر) — "
+                         "حقل واحد لكل نبضة، بلا كلمتي يمين/يسار")
     ap.add_argument("--power", type=float, default=0.3)
     a = ap.parse_args()
 
@@ -122,6 +125,84 @@ def main() -> int:
                 print("     • GND غير مشترك بين الراسبري والروفر")
                 print("     • ⚠ هل فُلِش فيرموير شاشة المتحكم على ESP32 الروفر؟")
             return 1
+
+        # ── 3د) 🧭 حسم الخريطة بمعلم فيزيائي — لا «يمين/يسار» إطلاقاً ──
+        # شهادات الجهة انقلبت مرتين في هذه القصة (النظر من الأمام يعكسها).
+        # المعلم الذي لا يلتبس: أنبوب الجيجر مثبّت على **يسار** الروبوت
+        # (قاسه المشغّل بالشريط 2026-08-09) — والسؤال يصير «جهة الأنبوب أم
+        # المقابلة؟» فلا مجال للمرآة. حقل واحد لكل نبضة يعزل كل قناة.
+        if a.map:
+            p = min(abs(a.power), MAX_MOTOR_POWER)
+
+            def pulse2(lp, rp, sec=2.0):
+                t0 = time.time()
+                while time.time() - t0 < sec:
+                    ser.write(json.dumps({"T": 1, "L": round(lp, 3),
+                                          "R": round(rp, 3)}).encode() + b"\n")
+                    time.sleep(0.1)
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+
+            def ask2(q, opts):
+                while True:
+                    print(q)
+                    try:
+                        v = input(f"[{'/'.join(opts)}] ").strip().lower()
+                    except Exception:          # noqa: BLE001
+                        print("  ⚠ أعد الكتابة — الحرف وحده ثم Enter")
+                        continue
+                    if v in opts:
+                        return v
+                    print(f"  حرف من: {' · '.join(opts)}")
+
+            print(f"\n🧭 حسم الخريطة — قوة {p}. ⚠ الروبوت **مرفوع** والعجلات "
+                  f"حرة.\n  المعلم: **أنبوب الجيجر** (على أحد جانبي الروبوت) "
+                  f"— لا نستعمل يمين/يسار أبداً.")
+            results = {}
+            for fname, lp, rp in (("L", p, 0.0), ("R", 0.0, p)):
+                input(f"\n  ▶ نبضة الحقل {fname} وحده — Enter…")
+                pulse2(lp, rp)
+                side = ask2("  أي جهة دارت عجلاتها؟ g = جهة أنبوب الجيجر · "
+                            "o = الجهة المقابلة · n = لا شيء دار",
+                            ("g", "o", "n"))
+                dirn = "n"
+                if side != "n":
+                    dirn = ask2("  ودارت نحو: f = مقدمة الروبوت (جهة الكاميرا) "
+                                "· b = مؤخرته", ("f", "b"))
+                results[fname] = (side, dirn)
+            ar_side = {"g": "جهة الجيجر (يسار الروبوت)",
+                       "o": "الجهة المقابلة (يمين الروبوت)", "n": "لا دوران"}
+            ar_dir = {"f": "أمام", "b": "خلف", "n": "—"}
+            print("\n  ── الخريطة المرصودة (الجيجر = يسار الروبوت) ──")
+            for fname in ("L", "R"):
+                s, d = results[fname]
+                print(f"    الحقل {fname}=+p ⇒ {ar_side[s]} · {ar_dir[d]}")
+            # الاشتقاق: side_g = يسار حقيقي. wheel(field)=±
+            print("\n  ── الاشتقاق ──")
+            ls, ld = results["L"]
+            rs, rd = results["R"]
+            if "n" in (ls, rs):
+                print("  🔴 حقل بلا استجابة — جانب ميت/قناة غير مقودة. أرسل الخرج.")
+            elif ls == rs:
+                print("  🔴 الحقلان يحرّكان نفس الجهة — قناتا الفيرموير على "
+                      "جانب واحد. أرسل الخرج.")
+            else:
+                # أي حقل يقود جهة الجيجر (يسار الروبوت)؟ وبأي قطبية؟
+                left_field = "L" if ls == "g" else "R"
+                left_dir = ld if ls == "g" else rd
+                right_dir = rd if ls == "g" else ld
+                swap_needed = (left_field == "R")
+                inv_needed = (left_dir == "b")   # ‎+p يجب أن يقدّم العجلة
+                same_pol = (left_dir == right_dir)
+                if not same_pol:
+                    print("  🔴 قطبية الجانبين مختلفة — انعكاس محرك جانب واحد "
+                          "(أسلاك) لا يصلحه ثابت. أرسل الخرج.")
+                else:
+                    print(f"  ✅ الوصفة النهائية في config:")
+                    print(f"     MOTOR_SWAP_LR = {swap_needed}")
+                    print(f"     MOTOR_INVERT  = {-1 if inv_needed else +1}")
+                    print("  طبّقها ثم تحقق بـcheck_directions (من خلف الروبوت).")
+            return 0
 
         # ── 3ج) 🔍 فحص العجلات الموجّه — سؤال واحد بسيط في كل مرة ────
         # الروبوت مرفوع والعجلات حرة: مراقبة عجلة عن قرب لا تلتبس، والسكربت
