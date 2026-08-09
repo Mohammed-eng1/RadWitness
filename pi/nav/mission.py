@@ -47,7 +47,8 @@ from pi.ai.approach_document import (
     run_documentation, approach_blockers, GradientApproach, source_bearing_deg,
     MOVE, STOP, WITHDRAW,
 )
-from pi.ai.dynamic_range import dead_time_correct, recheck_needed
+from pi.ai.dynamic_range import (dead_time_correct, recheck_needed,
+                                approach_stop_cpm as dr_stop_cpm)
 from pi.nav.scanner import boustrophedon_order, Welford, ANOMALY_NEIGHBOR_PRIORITY
 from pi.nav.planner import find_path
 from pi.nav.deadreckoning import DeadReckoning
@@ -297,11 +298,29 @@ class MissionSim:
             return {"ok": True, "training_source": None}
         self.training_source = {"x": float(x), "y": float(y),
                                 "usvh_1m": float(usvh_1m)}
+        # ⚠ معاينة الشدة **قبل** التشغيل (مقاس 2026-08-09): 50 µSv/h@1م في
+        #   غرفة 2×1م أعطى 2,088 µSv/h عند أقرب خلية ⇒ «تشبّع شامل» ⇒ انسحاب
+        #   بدل اقتراب — سلوك سلامة صحيح لكنه **يلغي بروفة الاقتراب
+        #   والتصوير**. المشغّل يجب أن يعرف ذلك قبل دقيقتي المسح لا بعدهما.
+        stop_usvh = dr_stop_cpm()["stop_cpm"] / CPM_PER_USVH
+        near = float(usvh_1m) / (SOURCE_R_MIN_M ** 2)      # أقرب خلية ممكنة
+        rec = round(stop_usvh * (SOURCE_R_MIN_M ** 2) * 0.5, 1)
+        hint = (f"عند أقرب خلية ({SOURCE_R_MIN_M}م) ≈ {near:,.0f} µSv/h "
+                f"مقابل عتبة التوقف {stop_usvh:,.0f}")
+        will_evac = near > stop_usvh
+        if will_evac:
+            hint += (f" ⇒ 🔴 **تشبّع شامل**: النظام سينسحب ولن يقترب أو يصوّر "
+                     f"(سلوك سلامة صحيح). لبروفة الدورة الكاملة استعمل شدة "
+                     f"≤ {rec:g} µSv/h@1م في غرفة بهذا الحجم.")
+        else:
+            hint += " ⇒ ✅ ضمن المدى الآمن — الاقتراب والتصوير سيُنفَّذان."
         self._log("training_source",
                   f"🎯 مصدر تدريبي افتراضي عند ({float(x):.2f}, {float(y):.2f}) "
                   f"بشدة {float(usvh_1m):g} µSv/h@1م — القيادة حقيقية "
-                  f"والعدّ مصنّع (بروفة)")
-        return {"ok": True, "training_source": dict(self.training_source)}
+                  f"والعدّ مصنّع (بروفة). {hint}")
+        return {"ok": True, "training_source": dict(self.training_source),
+                "hint": hint, "will_evacuate": will_evac,
+                "recommended_max_usvh_1m": rec}
 
     def set_source(self, x, y):
         """أداة خارجية (محاكاة) — يضع مصدراً وهمياً في SimWorld للتجريب اليدوي."""

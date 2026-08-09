@@ -541,7 +541,12 @@ $("#tsSet").onclick = async () => {
   const r = await api("/api/mission/training_source",
     {x: parseFloat($("#tsX").value), y: parseFloat($("#tsY").value),
      usvh_1m: parseFloat($("#tsS").value)});
-  if (r && r.ok) addEvent("sys", "🎯 مصدر تدريبي مفعّل — العدّ مُصنّع والقيادة حقيقية", Date.now()/1000);
+  if (r && r.ok){
+    addEvent("sys", "🎯 مصدر تدريبي مفعّل — العدّ مُصنّع والقيادة حقيقية", Date.now()/1000);
+    // معاينة الشدة قبل دقيقتي المسح: هل ستُشبع الغرفة فيُلغى الاقتراب؟
+    if (r.hint) showMsg("#tsBanner", (r.will_evacuate ? "🔴 " : "✅ ") + r.hint,
+                        r.will_evacuate ? "err" : "muted");
+  }
 };
 $("#tsClear").onclick = async () => {
   await api("/api/mission/training_source", {clear: true});
