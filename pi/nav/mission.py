@@ -24,7 +24,7 @@ from pathlib import Path
 from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
-    TURN_RELIABILITY_MIN_V, BATT_GOOD_V,
+    TURN_RELIABILITY_MIN_V, BATT_GOOD_V, BATT_LOG_MIN_GAP_S,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -170,6 +170,7 @@ class MissionSim:
         self.last_reading = {"cpm": 0.0, "usvh": 0.0, "risk": "Safe", "color": "#22c55e"}
         self._returning = False
         self._batt_level = None
+        self._batt_log_ts = 0.0        # تقييد فيضان سجل البطارية (§ config)
         self._batt_source = None       # مصدر الحماية الفاعل (يُسجَّل عند تغيّره)
         self._shutdown_streak = 0      # قراءات متتالية دون حدّ الإطفاء
         self._rth_triggered = False
@@ -566,9 +567,18 @@ class MissionSim:
                 self._rth_triggered = True
                 self._log("battery", f"⚠ جهد منخفض {info['v']}V — عودة إجبارية")
                 self.return_home()
-        elif info["level"] == "good" and self._batt_level != "good":
-            self._log("battery",
-                      f"تنبيه: جهد {info['v']}V ({info.get('cell_v')}V/خلية) — جيد")
+        elif info["level"] != self._batt_level:
+            # ⚠ نحن هنا في فرع **لا إجراء** (الإيقاف/العودة/الإطفاء عولجت
+            #   أعلاه وتُسجَّل فوراً دائماً) — فالتقييد آمن: الجهد يتأرجح حول
+            #   حدّ التصنيف 11.50V فينقلب المستوى عشرات المرات في الدقيقة،
+            #   وكل انقلاب كان يكتب سطراً حتى دُفنت أحداث المهمة (مقاس
+            #   2026-08-09: ~40 سطر بطارية بين حدثين ملاحيين).
+            now = time.time()
+            if now - self._batt_log_ts >= BATT_LOG_MIN_GAP_S:
+                self._batt_log_ts = now
+                self._log("battery",
+                          f"جهد {info['v']}V ({info.get('cell_v')}V/خلية) — "
+                          f"{info.get('text', info['level'])}")
         self._batt_level = info["level"]
         return info
 
