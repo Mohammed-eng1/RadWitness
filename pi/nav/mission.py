@@ -24,6 +24,7 @@ from pathlib import Path
 from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
+    TURN_RELIABILITY_MIN_V,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -1820,6 +1821,17 @@ class MissionSim:
         missing_ir = [n for n, p in IR_PRESENT.items() if not p]
         if missing_ir:
             warnings.append("حسّاسات IR معلَنة غائبة: " + "، ".join(missing_ir))
+
+        # ⑦ ⚠ موثوقية اللفّ تحت الحمل (مقاس 2026-08-09): عند ~32% انعكست
+        #    لفّة فعلياً من اختلال الجانبين — وعاد التناظر بعد الشحن.
+        if BATTERY_MONITOR_ENABLED:
+            v_now = self.rover.voltage()
+            if v_now is not None and v_now < TURN_RELIABILITY_MIN_V:
+                warnings.append(
+                    f"⚠ البطارية {v_now:.2f}V دون حدّ موثوقية اللفّ "
+                    f"({TURN_RELIABILITY_MIN_V}V) — اختلال الجانبين تحت الحمل "
+                    f"قد يُفسد اللفّات (قيس: لفّة انعكست عند 32%). اشحن قبل "
+                    f"مهمة فيها لفّات كثيرة.")
         return {"ready": not blockers, "blockers": blockers,
                 "warnings": warnings,
                 "heading_ok": bool(src and getattr(src, "ok", False)),
