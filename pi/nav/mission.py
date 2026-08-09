@@ -24,7 +24,7 @@ from pathlib import Path
 from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
-    TURN_RELIABILITY_MIN_V,
+    TURN_RELIABILITY_MIN_V, BATT_GOOD_V,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -1826,7 +1826,15 @@ class MissionSim:
         #    لفّة فعلياً من اختلال الجانبين — وعاد التناظر بعد الشحن.
         if BATTERY_MONITOR_ENABLED:
             v_now = self.rover.voltage()
-            if v_now is not None and v_now < TURN_RELIABILITY_MIN_V:
+            if v_now is not None and v_now < BATT_GOOD_V:
+                # 🔴 حاجب لا تحذير (مقاس 2026-08-09): مشغّل بدأ عند 10.57V —
+                #    داخل نطاق «العودة الإجبارية» (10.2–10.8) — فبدأت المهمة
+                #    لتعود فوراً بعد خلية واحدة. البدء في هذا النطاق عبث
+                #    بالتعريف، والحاجب أصدق من دورة بدء-وعودة محيّرة.
+                blockers.append(
+                    f"البطارية {v_now:.2f}V داخل نطاق العودة الإجبارية "
+                    f"(<{BATT_GOOD_V}V) — المهمة ستبدأ لتعود فوراً. اشحن أولاً.")
+            elif v_now is not None and v_now < TURN_RELIABILITY_MIN_V:
                 warnings.append(
                     f"⚠ البطارية {v_now:.2f}V دون حدّ موثوقية اللفّ "
                     f"({TURN_RELIABILITY_MIN_V}V) — اختلال الجانبين تحت الحمل "
