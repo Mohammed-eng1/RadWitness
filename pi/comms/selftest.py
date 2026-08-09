@@ -658,7 +658,7 @@ def main() -> None:
               f"أول بايت غير ASCII عند الإزاحة {_bad[0]}" if _bad else
               f"{len(_raw)} بايت كلها ASCII")
 
-    for _sketch in ("controller_display", "lora_probe"):
+    for _sketch in ("controller_display", "lora_probe", "touch_probe"):
         _ino = _arduino_compile(_fw_base / _sketch)
         if _ino is None:
             print(f"  ⏭  ترجمة {_sketch} تُخطّى: لا arduino-cli أو لا نواة esp32")
