@@ -31,23 +31,37 @@
  * fine in Python and Markdown -- never here. An automated ASCII guard
  * in pi/comms/selftest.py enforces this.
  *
- * Libraries: TFT_eSPI + XPT2046_Touchscreen (no WiFi, no JSON -- the
- * channel is narrow).
+ * Libraries: TFT_eSPI (+ XPT2046_Touchscreen on DISPLAY_MODEL 2 only -- see
+ * the touch note below; no WiFi, no JSON -- the channel is narrow).
  * Build: board "ESP32 Dev Module" + the TFT_eSPI setup file from
  *        legacy/RadiationRover/firmware/controller_display/tft_setup/
  */
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 
 #include "config.h"
 #include "protocol.h"
 #include "lineio.h"   // pump() lives in a header ON PURPOSE -- see its note
 
 TFT_eSPI tft = TFT_eSPI();
-SPIClass touchSpi(VSPI);
-XPT2046_Touchscreen ts(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 HardwareSerial loraSerial(2);
+
+// === Touch input: the path DIFFERS BY BOARD MODEL ==============
+// Model 1 (3248S035R, 3.5"): the XPT2046 shares the DISPLAY SPI bus and is
+//   read through TFT_eSPI (tft.getTouch), with TOUCH_CS set in the TFT_eSPI
+//   Setup file. Calibration is stored in NVS.
+// Model 2 (2432S028, 2.8"): raw XPT2046 on its own SPI bus.
+// Measured on hardware 2026-08-09: driving model 1 down the model-2 path
+// reads a floating MISO -- z=4095, y=8191, touched() true on every sample,
+// IRQ still working -- and every button is dead. Same symptom as a broken
+// panel, entirely different cause.
+#if DISPLAY_MODEL == 1
+  #include <Preferences.h>
+#else
+  #include <XPT2046_Touchscreen.h>
+  SPIClass touchSpi(VSPI);
+  XPT2046_Touchscreen ts(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
+#endif
 
 // === Displayed state ==========================================
 long     dCpm      = 0;
@@ -232,36 +246,52 @@ int btnAt(int x, int y) {
   return -1;
 }
 
-void handleTouch() {
-  bool touched = ts.touched();
-  if (touched) {
-    TS_Point p = ts.getPoint();
-    if (p.z < TOUCH_PRESSURE_TH) { touched = false; }
-    else {
-      int x = map(p.x, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.width());
-      int y = map(p.y, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.height());
+// Returns true and fills SCREEN coordinates when the panel is pressed.
+#if DISPLAY_MODEL == 1
+static bool readTouch(int &x, int &y) {
+  uint16_t tx = 0, ty = 0;
+  // getTouch applies the stored calibration, so this is already in screen
+  // space -- no raw mapping, no swap/invert (those are model-2 knobs).
+  if (!tft.getTouch(&tx, &ty, TOUCH_PRESSURE_TH)) return false;
+  x = (int)tx; y = (int)ty;
+  return true;
+}
+#else
+static bool readTouch(int &x, int &y) {
+  if (!ts.touched()) return false;
+  TS_Point p = ts.getPoint();
+  if (p.z < TOUCH_PRESSURE_TH) return false;
+  x = map(p.x, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.width());
+  y = map(p.y, TOUCH_RAW_MIN, TOUCH_RAW_MAX, 0, tft.height());
 #if TOUCH_SWAP_XY
-      int t = x; x = y; y = t;
+  int t = x; x = y; y = t;
 #endif
 #if TOUCH_INVERT_X
-      x = tft.width() - x;
+  x = tft.width() - x;
 #endif
 #if TOUCH_INVERT_Y
-      y = tft.height() - y;
+  y = tft.height() - y;
 #endif
-      int i = btnAt(x, y);
-      if (i >= 0 && i != heldBtn) {
-        heldBtn = i;
+  return true;
+}
+#endif
+
+void handleTouch() {
+  int x = 0, y = 0;
+  bool touched = readTouch(x, y);
+  if (touched) {
+    int i = btnAt(x, y);
+    if (i >= 0 && i != heldBtn) {
+      heldBtn = i;
+      sendCommand(btns[i].cmd, 0.30f);
+      lastRepeatMs = millis();
+      uiDirty = true;
+    } else if (i >= 0) {
+      // Press-and-hold keeps moving: refresh the command before the
+      // radio command timeout (2s on the Pi) can cut it off.
+      if (millis() - lastRepeatMs >= DRIVE_REPEAT_MS) {
         sendCommand(btns[i].cmd, 0.30f);
         lastRepeatMs = millis();
-        uiDirty = true;
-      } else if (i >= 0) {
-        // Press-and-hold keeps moving: refresh the command before the
-        // radio command timeout (2s on the Pi) can cut it off.
-        if (millis() - lastRepeatMs >= DRIVE_REPEAT_MS) {
-          sendCommand(btns[i].cmd, 0.30f);
-          lastRepeatMs = millis();
-        }
       }
     }
   }
@@ -289,9 +319,36 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(COL_BG);
 
+#if DISPLAY_MODEL == 1
+  // Calibration persists in NVS; the first run (or TOUCH_FORCE_CALIBRATE=1)
+  // asks for the four corners. Mirrors the proven legacy firmware.
+  {
+    uint16_t calData[5];
+    Preferences prefs;
+    prefs.begin("disp", false);
+    bool haveCal = (prefs.getBytesLength("touchcal") == sizeof(calData));
+  #if TOUCH_FORCE_CALIBRATE
+    haveCal = false;
+  #endif
+    if (haveCal) {
+      prefs.getBytes("touchcal", calData, sizeof(calData));
+      tft.setTouch(calData);
+    } else {
+      tft.fillScreen(COL_BG);
+      tft.setTextColor(COL_FG, COL_BG);
+      tft.setTextSize(2);
+      tft.setCursor(10, 10); tft.println("Touch each corner");
+      tft.setCursor(10, 40); tft.println("marker in turn");
+      tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 20);
+      prefs.putBytes("touchcal", calData, sizeof(calData));
+    }
+    prefs.end();
+  }
+#else
   touchSpi.begin(TOUCH_CLK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
   ts.begin(touchSpi);
   ts.setRotation(0);
+#endif
 
   layout();
   redraw();

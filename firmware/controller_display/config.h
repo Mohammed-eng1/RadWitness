@@ -35,18 +35,33 @@
 // corrupt frames and is the most common cause of "the radio is dead".
 #define LORA_BAUD       9600
 
-// XPT2046 touch -- its own SPI bus (shared across CYD family models)
-#define TOUCH_CLK_PIN  25
-#define TOUCH_MOSI_PIN 32
-#define TOUCH_MISO_PIN 39
-#define TOUCH_CS_PIN   33
-#define TOUCH_IRQ_PIN  36
-#define TOUCH_RAW_MIN  200
-#define TOUCH_RAW_MAX  3700
-#define TOUCH_PRESSURE_TH 40   // above = real touch (idle noise ~10-17)
-#define TOUCH_SWAP_XY  0
-#define TOUCH_INVERT_X 0
+// === Touch -- THE PATH DIFFERS BY MODEL, this is not a shared pinout =====
+// Model 1 (3248S035R, 3.5"): the XPT2046 sits on the DISPLAY SPI bus
+//   (sck 14, miso 12, mosi 13) with CS 33, and is read through TFT_eSPI's
+//   own tft.getTouch(). TOUCH_CS is declared in the TFT_eSPI Setup file, and
+//   calibration is stored in NVS. The four pins below are NOT used here.
+// Model 2 (2432S028, 2.8"): raw XPT2046 on its own SPI bus -- the pins below.
+//
+// Getting this wrong is a silent, misleading failure: driving model 1 down
+// the model-2 path talks to pins nothing is attached to, so MISO floats and
+// reads all ones -- z=4095, y=8191, x=-4096, touched() true on every single
+// sample, while the IRQ line still pulses correctly on every press. Buttons
+// simply never respond, looking exactly like a dead panel. Measured on
+// hardware 2026-08-09 with firmware/touch_probe.
+#define TOUCH_CLK_PIN  25      // model 2 only
+#define TOUCH_MOSI_PIN 32      // model 2 only
+#define TOUCH_MISO_PIN 39      // model 2 only
+#define TOUCH_CS_PIN   33      // model 2 only (model 1 sets TOUCH_CS in Setup)
+#define TOUCH_IRQ_PIN  36      // model 2 only (the one pin common to both)
+#define TOUCH_RAW_MIN  200     // model 2 only -- model 1 uses NVS calibration
+#define TOUCH_RAW_MAX  3700    // model 2 only
+#define TOUCH_PRESSURE_TH 40   // both: above = real touch (idle noise ~10-17)
+#define TOUCH_SWAP_XY  0       // model 2 only -- model 1 orientation comes
+#define TOUCH_INVERT_X 0       //   from the calibration itself
 #define TOUCH_INVERT_Y 0
+// Model 1: set to 1 for ONE boot to redo the four-corner calibration
+// (it is stored in NVS and reloaded automatically), then set it back to 0.
+#define TOUCH_FORCE_CALIBRATE 0
 
 // === Protocol (must match pi/comms/protocol.py) ===============
 #define MAX_PAYLOAD     56     // = LORA_MAX_PAYLOAD

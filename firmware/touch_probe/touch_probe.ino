@@ -71,7 +71,7 @@ XPT2046_Touchscreen ts(TOUCH_CS_PIN);
 
 uint16_t minX = 0xFFFF, maxX = 0, minY = 0xFFFF, maxY = 0;
 uint16_t maxZ = 0;
-uint32_t samples = 0, touches = 0, irqLows = 0;
+uint32_t samples = 0, touches = 0, irqLows = 0, rails = 0;
 uint32_t lastSummaryMs = 0;
 uint16_t lastZ = 0xFFFF;
 
@@ -102,6 +102,13 @@ void loop() {
   samples++;
   if (lib) touches++;
   if (irq == LOW) irqLows++;
+  // Rail signature: the XPT2046 is 12-bit, so anything above 4095 -- or a
+  // negative x, or z pinned at exactly 4095 -- is not a measurement at all.
+  // It is a floating MISO read as all ones, i.e. the chip is not answering
+  // on this SPI bus. Counted separately so the summary can say so plainly
+  // instead of "calibrating" garbage. (Measured on hardware 2026-08-09.)
+  bool rail = (p.z >= 4095) || (p.y > 4095) || (p.x > 4095) || (p.x < 0);
+  if (rail) rails++;
 
   if (p.z > 0) {
     if (p.x < minX) minX = p.x;
@@ -128,10 +135,25 @@ void loop() {
     Serial.printf("  samples=%lu  touched()=%lu  IRQ_low=%lu\n",
                   (unsigned long)samples, (unsigned long)touches,
                   (unsigned long)irqLows);
+    if (rails > samples / 2) {
+      Serial.println("  *** SPI NOT RESPONDING -- these are not measurements. ***");
+      Serial.println("  Values are stuck at the digital rails (z=4095, y=8191,");
+      Serial.println("  x negative): MISO is floating and reads all ones, so the");
+      Serial.println("  XPT2046 is not on the bus these pins describe.");
+      if (irqLows > 0)
+        Serial.println("  BUT the IRQ line pulses on your presses -> the panel and");
+      else
+        Serial.println("  The IRQ line never pulsed either -> also check the panel and");
+      Serial.println("  the chip are ALIVE; only the data path is wrong.");
+      Serial.println("  On the 3.5\" board (3248S035R) the touch chip shares the");
+      Serial.println("  DISPLAY SPI bus (sck 14, miso 12, mosi 13, cs 33) and must be");
+      Serial.println("  read via TFT_eSPI tft.getTouch() -- pins 25/32/39 are the");
+      Serial.println("  2.8\" board only. Ignore any calibration numbers below.");
+    }
     if (maxZ == 0) {
       Serial.println("  z never rose above 0 -> chip not responding.");
       Serial.println("  Check touch wiring / pins (clk,miso,mosi,cs), then the panel.");
-    } else {
+    } else if (rails <= samples / 2) {
       Serial.printf("  peak z=%d   x range=%d..%d   y range=%d..%d\n",
                     maxZ, minX, maxX, minY, maxY);
       if (maxZ < CFG_PRESSURE_TH)
