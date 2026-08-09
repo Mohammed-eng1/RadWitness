@@ -373,6 +373,24 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <input type="checkbox" id="driveMotors" style="width:17px;height:17px;accent-color:var(--acc)">
       </label>
       <div id="driveMsg"></div>
+      <!-- 🎯 مصدر تدريبي: قيادة حقيقية + عدّ جيجر مصنّع — بروفة الاختبار -->
+      <details style="margin:7px 0">
+        <summary class="muted" style="cursor:pointer">🎯 مصدر تدريبي افتراضي (بروفة)</summary>
+        <div class="formgrid" style="margin-top:7px">
+          <label>x (م)<input type="number" id="tsX" value="1.5" step="0.1" min="0"></label>
+          <label>y (م)<input type="number" id="tsY" value="1.5" step="0.1" min="0"></label>
+          <label>µSv/h@1م<input type="number" id="tsS" value="50" step="1" min="1"></label>
+        </div>
+        <div class="btnrow" style="margin-top:7px">
+          <button id="tsSet">تفعيل</button>
+          <button id="tsClear">إزالة</button>
+        </div>
+        <div class="muted" style="font-size:12.5px;margin-top:5px">
+          الروبوت يقود ويناور فعلياً والعدّ وحده مُصنّع من التربيع العكسي —
+          السلامة (ألترا سونيك/IR) حقيقية. يزول بإعادة تشغيل السيرفر.
+        </div>
+      </details>
+      <div id="tsBanner"></div>
       <div class="btnrow">
         <button data-m="start" id="btnStart">▶ ابدأ</button>
         <button data-m="pause">⏸ إيقاف مؤقت</button>
@@ -516,6 +534,18 @@ $("#withdraw").onclick = async () => {
   // الرفض يُعرض بسببه (لا مهمة نشطة · بلا قيادة محركات) لا يُبتلع
   if (r && r.ok === false)
     addEvent("sys", "⚠ رُفض الانسحاب: " + (r.reason || "سبب مجهول"), Date.now()/1000);
+};
+
+/* ═══ المصدر التدريبي — بروفة بقيادة حقيقية وعدّ مصنّع ═══ */
+$("#tsSet").onclick = async () => {
+  const r = await api("/api/mission/training_source",
+    {x: parseFloat($("#tsX").value), y: parseFloat($("#tsY").value),
+     usvh_1m: parseFloat($("#tsS").value)});
+  if (r && r.ok) addEvent("sys", "🎯 مصدر تدريبي مفعّل — العدّ مُصنّع والقيادة حقيقية", Date.now()/1000);
+};
+$("#tsClear").onclick = async () => {
+  await api("/api/mission/training_source", {clear: true});
+  addEvent("sys", "أُزيل المصدر التدريبي — العدّ من الأنبوب الحقيقي", Date.now()/1000);
 };
 
 /* ═══ تجاوز الحساسات (يدوي فقط) — السيرفر يصفّره عند إغلاق اليدوية ═══ */
@@ -1347,7 +1377,16 @@ function apply(st){
   $("#rRisk").textContent = rd.risk || "—";
   $("#rRisk").style.color = rd.color || "var(--fg)";
   const sn = st.sensors || {};
-  $("#rFront").textContent = sn.ultrasonic_cm != null ? sn.ultrasonic_cm+" سم" : "مجهول";
+  // فوق عتبة الثقة (30سم): الخام يُعرض موسوماً — لا يُخفى ولا يُدّعى موثوقاً
+  $("#rFront").textContent = sn.ultrasonic_cm != null ? sn.ultrasonic_cm+" سم"
+    : (sn.ultrasonic_raw_cm != null ? sn.ultrasonic_raw_cm+" سم ⚠" : "مجهول");
+  $("#rFront").title = (sn.ultrasonic_cm == null && sn.ultrasonic_raw_cm != null)
+    ? "فوق مدى الثقة ("+(sn.front_trust_max_cm||30)+"سم) — لا يُعتمد للقرار" : "";
+  // 🎯 لافتة المصدر التدريبي — صاخبة عمداً: لا بروفة تمرّ كأنها قياس حقيقي
+  const ts = st.training_source;
+  if (ts) showMsg("#tsBanner", "🎯 مصدر تدريبي مفعّل عند ("+ts.x+", "+ts.y+") بشدة "
+    +ts.usvh_1m+" µSv/h@1م — قراءات الجيجر مُصنّعة (بروفة، ليست قياساً حقيقياً)", "err");
+  else $("#tsBanner").innerHTML = "";
   // IR الخمسة: 0 = عائق (المنطق المعكوس المثبت) · 1 = خالٍ · null = مجهول —
   // «المجهول» يُعرض رمادياً لا أخضر (الغائب ليس شهادة خلوّ — §6.1)
   const irDot = v => v == null ? '<span style="color:#8a93a6">○</span>'

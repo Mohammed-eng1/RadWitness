@@ -2125,6 +2125,40 @@ def main() -> int:
     finally:
         _mn.GEIGER_OFFSET_LEFT_M = _sv_off
 
+    # ── 🎯 المصدر التدريبي: عدّ مصنّع فوق مسار القياس الواحد ────────
+    # بروفة الاختبار (طلب المشغّل 2026-08-09): قيادة حقيقية وعدّ بواسون من
+    # التربيع العكسي — معلَن بحدث ووسم في كل بثّ، ولا يمرّ كقياس حقيقي.
+    ms_tr = MissionSim()
+    ms_tr.configure_room(3.0, 3.0, bg_cpm=18.0)
+    ms_tr.set_training_source(1.0, 1.0, usvh_1m=100.0)
+    m_tr = ms_tr._measure(1.0, 2.0, 3.0)      # على بعد 1م من المصدر
+    check("🎯 المصدر التدريبي يصنّع عدّات التربيع العكسي (وسم training)",
+          m_tr["window"] == "training" and 380 < m_tr["counts"] < 750,
+          f"{m_tr['counts']:.0f} عدّة (متوقّع ~556 عند 1م بشدة 100µSv/h)")
+    check("وتفعيله معلَن حدثاً ويُوسم في البثّ",
+          any(e["kind"] == "training_source" for e in ms_tr.events)
+          and ms_tr.state_dict()["training_source"] is not None)
+    ms_tr.set_training_source()
+    check("ومسحه يعيد العدّ للمسار الأصلي فوراً",
+          ms_tr.training_source is None
+          and ms_tr._measure(1.0, 2.0, 0.1)["window"] != "training")
+
+    # ── عتبة ثقة الأمامي (30سم — الأمامي وحده، الجانبان مثبتان) ─────
+    class FarUS:
+        ok = True
+        distance_cm = 200.0
+        quality = 90
+    ms_ft = MissionSim()
+    ms_ft.configure_room(2.0, 2.0)
+    ms_ft.set_proximity(FarUS(), None)
+    s_ft = ms_ft.sensors()
+    check("🔴 أمامي فوق عتبة الثقة ⇒ مجهول للقرار والخام موسوم للعرض",
+          s_ft["ultrasonic_cm"] is None and s_ft["ultrasonic_raw_cm"] == 200.0,
+          f"خام={s_ft['ultrasonic_raw_cm']} · قرار={s_ft['ultrasonic_cm']}")
+    FarUS.distance_cm = 25.0
+    check("ودون العتبة يُعتمد كما هو",
+          ms_ft.sensors()["ultrasonic_cm"] == 25.0)
+
     # ═══ (ع) حارس «المبنيّ غير المستدعى» — قاعدة CLAUDE.md §8 آلياً ═══
     # النمط تكرر ست مرات: وحدة مبنيّة ومختبَرة وحدةً ولا يستدعيها أحد في
     # مسار المهمة، واختبار الوحدة المعزول يمرّ وإن لم يستدعِها أحد. الحارس

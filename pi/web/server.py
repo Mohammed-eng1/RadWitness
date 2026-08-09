@@ -608,6 +608,20 @@ async def api_drive_mode(req: Request):
                                     allow_sim=bool(d.get("allow_sim", False)))
 
 
+@app.post("/api/mission/training_source")
+async def api_training_source(req: Request):
+    """
+    🎯 مصدر تدريبي افتراضي فوق قيادة حقيقية (بروفة الاختبار): العدّ وحده
+    يُصنَّع من التربيع العكسي، والقيادة والسلامة حقيقيتان. معلَن في السجل
+    وكل بثّ حالة، ويزول بإعادة تشغيل السيرفر. `{"clear": true}` يمسحه.
+    ⚠ مُسجَّل قبل مسار `/api/mission/{action}` العام عمداً — وإلا ابتلعه.
+    """
+    d = await req.json()
+    if d.get("clear"):
+        return mission.set_training_source()
+    return mission.set_training_source(d.get("x"), d.get("y"), d.get("usvh_1m"))
+
+
 @app.post("/api/sim/battery")
 async def api_sim_battery(req: Request):
     """

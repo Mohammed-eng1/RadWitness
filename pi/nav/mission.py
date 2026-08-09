@@ -16,12 +16,14 @@ from __future__ import annotations
 import csv
 import io
 import math
+import random
 import threading
 import time
 from pathlib import Path
 
 from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
+    FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -73,6 +75,20 @@ IDLE, RUNNING, PAUSED, DONE, RETURNING, ESTOP = (
 #    توقف → توثيق. كل انتقال بحكم **المنسّق** لا برغبة الملاحة.
 PHASE_SURVEY, PHASE_SCREEN, PHASE_CONFIRM = "survey", "screen", "confirm"
 PHASE_APPROACH, PHASE_STOP, PHASE_DOCUMENT = "approach", "stop", "document"
+
+
+def _poisson(mu: float) -> int:
+    """عيّنة بواسون (كنوث للصغيرة، تقريب طبيعي للكبيرة) — للمصدر التدريبي."""
+    if mu <= 0.0:
+        return 0
+    if mu > 50.0:
+        return max(0, int(round(random.gauss(mu, math.sqrt(mu)))))
+    limit, k, p = math.exp(-mu), 0, 1.0
+    while True:
+        p *= random.random()
+        if p <= limit:
+            return k
+        k += 1
 PHASE_WITHDRAW, PHASE_REPORT = "withdraw", "report"
 PHASE_PERIMETER = "perimeter"      # يسبق المسح: قياس نطاق الغرفة فعلياً
 PHASE_AR = {
@@ -196,6 +212,9 @@ class MissionSim:
         self.locator = None      # يُنشأ عند configure_room
         self.camera = None       # تُحقن من السيرفر (اختيارية)
         self.documentation = None  # نتيجة التوثيق البصري بعد المسح
+        # مصدر تدريبي افتراضي فوق قيادة حقيقية (بروفة الاختبار) — لا يعيش
+        # خارج الجلسة: يُنشأ ويُمسح بالواجهة ويزول بإعادة تشغيل السيرفر.
+        self.training_source = None
 
     def _stop_worker(self, reason: str = "") -> None:
         """
@@ -254,6 +273,34 @@ class MissionSim:
 
     def set_calibration(self, profile: CalibrationProfile):
         self.profile = profile
+
+    def set_training_source(self, x=None, y=None, usvh_1m=None) -> dict:
+        """
+        🎯 مصدر **تدريبي افتراضي فوق قيادة حقيقية** (طلب المشغّل 2026-08-09
+        لبروفات ما قبل الاختبار): الروبوت يقود ويناور فعلياً، وقراءات الجيجر
+        وحدها تُصنَّع بواسون من قانون التربيع العكسي حول موضع وشدة يختارهما
+        المشغّل — بروفة كاملة للمهمة الفيزيائية (مسح/عودة/اقتراب/تصوير)
+        بلا أي إشعاع.
+
+        - طبقة السلامة **غير ممسوسة**: ألترا سونيك وIR والبطارية حقيقية.
+        - التفعيل معلَن بصخب: حدث في السجل + وسم في كل بثّ حالة — لا بروفة
+          تُدسّ في تقرير كأنها قياس حقيقي.
+        - النداء بلا وسائط (أو بـNone) يمسحه.
+        """
+        if x is None or y is None or usvh_1m is None:
+            prev = self.training_source
+            self.training_source = None
+            if prev is not None:
+                self._log("training_source", "أُزيل المصدر التدريبي — "
+                                             "القراءات من العدّاد الحقيقي")
+            return {"ok": True, "training_source": None}
+        self.training_source = {"x": float(x), "y": float(y),
+                                "usvh_1m": float(usvh_1m)}
+        self._log("training_source",
+                  f"🎯 مصدر تدريبي افتراضي عند ({float(x):.2f}, {float(y):.2f}) "
+                  f"بشدة {float(usvh_1m):g} µSv/h@1م — القيادة حقيقية "
+                  f"والعدّ مصنّع (بروفة)")
+        return {"ok": True, "training_source": dict(self.training_source)}
 
     def set_source(self, x, y):
         """أداة خارجية (محاكاة) — يضع مصدراً وهمياً في SimWorld للتجريب اليدوي."""
@@ -651,8 +698,14 @@ class MissionSim:
         us_ok = bool(real_us is not None and real_us.ok) or arr_front
         ir_ok = bool(real_ir is not None and real_ir.ok)
         if us_ok or ir_ok:
-            us = (arr.distance_cm("front") if arr_front
-                  else (real_us.distance_cm if us_ok else None))
+            us_raw = (arr.distance_cm("front") if arr_front
+                      else (real_us.distance_cm if us_ok else None))
+            # 🔴 عتبة ثقة الأمامي (قرار المشغّل 2026-08-09): فوقها قراءاته
+            #    ثنائية النسق (190-330 وجدار على 56سم) — اعتمادها «سالكاً»
+            #    فرملة متأخرة. فوق العتبة ⇒ مجهول للقرارات، والخام يُعرض
+            #    موسوماً في الواجهة. الجانبيان غير مشمولين (دقتهما مثبتة).
+            us = (us_raw if (us_raw is None
+                             or us_raw <= FRONT_US_TRUST_MAX_CM) else None)
             vals = real_ir.read_all() if (ir_ok and hasattr(real_ir, "read_all")) \
                 else {"front_left": None, "front_right": None, "front_mid": None,
                       "side_left": None, "side_right": None}
@@ -666,7 +719,9 @@ class MissionSim:
                     "ir_side_right": vals["side_right"],
                     "cpm": (live_cpm if live_cpm is not None
                             else self.last_reading["cpm"]),
-                    "source": "real", "quality": q}
+                    "source": "real", "quality": q,
+                    "ultrasonic_raw_cm": us_raw,
+                    "front_trust_max_cm": FRONT_US_TRUST_MAX_CM}
         # 🔴 **لا سقوط إلى نموذج المحاكاة على عتاد حقيقي**: كان الفشل الكامل
         #    لقراءة الحساسات يُسقط المسار إلى `SimWorld` — أي **مسافات
         #    مُختلَقة تقود محركات حقيقية**. الآن نُعلن الجهل صراحةً.
@@ -1574,6 +1629,24 @@ class MissionSim:
         في الانتظار حين تكون القيمة محسوبة.
         """
         dur = max(0.0, float(duration_s))
+        # 🎯 المصدر التدريبي يسبق العدّاد الحقيقي — القيادة والانتظار حقيقيان
+        #    (الزمن جزء من البروفة على العتاد)، والعدّ وحده مصنّع بواسون من
+        #    التربيع العكسي. الوسم `training` يصل كل قراءة ولا يُخفى.
+        ts = self.training_source
+        if ts is not None:
+            if self.rover.mode == "real":
+                time.sleep(dur)
+            bg = (self.locator.background_cpm if self.locator
+                  else SOURCE_BG_CPM_DEFAULT)
+            d2 = max((x - ts["x"]) ** 2 + (y - ts["y"]) ** 2,
+                     SOURCE_R_MIN_M ** 2)
+            cpm_true = bg + ts["usvh_1m"] * CPM_PER_USVH / d2
+            counts = float(_poisson(cpm_true * dur / 60.0))
+            cpm_raw = counts * 60.0 / max(dur, 1e-6)
+            corr = dead_time_correct(cpm_raw)
+            return {"counts": counts, "duration_s": dur,
+                    "cpm": corr["cpm_true"], "usvh": corr["usvh"],
+                    "cpm_raw": cpm_raw, "window": "training"}
         g = getattr(self, "geiger", None)
         if g is not None and getattr(g, "ok", False):
             t0 = g.tally() if hasattr(g, "tally") else None
@@ -1723,7 +1796,9 @@ class MissionSim:
         elif not ir_live:
             warnings.append("⚠ بلا IR أمامي: الألترا سونيك يعمى عن الأسطح "
                             "المائلة والمواد الماصّة والأجسام المنخفضة")
-        if us_live and us is None:
+        if us_live and us is None and s.get("ultrasonic_raw_cm") is None:
+            # ⚠ الشرط على **الخام**: بعد عتبة ثقة الأمامي (30سم) تكون القيمة
+            #   المقصوصة None في الفضاء المفتوح دائماً — وليست عطل حسّاس.
             warnings.append("⚠ الألترا سونيك لا يُرجع قراءة الآن (جودة "
                             f"{s.get('quality')}%)")
 
@@ -2282,6 +2357,7 @@ class MissionSim:
                               if self.perimeter is not None else None),
             },
             "drive_motors": self.drive_motors,
+            "training_source": self.training_source,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),
                       "bias_calibrated": self.rover.bias_calibrated,
