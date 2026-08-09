@@ -115,6 +115,12 @@ class ManualControl:
         now = self._clock() if now is None else now
         cmd = str(cmd or "").strip().upper()
         self.last_source = source
+        # ⚠ يُسجَّل **قبل** أي بوابة: مسارات الرفض كانت تحدّث السبب وحده
+        # وتترك `last_cmd` قديماً، فتُقرأ الحالة معاً على غير حقيقتها —
+        # «آخر أمر: STOP» بجانب «رُفض FWD: القيادة اليدوية غير مفعّلة»
+        # (شوهد على العتاد 2026-08-09). ⚠ و`last_ts` وحدها تبقى للمقبول:
+        # هي ساعة heartbeat، ولو حدّثها الرفض لما انطلقت مهلة الأوامر أبداً.
+        self.last_cmd = cmd
 
         if cmd not in RADIO_COMMANDS:
             self.rejected_count += 1

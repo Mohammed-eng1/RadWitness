@@ -236,9 +236,12 @@ def main() -> None:
     clk = FakeClock()
     mc = ManualControl(m, clock=clk)
 
+    mc.command("STOP")                      # يُقبل دائماً — يضبط last_cmd
     r = mc.command("FWD", 0.3)
     check("أمر حركة قبل تفعيل النمط يُرفض (حصرية الأنماط)",
           not r["ok"] and r["ack"] == ACK_BUSY, r["reason"])
+    check("🔴 والمرفوض يُسجَّل في `last_cmd` (لا أمر قديم بجانب سبب جديد)",
+          mc.state()["last_cmd"] == "FWD", mc.state()["last_cmd"])
 
     mc.set_enabled(True)
     r = mc.command("FWD", 0.3)
