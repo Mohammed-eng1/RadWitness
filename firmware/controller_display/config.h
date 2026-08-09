@@ -67,6 +67,9 @@
 // layout is discarded and redone instead of silently mis-mapping every press.
 // BUMP THIS whenever setRotation() or the layout changes.
 #define TOUCH_CAL_TAG 0x43594431UL   // 'CYD1' -- rotation 0, 3x3 button grid
+// Model 1: print raw + converted touch values over USB while STANDALONE.
+// Leave at 1 while proving the panel; set to 0 once buttons respond.
+#define TOUCH_DEBUG 1
 
 // === Protocol (must match pi/comms/protocol.py) ===============
 #define MAX_PAYLOAD     56     // = LORA_MAX_PAYLOAD

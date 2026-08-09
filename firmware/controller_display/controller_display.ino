@@ -252,7 +252,28 @@ static bool readTouch(int &x, int &y) {
   uint16_t tx = 0, ty = 0;
   // getTouch applies the stored calibration, so this is already in screen
   // space -- no raw mapping, no swap/invert (those are model-2 knobs).
-  if (!tft.getTouch(&tx, &ty, TOUCH_PRESSURE_TH)) return false;
+  bool ok = tft.getTouch(&tx, &ty, TOUCH_PRESSURE_TH);
+#if TOUCH_DEBUG
+  // Prints what the panel and the calibration ACTUALLY produce. Needed
+  // because "buttons dead" has two very different causes that look
+  // identical: the panel not reading (rawz stays 0), or a calibration whose
+  // converted point lands outside the screen -- TFT_eSPI's getTouch rejects
+  // out-of-bounds points silently, so a bad calibration reads as "no touch".
+  // Silent in BRIDGE mode: those bytes belong to the browser's frame stream.
+  static uint32_t lastDbg = 0;
+  uint16_t rz = tft.getTouchRawZ();
+  if (rz > 0 && !bridgeMode && (millis() - lastDbg) > 150) {
+    lastDbg = millis();
+    uint16_t rx = 0, ry = 0;
+    tft.getTouchRaw(&rx, &ry);
+    Serial.printf("TOUCH rawz=%u rawx=%u rawy=%u | getTouch=%s sx=%u sy=%u"
+                  " | screen=%dx%d btn=%d\n",
+                  rz, rx, ry, ok ? "YES" : "NO", tx, ty,
+                  tft.width(), tft.height(),
+                  ok ? btnAt((int)tx, (int)ty) : -2);
+  }
+#endif
+  if (!ok) return false;
   x = (int)tx; y = (int)ty;
   return true;
 }
