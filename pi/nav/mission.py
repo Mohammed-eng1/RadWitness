@@ -304,15 +304,27 @@ class MissionSim:
         #   بدل اقتراب — سلوك سلامة صحيح لكنه **يلغي بروفة الاقتراب
         #   والتصوير**. المشغّل يجب أن يعرف ذلك قبل دقيقتي المسح لا بعدهما.
         stop_usvh = dr_stop_cpm()["stop_cpm"] / CPM_PER_USVH
-        near = float(usvh_1m) / (SOURCE_R_MIN_M ** 2)      # أقرب خلية ممكنة
-        rec = round(stop_usvh * (SOURCE_R_MIN_M ** 2) * 0.5, 1)
-        hint = (f"عند أقرب خلية ({SOURCE_R_MIN_M}م) ≈ {near:,.0f} µSv/h "
+        # 🔴 المسافة الحاكمة هي **أقرب مركز خلية فعلي** في شبكة هذه الغرفة لا
+        #    r_min النظرية (مقاس 2026-08-09: معاينة بـr_min قالت «آمن» عند
+        #    3 µSv/h، ثم مرّ المسح فوق خلية على 0.16م من المصدر فقرأ 139 —
+        #    فحُجب التوثيق بعد دقيقتين). الهندسة الحقيقية للمسح هي المرجع.
+        d_near = SOURCE_R_MIN_M
+        if self.grid is not None:
+            cs = [self.grid.cell_center(r, c)
+                  for r in range(self.grid.rows) for c in range(self.grid.cols)]
+            if cs:
+                d_near = max(min(math.hypot(cx - float(x), cy - float(y))
+                                 for cx, cy in cs), SOURCE_R_MIN_M)
+        near = float(usvh_1m) / (d_near ** 2)
+        rec = round(stop_usvh * (d_near ** 2) * 0.7, 1)
+        hint = (f"أقرب خلية مسح على {d_near:.2f}م ⇒ ≈ {near:,.0f} µSv/h "
                 f"مقابل عتبة التوقف {stop_usvh:,.0f}")
         will_evac = near > stop_usvh
         if will_evac:
-            hint += (f" ⇒ 🔴 **تشبّع شامل**: النظام سينسحب ولن يقترب أو يصوّر "
-                     f"(سلوك سلامة صحيح). لبروفة الدورة الكاملة استعمل شدة "
-                     f"≤ {rec:g} µSv/h@1م في غرفة بهذا الحجم.")
+            hint += (f" ⇒ 🔴 المسح سيمرّ فوق جرعة تفوق عتبة التوقف فيُحجب "
+                     f"الاقتراب والتصوير (سلوك سلامة صحيح). لبروفة الدورة "
+                     f"كاملةً: شدة ≤ **{rec:g}** µSv/h@1م، أو أبعد المصدر عن "
+                     f"مراكز الخلايا (منتصف المسافة بينها أبعد نقطة).")
         else:
             hint += " ⇒ ✅ ضمن المدى الآمن — الاقتراب والتصوير سيُنفَّذان."
         self._log("training_source",
