@@ -66,6 +66,8 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=ROVER_BAUD)
     ap.add_argument("--spin", action="store_true",
                     help="⚠ أمر دوران فعلي 1ث — يدير الروبوت بالمكان")
+    ap.add_argument("--truth-table", action="store_true",
+                    help="🔬 4 نبضات خام والدوران يُقاس بالجايرو — جدول حقيقة الفيرموير")
     ap.add_argument("--power", type=float, default=0.3)
     a = ap.parse_args()
 
@@ -117,6 +119,66 @@ def main() -> int:
                 print("     • GND غير مشترك بين الراسبري والروفر")
                 print("     • ⚠ هل فُلِش فيرموير شاشة المتحكم على ESP32 الروفر؟")
             return 1
+
+        # ── 3ب) 🔬 جدول حقيقة الفيرموير — القياس بالجايرو لا بالعين ──
+        # وُلد من مأزق مقاس (2026-08-09): أمر «يمين» أنتج يساراً في كلا وضعي
+        # التبديل رغم أن النمطين السلكيين متعاكسان — مستحيل على عتاد خطي
+        # سليم. الاحتمالان الباقيان: فيرموير غير خطي مع الإشارة السالبة، أو
+        # جانب محركات ميت/ضعيف (يكشفه النمط المتماثل). العين خارج الحلقة
+        # نهائياً: الجايرو المثبت يدوياً هو الحكم.
+        if a.truth_table:
+            try:
+                from pi.sensors.mpu6050 import get_mpu
+                from pi.config import MPU6050_GYRO_Z_SIGN as _ZS
+            except Exception as e:            # noqa: BLE001
+                sys.exit(f"⛔ يحتاج MPU: {e}")
+            mpu = get_mpu()
+            if not mpu.ok:
+                sys.exit(f"⛔ MPU غير متاح ({mpu.error}) — الجدول يقيس بالجايرو")
+            p = min(abs(a.power), MAX_MOTOR_POWER)
+            print(f"\n[3/3] 🔬 جدول الحقيقة: 4 أنماط خام × 1ث بقوة {p} — "
+                  f"أفرغ حول الروبوت (3ث)…")
+            time.sleep(3.0)
+            pats = [("L=+p R=-p", p, -p), ("L=-p R=+p", -p, p),
+                    ("L=+p R=+p", p, p), ("L=-p R=-p", -p, -p)]
+            res = []
+            for name, lp, rp in pats:
+                t0 = time.time()
+                bias, n = 0.0, 0
+                while time.time() - t0 < 1.0:      # انحياز سريع ساكناً
+                    z = mpu.gyro_z_dps()
+                    if z is not None:
+                        bias += z
+                        n += 1
+                    time.sleep(0.01)
+                bias /= max(n, 1)
+                yaw, last, t0 = 0.0, time.time(), time.time()
+                while time.time() - t0 < 1.0:
+                    ser.write(json.dumps(
+                        {"T": 1, "L": round(lp, 3),
+                         "R": round(rp, 3)}).encode() + b"\n")
+                    z = mpu.gyro_z_dps()
+                    now = time.time()
+                    if z is not None:
+                        yaw += (z - bias) * (now - last) * _ZS
+                    last = now
+                    time.sleep(0.02)
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+                d = "يمين" if yaw > 15 else ("يسار" if yaw < -15 else "≈بلا دوران")
+                res.append((name, yaw))
+                print(f"    {name}: {yaw:+7.1f}° ⇒ {d}")
+                time.sleep(1.5)                    # خمود بين الأنماط
+            y_pm, y_mp, y_pp, y_mm = (r[1] for r in res)
+            print("\n  ── قراءة الجدول ──")
+            if abs(y_pp) > 25 or abs(y_mm) > 25:
+                print("  🔴 أمر **متماثل** يُدير الروبوت ⇒ جانب كامل ضعيف/ميت "
+                      "(أسلاك أو درايفر جانب) — لا يصلحه أي ثابت في config.")
+            if y_pm * y_mp > 0 and (abs(y_pm) > 15 or abs(y_mp) > 15):
+                print("  🔴 النمطان المتعاكسان يدوران بنفس الجهة ⇒ فيرموير "
+                      "غير خطي مع الإشارة السالبة — أرسل الجدول كاملاً.")
+            print("  أرسل الأسطر الأربعة كما هي — الثوابت تُشتق منها مباشرة.")
+            return 0
 
         # ── 3) أمر حركة فعلي ─────────────────────────────────────
         if a.spin:
