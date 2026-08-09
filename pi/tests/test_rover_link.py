@@ -68,6 +68,9 @@ def main() -> int:
                     help="⚠ أمر دوران فعلي 1ث — يدير الروبوت بالمكان")
     ap.add_argument("--truth-table", action="store_true",
                     help="🔬 4 نبضات خام والدوران يُقاس بالجايرو — جدول حقيقة الفيرموير")
+    ap.add_argument("--wheels", action="store_true",
+                    help="🔍 فحص العجلات الموجّه: نبضة ثم سؤال بسيط (f/b/n/w) — "
+                         "الروبوت مرفوع والعجلات حرة")
     ap.add_argument("--power", type=float, default=0.3)
     a = ap.parse_args()
 
@@ -119,6 +122,83 @@ def main() -> int:
                 print("     • GND غير مشترك بين الراسبري والروفر")
                 print("     • ⚠ هل فُلِش فيرموير شاشة المتحكم على ESP32 الروفر؟")
             return 1
+
+        # ── 3ج) 🔍 فحص العجلات الموجّه — سؤال واحد بسيط في كل مرة ────
+        # الروبوت مرفوع والعجلات حرة: مراقبة عجلة عن قرب لا تلتبس، والسكربت
+        # يبني الجدول ويحكم بنفسه (المشغّل لم يفهم جدولاً يملؤه يدوياً — عدّل
+        # الأسلوب لا تلُم المشغّل، 2026-08-09).
+        if a.wheels:
+            p = min(abs(a.power), MAX_MOTOR_POWER)
+
+            def pulse(lp, rp, sec=2.0):
+                t0 = time.time()
+                while time.time() - t0 < sec:
+                    ser.write(json.dumps({"T": 1, "L": round(lp, 3),
+                                          "R": round(rp, 3)}).encode() + b"\n")
+                    time.sleep(0.1)
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+                ser.write(b'{"T":1,"L":0,"R":0}\n')
+
+            def ask(side_ar):
+                while True:
+                    print(f"  عجلتا {side_ar}: f = أمام · b = خلف · "
+                          f"n = ساكنة · w = ضعيفة/متقطعة")
+                    try:
+                        v = input("[f/b/n/w] ").strip().lower()
+                    except Exception:          # noqa: BLE001 — ترميز طرفية
+                        print("  ⚠ تعذّرت القراءة — اكتب الحرف وحده وEnter")
+                        continue
+                    if v in ("f", "b", "n", "w"):
+                        return v
+                    print("  حرف واحد فقط من الأربعة.")
+
+            print(f"\n🔍 فحص العجلات الموجّه — قوة {p}. ⚠ الروبوت **مرفوع** "
+                  f"والعجلات في الهواء.")
+            print("  ثماني نبضات (2ث لكل نبضة): في كل نبضة راقب الجانب الذي "
+                  "أطلبه **فقط** وأجب بحرف واحد.")
+            pats = [("1", p, -p), ("2", -p, p), ("3", p, p), ("4", -p, -p)]
+            obs = {}
+            for name, lp, rp in pats:
+                for side_ar, key in (("اليسار", "L"), ("اليمين", "R")):
+                    input(f"\n  ▶ راقب عجلتي **{side_ar}** الآن — Enter للنبضة…")
+                    pulse(lp, rp)
+                    obs[(name, key)] = ask(side_ar)
+            ar = {"f": "أمام", "b": "خلف", "n": "ساكنة", "w": "ضعيفة"}
+            print("\n  ── الجدول المرصود (النمط: يسار | يمين) ──")
+            for name, lp, rp in pats:
+                print(f"    نمط {name} (L={'+' if lp>0 else '-'}p R="
+                      f"{'+' if rp>0 else '-'}p): "
+                      f"{ar[obs[(name,'L')]]} | {ar[obs[(name,'R')]]}")
+            l_dead = all(obs[(n, "L")] in ("n", "w") for n, _, _ in pats)
+            r_dead = all(obs[(n, "R")] in ("n", "w") for n, _, _ in pats)
+            l_nosign = (obs[("1", "L")] == obs[("2", "L")]
+                        and obs[("1", "L")] in ("f", "b"))
+            r_nosign = (obs[("1", "R")] == obs[("2", "R")]
+                        and obs[("1", "R")] in ("f", "b"))
+            print("\n  ── الحكم ──")
+            verdicts = False
+            if l_dead:
+                verdicts = True
+                print("  🔴 عجلات **اليسار** ميتة/ضعيفة في كل الأنماط ⇒ "
+                      "موصلا محركي اليسار على اللوحة، أو درايفر اليسار، أو "
+                      "فيرموير لا يقود أطرافه. ابدأ بإعادة تثبيت الموصلين.")
+            if r_dead:
+                verdicts = True
+                print("  🔴 عجلات **اليمين** ميتة/ضعيفة في كل الأنماط ⇒ "
+                      "موصلا محركي اليمين، أو درايفر اليمين، أو الفيرموير. "
+                      "ابدأ بإعادة تثبيت الموصلين.")
+            if l_nosign:
+                verdicts = True
+                print("  🔴 اليسار يدور بنفس الاتجاه في النمطين المتعاكسين ⇒ "
+                      "يتجاهل إشارة أمره — فيرموير (بناء لوحة خاطئ) أو درايفر.")
+            if r_nosign:
+                verdicts = True
+                print("  🔴 اليمين يتجاهل إشارة أمره — فيرموير أو درايفر.")
+            if not verdicts:
+                print("  ✅ الجانبان يستجيبان ويعكسان الإشارة — أرسل الجدول "
+                      "لاشتقاق الثابتين نهائياً.")
+            print("  أرسل الخرج كاملاً كما هو.")
+            return 0
 
         # ── 3ب) 🔬 جدول حقيقة الفيرموير — القياس بالجايرو لا بالعين ──
         # وُلد من مأزق مقاس (2026-08-09): أمر «يمين» أنتج يساراً في كلا وضعي
