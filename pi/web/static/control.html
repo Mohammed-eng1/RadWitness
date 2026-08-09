@@ -694,15 +694,21 @@ $("#camres").onchange = () => { if (camOn) startCam(); };
    أياً كان مصدر الصفحة، وإن غاب نفرّق بين السببين. */
 let port = null, writer = null, txSeq = 0;
 function serialStatus(){
-  if ("serial" in navigator)
-    return {ok:true, msg:"Web Serial متاح — اضغط «وصل الشاشة» واختر منفذ CYD."};
+  // ⚠ تُفحص **القيمة** لا وجود المفتاح: `"serial" in navigator` يصدق ولو
+  //   كانت undefined، فيمرّ الكود إلى requestPort ويرمي استثناءً غامضاً
+  //   بدل رسالة مفيدة (ظهر في اختبار محاكاة السياق غير الآمن).
+  if (navigator.serial)
+    return {ok:true, why:"", msg:"✅ Web Serial متاح — اضغط «وصل الشاشة» واختر منفذ CYD."};
   if (!window.isSecureContext)
     return {ok:false, why:"insecure",
-      msg:"⛔ سياق غير آمن: الصفحة على HTTP (عبر Tailscale غالباً). Web Serial " +
-          "يتطلب HTTPS أو localhost. الحل: افتح الصفحة من localhost على " +
-          "الراسبري، أو أضف شهادة Tailscale — وعندها يعمل الراديو بلا تعديل كود."};
+      msg:"ℹ الصفحة على HTTP، وChrome يخفي Web Serial خارج HTTPS/localhost. " +
+          "<b>الزر يبقى متاحاً — جرّبه</b>؛ وإن فشل فالحل الدائم: افتح " +
+          "<code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>، " +
+          "أضف <code>" + esc(location.origin) + "</code> وفعّله ثم أعد تشغيل المتصفح. " +
+          "(أو افتح الصفحة من localhost على الراسبري، أو أضف شهادة Tailscale.)"};
   return {ok:false, why:"unsupported",
-    msg:"⛔ المتصفح لا يدعم Web Serial: مدعوم في Chrome وEdge فقط (لا Firefox ولا Safari)."};
+    msg:"ℹ هذا المتصفح لا يعرض Web Serial (مدعوم في Chrome وEdge فقط — لا Firefox " +
+        "ولا Safari). <b>الزر يبقى متاحاً</b>، لكن الوصل يحتاج Chrome أو Edge."};
 }
 function xorck(s){ let c = 0; for (const b of new TextEncoder().encode(s)) c ^= b; return c; }
 function frame(payload){
@@ -713,13 +719,27 @@ function cmdFrame(cmd, p1){        // يطابق pi/comms/protocol.py
   const n = v => (v === Math.trunc(v) ? String(Math.trunc(v)) : String(v));
   return frame("C," + txSeq + "," + cmd + "," + n(p1 || 0) + ",0");
 }
+// ⚠ رسالة الحالة تحمل وسوماً (كود/غامق) فلا تمرّ بـesc — والقيم المحقونة
+//   فيها (مثل location.origin) مهرَّبة عند بنائها.
+function showHtml(sel, html, cls){
+  $(sel).innerHTML = '<div class="' + cls + '">' + html + '</div>';
+}
 function initSerial(){
   const s = serialStatus();
-  showMsg("#serialMsg", s.msg, s.ok ? "info" : "err");
-  $("#serialBtn").disabled = !s.ok;
-  if (!s.ok) $("#serialBtn").title = "الشاشة غير قابلة للوصل: " + s.why;
+  // 🔴 **لا حجب**: الرسالة إرشاد لا حاجز. تعطيل الزر كان يمنع المحاولة حتى
+  //    على متصفح فعّل صاحبه علم المصدر الموثوق في Chrome — فتصير الواجهة
+  //    أعلمَ من المستخدم بحاله وهي ليست كذلك. يبقى التفريق بين السببين
+  //    (سياق غير آمن ≠ متصفح غير مدعوم) لأن علاجيهما مختلفان.
+  showHtml("#serialMsg", s.msg, "info");
+  $("#serialBtn").disabled = false;
+  $("#serialBtn").title = s.ok ? "" : "قد يفشل في هذا السياق (" + s.why + ") — جرّب";
 }
 $("#serialBtn").onclick = async () => {
+  if (!navigator.serial){
+    // فشل متوقَّع: أعد الإرشاد نفسه بصيغة خطأ بدل استثناء غامض
+    showHtml("#serialMsg", "⛔ تعذّر فتح مُنتقي المنافذ. " + serialStatus().msg, "err");
+    return;
+  }
   try {
     port = await navigator.serial.requestPort();
     await port.open({baudRate: 9600});

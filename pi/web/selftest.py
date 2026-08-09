@@ -331,6 +331,11 @@ def main() -> None:
     check("بطاقة الاستشارة موجودة بمزوّدين ومفتاح متصفحي",
           'id="cardAI"' in html_ai and 'id="aiProvider"' in html_ai
           and "localStorage" in html_ai)
+    check("🔴 Web Serial: التفريق بين السببين باقٍ (معيار قبول) بلا حجب الزر",
+          "insecure" in html_ai and "unsupported" in html_ai
+          and 'unsafely-treat-insecure-origin-as-secure' in html_ai
+          and '$("#serialBtn").disabled = false;' in html_ai,
+          "الزر يبقى متاحاً والسبب يُشرح")
     check("🔴 §8: النداء من المتصفح مباشرة (ترويسة النداء المتصفحي حاضرة)",
           "anthropic-dangerous-direct-browser-access" in html_ai
           and "api.anthropic.com" in html_ai)
