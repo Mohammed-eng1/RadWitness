@@ -573,17 +573,19 @@ def api_rover_status():
     """
     ردّ `T=130` **خاماً** (تشخيص وصلة السيريال والفيرموير).
 
-    ⛔ **لا حسّاس جهد على هذا العتاد** — الحقل `v` لا يصل والحسّاس معطّل. لا
-       تبنِ عليه شيئاً. الحماية من الاستنزاف قائمة على بديلين لا يحتاجان
-       فولتميتر: حدّ زمني، و**ذروة معدل الدوران** (الدوران بالمكان أثقل
-       مناورة فهو أول ما يسقط مع ضعف البطارية).
+    ⚠ الحقل `v` في ردّ الروفر **صفر دائماً** (ناقل I2C الداخلي في اللوحة
+       معطّل فيزيائياً) — الجهد الفعلي من INA219 على الراسبري (0x42، ناقل 1)
+       عبر `battery_state()` والمصدر يُعلَن دائماً. وتبقى فوقه طبقتان لا
+       تحتاجان فولتميتر: الحدّ الزمني وذروة معدل الدوران.
     """
     st = mission.rover.read_status()
     rv = mission.rover
     return {
         "raw": st, "mode": rv.mode,
         "link_ok": rv.link_ok, "link_error": rv.link_error,
-        "voltage_sensor": "معطّل — لا قراءة جهد على هذا العتاد",
+        # علق إقلاع ESP32 (تدفق أصفار) — العلاج زرّ Reset لا إعادة محاولة
+        "esp32_stuck": rv.esp32_stuck,
+        "voltage_source": rv.voltage_source,
         "battery_monitor_enabled": BATTERY_MONITOR_ENABLED,
         # الحماية البديلة الفعلية
         "turn_peak_baseline_dps": rv.turn_peak_baseline,
@@ -706,6 +708,18 @@ async def api_manual_enable(req: Request):
     """يفتح/يغلق نمط القيادة اليدوية (الإغلاق يوقف المحركات دائماً)."""
     d = await req.json()
     return manual.set_enabled(bool(d.get("on", False)))
+
+
+@app.post("/api/manual/ignore_sensors")
+async def api_manual_ignore(req: Request):
+    """
+    🔴 تجاوز حساسات العوائق — **قيادة يدوية فقط وبطلب صريح**: المشغّل يقود
+    بالكاميرا ويتحمّل المسؤولية. heartbeat وحدّ القوة وESTOP لا يتأثرون،
+    ويُصفَّر تلقائياً عند إغلاق القيادة اليدوية (لا يورَّث لوضع آخر).
+    """
+    d = await req.json()
+    manual.ignore_sensors = bool(d.get("on", False))
+    return {"ok": True, "ignore_sensors": manual.ignore_sensors}
 
 
 @app.get("/api/manual/status")

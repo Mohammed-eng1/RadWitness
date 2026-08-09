@@ -78,6 +78,11 @@ class ManualControl:
         self.stops_by_timeout = 0
         self.blocked_count = 0
         self.rejected_count = 0
+        # 🔴 تجاوز حساسات العوائق — **قيادة يدوية فقط وبطلب صريح**: المشغّل
+        #    يقود بالكاميرا/بعينه ويتحمّل المسؤولية. heartbeat وحدّ القوة
+        #    وESTOP لا يتأثرون. يُصفَّر تلقائياً عند إغلاق القيادة اليدوية.
+        self.ignore_sensors = False
+        self.overridden_count = 0
 
     # ── التفعيل (حصرية الأنماط) ─────────────────────────────────
     def set_enabled(self, on: bool, source: str = SOURCE_MANUAL) -> dict:
@@ -88,6 +93,10 @@ class ManualControl:
         on = bool(on)
         if not on and self._engaged:
             self._hard_stop("أُغلقت القيادة اليدوية")
+        if not on and self.ignore_sensors:
+            # ⚠ التجاوز لا يعيش خارج جلسة اليدوية — لا نورّثه لوضع آخر
+            self.ignore_sensors = False
+            self._log("manual_mode", "أُعيد تفعيل حساسات العوائق (تصفير تلقائي)")
         self.enabled = on
         self._log("manual_mode",
                   "قيادة يدوية مفعّلة ⚠ المحركات تستجيب" if on
@@ -191,6 +200,15 @@ class ManualControl:
 
         pwr = self._clamp_power(power)
         gate = self._safety_gate(cmd)
+        if not gate["allow"] and self.ignore_sensors:
+            # 🔴 تجاوز مقصود بطلب المشغّل: البوابة **تُحتسب وتُسجَّل** لكنها
+            #    لا تمنع — والسبب الأصلي يبقى في الردّ مسبوقاً بالتحذير حتى
+            #    تعرف الواجهة ماذا كان سيُمنع. heartbeat وحدّ القوة باقيان.
+            self.overridden_count += 1
+            self._log("safety_override",
+                      f"⚠ تجاوز الحساسات: نُفّذ {cmd} رغم «{gate['reason']}»")
+            gate = dict(gate, allow=True, overridden=True,
+                        reason="⚠ تجاوز مفعّل — " + str(gate.get("reason", "")))
         if not gate["allow"]:
             self.blocked_count += 1
             self._safe_stop()
@@ -201,8 +219,9 @@ class ManualControl:
             return self._reject(cmd, ACK_SAFE, gate["reason"], source,
                                 extra={"safety": gate})
 
-        # قصّ السرعة بسلّم المسافة (التقدّم وحده يتأثر)
-        if gate.get("speed_cap") is not None and cmd == CMD_FWD:
+        # قصّ السرعة بسلّم المسافة (التقدّم وحده يتأثر — والتجاوز يعطّله أيضاً)
+        if (gate.get("speed_cap") is not None and cmd == CMD_FWD
+                and not gate.get("overridden")):
             pwr = min(pwr, float(gate["speed_cap"]))
             pwr = max(pwr, MANUAL_POWER_MIN)
 
@@ -346,6 +365,8 @@ class ManualControl:
                 "last_reason": self.last_reason,
                 "stops_by_timeout": self.stops_by_timeout,
                 "blocked": self.blocked_count, "rejected": self.rejected_count,
+                "ignore_sensors": self.ignore_sensors,
+                "overridden": self.overridden_count,
                 "power_min": MANUAL_POWER_MIN, "power_max": MANUAL_POWER_MAX,
                 "heartbeat_s": MANUAL_HEARTBEAT_S,
                 "radio_timeout_s": LORA_COMMAND_TIMEOUT_S}

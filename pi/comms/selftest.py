@@ -277,6 +277,23 @@ def main() -> None:
     check("🔴 عائق IR يمنع التقدّم أيضاً (لا الألترا سونيك وحده)",
           not r["ok"] and r["ack"] == ACK_SAFE, r["reason"])
 
+    # ── تجاوز الحساسات (يدوي فقط، بطلب صريح — 2026-08-09) ──────────
+    m.reactive.decision = {"action": "stop", "speed": 0.0, "priority": "ultrasonic",
+                           "rung": "stop", "reason": "عائق أمامي 20سم",
+                           "unknown": []}
+    mc.ignore_sensors = True
+    r = mc.command("FWD", 0.3)
+    check("⚠ التجاوز مفعّل: التقدّم يُنفَّذ رغم العائق والسبب يبقى في الردّ",
+          r["ok"] and m.rover.last[0] == "forward"
+          and r.get("safety", {}).get("overridden") is True
+          and "تجاوز" in r["reason"], r["reason"][:60])
+    check("والتجاوز مسجَّل في السجل بعدّاده (لا تجاوز صامتاً)",
+          "safety_override" in m.log_kinds() and mc.overridden_count > 0)
+    mc.set_enabled(False)
+    check("🔴 إغلاق اليدوية **يصفّر التجاوز** تلقائياً (لا يُورَّث لوضع آخر)",
+          mc.ignore_sensors is False)
+    mc.set_enabled(True)
+
     # قصّ السرعة بالسلّم
     m.reactive.decision = {"action": "go", "speed": 0.2, "priority": "clear",
                            "rung": "≥60سم", "reason": "مسافة 70سم", "unknown": []}
