@@ -325,8 +325,16 @@ void setup() {
   {
     uint16_t calData[5];
     Preferences prefs;
-    prefs.begin("disp", false);
-    bool haveCal = (prefs.getBytesLength("touchcal") == sizeof(calData));
+    // Namespace is OURS, not the legacy firmware's "disp": that one is still
+    // in NVS (flashing with Erase Flash disabled keeps it) and its blob was
+    // recorded at a different rotation/layout. Loading it silently skipped
+    // the corner prompt and mapped every press to the wrong place -- seen on
+    // hardware 2026-08-09. The tag below adds a second guard: any calibration
+    // not written by THIS layout/rotation is discarded and redone, so future
+    // layout changes cannot resurrect the same bug.
+    prefs.begin("cydctl", false);
+    bool haveCal = (prefs.getBytesLength("touchcal") == sizeof(calData))
+                   && (prefs.getUInt("caltag", 0) == TOUCH_CAL_TAG);
   #if TOUCH_FORCE_CALIBRATE
     haveCal = false;
   #endif
@@ -341,6 +349,7 @@ void setup() {
       tft.setCursor(10, 40); tft.println("marker in turn");
       tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 20);
       prefs.putBytes("touchcal", calData, sizeof(calData));
+      prefs.putUInt("caltag", TOUCH_CAL_TAG);
     }
     prefs.end();
   }

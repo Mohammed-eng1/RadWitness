@@ -62,6 +62,11 @@
 // Model 1: set to 1 for ONE boot to redo the four-corner calibration
 // (it is stored in NVS and reloaded automatically), then set it back to 0.
 #define TOUCH_FORCE_CALIBRATE 0
+// Stamped next to the stored calibration. A calibration is only reused when
+// this value matches, so a blob recorded under a different rotation or button
+// layout is discarded and redone instead of silently mis-mapping every press.
+// BUMP THIS whenever setRotation() or the layout changes.
+#define TOUCH_CAL_TAG 0x43594431UL   // 'CYD1' -- rotation 0, 3x3 button grid
 
 // === Protocol (must match pi/comms/protocol.py) ===============
 #define MAX_PAYLOAD     56     // = LORA_MAX_PAYLOAD
