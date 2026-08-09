@@ -54,6 +54,42 @@ def check(name: str, cond: bool, detail: str = "") -> bool:
     return bool(cond)
 
 
+def run_worker_live(m: MissionSim) -> None:
+    """
+    يشغّل خيط المحركات ويبثّ أحداثه **حيّاً** مع نبض تغطية كل 10ث.
+
+    ⚠ مقاس 2026-08-09: التنفيذ المتزامن الصامت (دقائق بلا حرف واحد) ظنّه
+      المشغّل علقاً فقتل الاختبار في منتصفه — الصمت في اختبار عتادي يعمي.
+      وCtrl-C هنا = estop نظيف يوقف المحركات ثم ينتظر الخيط، لا قتل أعمى
+      يترك أمر حركة سارياً في الفيرموير.
+    """
+    import threading
+    th = threading.Thread(target=m._motor_worker, daemon=True)
+    seen = 0
+    last_beat = time.time()
+    th.start()
+    try:
+        while th.is_alive():
+            evs = list(m.events)
+            if len(evs) < seen:
+                seen = 0                  # السجل قُصّ (>300) — تابع من المتاح
+            for e in evs[seen:]:
+                print(f"    · {e['kind']}: {str(e['msg'])[:110]}")
+            seen = len(evs)
+            if time.time() - last_beat > 10.0:
+                last_beat = time.time()
+                print(f"    ⏱ {m.grid.coverage_text()} · المرحلة: {m.phase}")
+            time.sleep(0.5)
+        th.join()
+        for e in list(m.events)[seen:]:
+            print(f"    · {e['kind']}: {str(e['msg'])[:110]}")
+    except KeyboardInterrupt:
+        print("\n  ⚠ إيقاف بالمستخدم — estop وانتظار الخيط…")
+        m.estop()
+        th.join(timeout=10.0)
+        raise
+
+
 def build_mission(length_m: float, width_m: float, bg_cpm: float) -> MissionSim:
     """
     مهمة على **عتاد حقيقي**: نفس الحقن الذي يفعله السيرفر — لا مسار ثانٍ.
@@ -221,7 +257,7 @@ def run_cycle(m: MissionSim, a) -> None:
     print(f"  ⚠ قد تستغرق دقائق. الحدّ الزمني للمهمة {MISSION_TIME_LIMIT_S:.0f}ث "
           f"يفرض عودة إجبارية.")
     t0 = time.time()
-    m._motor_worker()                     # المسح ثم `_finish` → `_run_cycle`
+    run_worker_live(m)                    # المسح ثم `_finish` → `_run_cycle` — ببث حي
     show_events(m, 20)
     cyc = m.cycle or {}
     phases = [p["phase"] for p in cyc.get("phase_log", [])]

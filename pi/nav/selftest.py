@@ -2101,6 +2101,30 @@ def main() -> int:
     check("وعلى جسر sim يبقى المصدر المحاكى مشروعاً (لا حجب زائفاً)",
           not any("محاكى" in b for b in ms_hd.mission_readiness()["blockers"]))
 
+    # ── إزاحة أنبوب الجيجر: القراءة تُنسب للأنبوب لا لمركز الروبوت ──
+    # ⚠ الأنبوب على يسار الهيكل (2026-08-09) — نسبته للمركز = انحياز موضع
+    #   ثابت بحجم الإزاحة في كل تقدير، وخطأ الموقع المستهدف 18سم.
+    import pi.nav.mission as _mn
+    ms_go = MissionSim()
+    ms_go.configure_room(2.0, 2.0)
+    _sv_off = _mn.GEIGER_OFFSET_LEFT_M
+    try:
+        _mn.GEIGER_OFFSET_LEFT_M = 0.5
+        ms_go.heading = 0.0
+        ms_go._feed_locator(1.0, 1.0, {"counts": 5, "duration_s": 3.0})
+        rr_off = ms_go.locator.readings[-1]
+        check("قراءة الجيجر تُنسب لموضع **الأنبوب** (إزاحة يسارية مُدارة بالاتجاه)",
+              abs(rr_off["x"] - 0.5) < 1e-9 and abs(rr_off["y"] - 1.0) < 1e-9,
+              f"مركز (1,1) + يسار 0.5 عند 0° ⇒ ({rr_off['x']}, {rr_off['y']})")
+        ms_go.heading = 90.0
+        ms_go._feed_locator(1.0, 1.0, {"counts": 5, "duration_s": 3.0})
+        rr_off2 = ms_go.locator.readings[-1]
+        check("والإزاحة تدور مع اتجاه الروبوت (90° ⇒ اليسار صار +y)",
+              abs(rr_off2["x"] - 1.0) < 1e-9 and abs(rr_off2["y"] - 1.5) < 1e-9,
+              f"({rr_off2['x']}, {rr_off2['y']})")
+    finally:
+        _mn.GEIGER_OFFSET_LEFT_M = _sv_off
+
     # ═══ (ع) حارس «المبنيّ غير المستدعى» — قاعدة CLAUDE.md §8 آلياً ═══
     # النمط تكرر ست مرات: وحدة مبنيّة ومختبَرة وحدةً ولا يستدعيها أحد في
     # مسار المهمة، واختبار الوحدة المعزول يمرّ وإن لم يستدعِها أحد. الحارس

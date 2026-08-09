@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from pi.config import (
-    FRONT_WALL_CORRECTION_ENABLED,
+    FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -1628,9 +1628,17 @@ class MissionSim:
         """
         if self.locator is None:
             return {}
+        # 🔴 موضع القراءة = موضع **الأنبوب** لا مركز الروبوت: الأنبوب مثبّت
+        #    على يسار الهيكل (2026-08-09)، والإزاحة تُدار بالاتجاه الحالي —
+        #    انحياز ثابت بحجمها في كل تقدير موقع لو نُسبت للمركز.
+        th = math.radians(self.heading)
+        gx = (float(x) + GEIGER_OFFSET_FWD_M * math.sin(th)
+              - GEIGER_OFFSET_LEFT_M * math.cos(th))
+        gy = (float(y) + GEIGER_OFFSET_FWD_M * math.cos(th)
+              + GEIGER_OFFSET_LEFT_M * math.sin(th))
         try:
             return self.locator.add_reading(
-                float(x), float(y), self.heading,
+                gx, gy, self.heading,
                 counts_L=m["counts"], duration_s=m["duration_s"],
                 pos_uncertainty_m=self._pos_sigma(),
                 purpose=purpose, approaching=approaching) or {}
