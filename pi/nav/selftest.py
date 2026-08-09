@@ -2101,6 +2101,26 @@ def main() -> int:
     check("وعلى جسر sim يبقى المصدر المحاكى مشروعاً (لا حجب زائفاً)",
           not any("محاكى" in b for b in ms_hd.mission_readiness()["blockers"]))
 
+    # ── 🔴 التوثيق يُنفَّذ من المسافة الآمنة ولو مُنع الاقتراب ──────
+    # ثغرة مقاسة 2026-08-09: تتبّع التدرّج بلغ عتبة التوقف وأعلن «جاهز
+    # للتوثيق البصري»، فرفضه حاجب نصّه نفسه يقول «وثّق من بعيد» — أي أن
+    # كل مصدر قويّ بما يكفي ليكون مهماً كان غير قابل للتوثيق.
+    from pi.ai.approach_document import (approach_blockers as _apb,
+                                         documentation_blockers as _dcb)
+    _hot = {"hazard_level": "normal", "max_usvh": 3000.0,
+            "position_reliable": True, "found": True,
+            "protocol": {"perimeter_start_ok": True}}
+    check("🔴 جرعة فوق عتبة التوقف: الاقتراب ممنوع **والتوثيق مسموح**",
+          any("عتبة التوقف" in b for b in _apb(_hot)) and not _dcb(_hot),
+          f"موانع اقتراب={len(_apb(_hot))} · موانع توثيق={len(_dcb(_hot))}")
+    _blind = dict(_hot, position_reliable=False)
+    check("وبلا موقع موثوق يُمنع التوثيق (لا وجهة للكاميرا)",
+          any("وجهة" in b for b in _dcb(_blind)))
+    from pi.ai import dynamic_range as _drm
+    _evac = dict(_hot, hazard_level=_drm.HAZARD_EVACUATE)
+    check("وعند الإخلاء يُمنع التوثيق (الفرار أولوية مطلقة)",
+          any("الانسحاب أولاً" in b for b in _dcb(_evac)))
+
     # ── إزاحة أنبوب الجيجر: القراءة تُنسب للأنبوب لا لمركز الروبوت ──
     # ⚠ الأنبوب على يسار الهيكل (2026-08-09) — نسبته للمركز = انحياز موضع
     #   ثابت بحجم الإزاحة في كل تقدير، وخطأ الموقع المستهدف 18سم.

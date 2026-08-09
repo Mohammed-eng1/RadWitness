@@ -44,7 +44,8 @@ from pi.config import (
 from pi.nav.room import Room, OccupancyGrid, CELL_SIZE_M
 from pi.ai.source_locator import SourceLocator, SURVEY, CONFIRM
 from pi.ai.approach_document import (
-    run_documentation, approach_blockers, GradientApproach, source_bearing_deg,
+    run_documentation, approach_blockers, documentation_blockers,
+    GradientApproach, source_bearing_deg,
     MOVE, STOP, WITHDRAW,
 )
 from pi.ai.dynamic_range import (dead_time_correct, recheck_needed,
@@ -2206,7 +2207,10 @@ class MissionSim:
             return {"documented": False, "statement": "لا منسّق"}
         try:
             rep = self.locator.report()
-            blockers = approach_blockers(rep)
+            # ⚠ موانع **التوثيق** لا موانع الاقتراب: التصوير من الموضع الحالي
+            #   بلا خطوة إضافية (دوران ولقطة) فجرعته صفر — ومنعه بحجّة «وثّق
+            #   من بعيد» تناقض قاتل جعل كل مصدر قويّ غير قابل للتوثيق.
+            blockers = documentation_blockers(rep)
             if blockers:
                 self.documentation = {"documented": False, "blockers": blockers,
                                       "statement": "🔴 لم يُنفَّذ التوثيق البصري: "
