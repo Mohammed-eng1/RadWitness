@@ -32,18 +32,47 @@ class CameraReader:
         self._lock = threading.Lock()
 
     def _ensure_open(self) -> bool:
+        """
+        🔴 **يتخلّص من المقبض الميت ويعيد المحاولة** — لا يعود False للأبد.
+
+        عطل مقاس (2026-08-10): كان الشرط `if self._cap is not None: return
+        self._cap.isOpened()` بلا تنظيف، فأي مقبض محرَّر أو جهاز اختفى
+        لحظةً يقفل الكاميرا **لبقية عمر العملية**: كل لقطة تالية `None`،
+        والتوثيق يخرج بصفر صور فيبدو عطلاً في التوثيق لا في الجهاز.
+        وأشيع مسبّب: فشل فتح عابر عند الإقلاع (الجهاز مشغول أو لم يُعدّ بعد).
+        """
         if self._cap is not None:
-            return self._cap.isOpened()
+            try:
+                if self._cap.isOpened():
+                    return True
+            except Exception:             # noqa: BLE001
+                pass
+            self._drop_handle()           # مقبض ميت — تخلّص وأعد الفتح
         try:
             cap = cv2.VideoCapture(self._index)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
             self._cap = cap
             self._opened = cap.isOpened()
+            if not self._opened:
+                self._drop_handle()       # لا تحتفظ بمقبض فاشل يمنع المحاولة
+                self.error = f"تعذّر فتح الكاميرا (index={self._index})"
             return self._opened
         except Exception as e:            # noqa: BLE001
             self.error = str(e)
+            self._drop_handle()
             return False
+
+    def _drop_handle(self) -> None:
+        """يحرّر المقبض **ويُصفّر الحالة** — التصفير جزء من التحرير لا زينة."""
+        try:
+            if self._cap is not None:
+                self._cap.release()
+        except Exception:                 # noqa: BLE001
+            pass
+        finally:
+            self._cap = None
+            self._opened = False
 
     def snapshot_jpeg(self):
         """يُعيد بايتات JPEG للقطة واحدة، أو None عند التعذّر."""
@@ -88,13 +117,27 @@ class CameraReader:
             return None
 
     def state(self) -> dict:
-        # الصحة الحقيقية تُعرف بعد أول لقطة؛ قبلها نبلّغ توفّر المكتبة فقط
-        return {"available": self.available, "opened": self._opened}
+        # الصحة الحقيقية تُعرف بعد أول لقطة؛ قبلها نبلّغ توفّر المكتبة فقط.
+        # ⚠ تُقرأ من المقبض لا من راية محفوظة: الراية القديمة كانت تُبقي
+        #   نقطة الصحة **خضراء على كاميرا محرَّرة**، فيبدو العطل في التوثيق.
+        opened = False
+        try:
+            opened = bool(self._cap is not None and self._cap.isOpened())
+        except Exception:                 # noqa: BLE001
+            opened = False
+        self._opened = opened
+        return {"available": self.available, "opened": opened,
+                "error": self.error}
 
     def close(self) -> None:
+        """
+        🔴 التحرير **يُصفّر الحالة** — وإلا ماتت الكاميرا لبقية عمر العملية.
+
+        عطل مقاس (2026-08-10) وهو سبب غياب الصور فعلياً: `ModeManager` ينادي
+        `close()` عند **مغادرة نمط القيادة اليدوية** — أي عند كل انتقال
+        «يدوي → ذاتي»، وهو بالضبط ما يسبق كل مهمة. وبلا تصفير `_cap` كان
+        `_ensure_open` يعود `isOpened()=False` أبداً، فيخرج التوثيق بصفر
+        صورة ويبدو العطل في التوثيق لا في الجهاز.
+        """
         with self._lock:
-            try:
-                if self._cap:
-                    self._cap.release()
-            except Exception:             # noqa: BLE001
-                pass
+            self._drop_handle()

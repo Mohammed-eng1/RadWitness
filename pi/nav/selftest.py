@@ -2101,6 +2101,97 @@ def main() -> int:
     check("وعلى جسر sim يبقى المصدر المحاكى مشروعاً (لا حجب زائفاً)",
           not any("محاكى" in b for b in ms_hd.mission_readiness()["blockers"]))
 
+    # ── 🔴 كاسر الانحشار: اللفّ على أرضية عالية الاحتكاك (سجاد/فرش) ──
+    # عرَض مقاس 2026-08-10: «يرتجف ويلتفّ قليلاً ثم يقف». سببان مركّبان:
+    # القوة 0.40 لا تكسر احتكاك الوبر، **والتهدئة تنزل بها إلى 0.25** قرب
+    # الهدف فتتوقف الحركة داخل قوس التهدئة.
+    from pi.config import (TURN_STALL_DPS as _TSD, TURN_MIN_POWER as _TMP,
+                           TURN_STALL_FLOOR_FRAC as _TFF)
+
+    class CarpetBridge(WaveRoverBridge):
+        """منصّة لا تدور إلا فوق عتبة قوة (احتكاك سجاد)."""
+        need = 0.47                       # فوق TURN_POWER الافتراضية 0.40
+        def motors(self, l, r):
+            out = super().motors(l, r)
+            if abs(out["L"]) < self.need:
+                self._sim_turn_rate = 0.0   # مأمور ولا يدور
+            return out
+
+    carpet = CarpetBridge(mode="sim")
+    carpet.calibrate_gyro_bias(seconds=0.3)
+    r_carp = carpet.turn_by_angle(90, timeout=8.0)
+    check("🔴 أرضية عالية الاحتكاك: القوة تُرفع بالقياس حتى يدور فعلاً",
+          r_carp.get("stall_boosts", 0) > 0 and abs(r_carp["turned_deg"]) > 45,
+          f"{r_carp.get('stall_boosts')} زيادة · قوة {r_carp.get('power_used')} "
+          f"· دار {r_carp['turned_deg']}°")
+    check("والرفع معلَن حدثاً مقروءاً مرة واحدة (لا تعويض صامت)",
+          sum(1 for e in carpet.events if e["kind"] == "turn_stall_boost") == 1,
+          next((e["msg"][:64] for e in carpet.events
+                if e["kind"] == "turn_stall_boost"), "لا حدث"))
+    check("ولا يتجاوز الحاجز الصلب 0.5 مهما تكرّر الانحشار",
+          r_carp.get("power_used", 0) <= MAX_MOTOR_POWER + 1e-9,
+          f"{r_carp.get('power_used')} ≤ {MAX_MOTOR_POWER}")
+    # أرضية التهدئة ترتفع مع القوة — وإلا وقف داخل قوس التهدئة
+    from pi.rover.bridge import WaveRoverBridge as _WB
+    _p_boosted = 0.50
+    _floor = max(_TMP, _p_boosted * _TFF)
+    check("وأرضية التهدئة ترتفع مع القوة (لا عودة إلى قوة الانحشار)",
+          _WB._turn_power(1.0, 45.0, _p_boosted, _floor) >= _floor > _TMP,
+          f"أرضية {_floor:.2f} > الثابتة {_TMP}")
+    # المنصّة العادية لا تتأثر: صفر زيادة
+    plain = WaveRoverBridge(mode="sim")
+    plain.calibrate_gyro_bias(seconds=0.3)
+    r_plain = plain.turn_by_angle(90, timeout=8.0)
+    check("وعلى أرضية عادية: صفر زيادة (لا تدخّل بلا داعٍ)",
+          r_plain.get("stall_boosts", 0) == 0
+          and abs(r_plain.get("power_used", 0) - TURN_POWER) < 1e-9,
+          f"زيادات={r_plain.get('stall_boosts')} · قوة={r_plain.get('power_used')}")
+
+    # ── 🔴 الكاميرا تحيا بعد close (مغادرة النمط اليدوي قبل كل مهمة) ──
+    # عطل مقاس 2026-08-10 وهو **السبب المباشر لصفر صورة**: `close()` كان
+    # يحرّر المقبض بلا تصفيره، و`_ensure_open` يعود `isOpened()=False` أبداً
+    # ⇒ الكاميرا ميتة لبقية عمر العملية. و`ModeManager` ينادي `close()` عند
+    # مغادرة «القيادة اليدوية» — أي قبل كل مهمة ذاتية بالضبط.
+    from pi.sensors.camera import CameraReader as _CamR
+
+    class _FakeCap:
+        def __init__(self): self._open = True
+        def isOpened(self): return self._open
+        def set(self, *a): return True
+        def read(self): return (self._open, b"frame")
+        def release(self): self._open = False
+
+    cam = _CamR()
+    cam._cap = _FakeCap()
+    cam._opened = True
+    check("الكاميرا مفتوحة قبل الإغلاق", cam.state()["opened"] is True)
+    cam.close()
+    check("🔴 `close()` يُصفّر المقبض (لا مقبض ميت يمنع إعادة الفتح للأبد)",
+          cam._cap is None and cam._opened is False)
+    check("وحالة الكاميرا تُقرأ من المقبض لا من راية بائتة (لا صحة كاذبة)",
+          cam.state()["opened"] is False)
+    cam2 = _CamR()
+    cam2._cap = _FakeCap()
+    cam2._cap.release()               # مقبض ميت (جهاز اختفى/حُرّر)
+    check("ومقبض ميت يُطرح ليُعاد الفتح (لا `isOpened()=False` أبدية)",
+          cam2._ensure_open() in (True, False) and cam2._cap is not True)
+
+    # ── 🔴 العودة الإجبارية تُنتج تقريراً وتوثيقاً (لا تخرج بلا مخرَج) ──
+    # عطل مقاس 2026-08-10: `_finish` يستدعي الدورة في فرع «انتهى المسح»
+    # وحده، والعودة الإجبارية (زمن 480ث أو جهد 10.2–10.8V) شبه حتمية —
+    # فأكثر المهمات واقعيةً كانت تخرج بلا تقرير ولا سبب.
+    ms_rt = full_mission(run=False)
+    ms_rt._returning = True
+    ms_rt.state = RUNNING
+    ms_rt._finish()
+    check("🔴 مهمة انتهت بعودة إجبارية **تمرّ بالدورة** (تقرير لا صمت)",
+          ms_rt.cycle is not None
+          and any(e["kind"] == "cycle_after_return" for e in ms_rt.events),
+          f"مراحل={[p['phase'] for p in (ms_rt.cycle or {}).get('phase_log', [])]}")
+    check("ولا تُنفَّذ فيها أي مرحلة حركية (الحالة IDLE تمنع القيادة)",
+          ms_rt._can_drive() and not ms_rt._can_move(),
+          f"can_drive={ms_rt._can_drive()} · can_move={ms_rt._can_move()}")
+
     # ── 🔴 التوثيق يُنفَّذ من المسافة الآمنة ولو مُنع الاقتراب ──────
     # ثغرة مقاسة 2026-08-09: تتبّع التدرّج بلغ عتبة التوقف وأعلن «جاهز
     # للتوثيق البصري»، فرفضه حاجب نصّه نفسه يقول «وثّق من بعيد» — أي أن

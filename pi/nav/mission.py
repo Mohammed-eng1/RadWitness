@@ -1637,6 +1637,19 @@ class MissionSim:
     def _can_drive(self) -> bool:
         return bool(self.drive_motors and self.executor is not None)
 
+    def _can_move(self) -> bool:
+        """
+        🔴 قيادة **مسموحة الآن**: `_can_drive` + الحالة تسمح بالحركة.
+
+        ⚠ الفرق حاسم في دورة المراحل: تُستدعى الدورة أيضاً بعد **عودة
+           إجبارية** (بطارية/زمن) وبعد الإجهاض، والحالة عندها `IDLE`/`ESTOP`.
+           `_can_drive` وحدها تبقى True (المفتاح مرفوع والمنفّذ موجود) فتبدأ
+           المراحل الحركية قيادةً على بطارية منهكة أو بعد أمر إيقاف — وهو
+           نقيض سبب انتهاء المهمة أصلاً. المراحل غير الحركية (فرز · توثيق من
+           الموضع · تقرير) تبقى عاملة في الحالتين.
+        """
+        return self._can_drive() and self.state not in (ESTOP, IDLE)
+
     def _set_phase(self, phase: str) -> None:
         if phase != self.phase:
             self.phase = phase
@@ -2029,6 +2042,17 @@ class MissionSim:
             self.state = IDLE
             self._returning = False
             self._log("home", "وصل نقطة الانطلاق")
+            # 🔴 المهمة المنتهية بعودة إجبارية كانت **تفقد التقرير والتوثيق
+            #    كلياً**: الدورة تُستدعى في الفرع الآخر وحده. والعودة
+            #    الإجبارية شبه حتمية على العتاد (حدّ 480ث، أو جهد 10.2–10.8V)
+            #    ⇒ أكثر المهمات واقعيةً كانت تخرج **بلا مخرَج ولا سبب**.
+            # ⚠ والحالة IDLE هنا ليست تفصيلاً: `_can_move` يقرأها فتُتخطّى كل
+            #    المراحل الحركية تلقائياً — فرز وتوثيق من الموضع الحالي بلا
+            #    دوران وتقرير، بلا قيادة خطوة واحدة على بطارية منهكة.
+            self._log("cycle_after_return",
+                      "⚠ عودة إجبارية — تُنفَّذ المراحل غير الحركية فقط "
+                      "(فرز → توثيق من الموضع الحالي → تقرير)")
+            self._run_cycle()
         else:
             self.state = DONE
             self._log("mission_end",
@@ -2070,8 +2094,8 @@ class MissionSim:
                 mark(PHASE_WITHDRAW, hz.get("alarm"))
                 out["withdraw"] = self.retrace_path(
                     reason=hz.get("alarm") or "تقييم خطر يأمر بالانسحاب") \
-                    if self._can_drive() else {"ok": False,
-                                               "reason": "بلا محركات"}
+                    if self._can_move() else {"ok": False,
+                                              "reason": "لا حركة مسموحة الآن"}
                 out["documentation"] = self._document_source()
                 mark(PHASE_REPORT)
                 return out
@@ -2085,13 +2109,14 @@ class MissionSim:
             # ── ٣ تأكيد: قياسات جديدة مستقلة على **منطقة** ──────────
             center = self.locator.detector.suspect
             mark(PHASE_CONFIRM, f"منطقة مشتبهة عند {center}")
-            if self._can_drive():
+            if self._can_move():
                 out["rescan"] = self.rescan_region(center)
             else:
                 out["rescan"] = {"ok": False, "plan": self.locator
                                  .confirmation_plan(center, CONFIRM_RADIUS_M),
-                                 "reason": "المسح المنطقي لا يُنتج قياسات جديدة "
-                                           "— خطة التأكيد جاهزة للتنفيذ بالمحركات"}
+                                 "reason": "لا حركة مسموحة الآن (مسح منطقي أو "
+                                           "عودة/إجهاض) — خطة التأكيد جاهزة "
+                                           "للتنفيذ بالمحركات"}
             v = self.locator.confirm_region(center)
             out["confirm"] = {k: v.get(k) for k in
                               ("ready", "confirmed", "lambda_stat", "position",
@@ -2112,7 +2137,7 @@ class MissionSim:
                 return out
             mark(PHASE_APPROACH)
             pos = rep.get("position")
-            if self._can_drive() and pos:
+            if self._can_move() and pos:
                 out["transit"] = self._transit_toward(pos)
                 out["gradient"] = self.follow_gradient(target_xy=pos)
             else:

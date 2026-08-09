@@ -37,6 +37,8 @@ from pi.config import (
     ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, MOTOR_SWAP_LR, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
     MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
+    TURN_STALL_DPS, TURN_STALL_AFTER_S, TURN_STALL_BOOST,
+    TURN_STALL_FLOOR_FRAC,
     TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED,
     TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
     TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
@@ -638,21 +640,25 @@ class WaveRoverBridge:
 
     # ── الدوران بزاوية عبر مصدر الاتجاه (مهلة أمان) ─────────────
     @staticmethod
-    def _turn_power(remaining_deg: float, turned_deg: float, base: float) -> float:
+    def _turn_power(remaining_deg: float, turned_deg: float, base: float,
+                    floor: float = TURN_MIN_POWER) -> float:
         """
-        قوة اللفّ لحظياً: كاملة حتى يقترب الهدف، ثم تنزل خطياً إلى
-        `TURN_MIN_POWER` داخل آخر `TURN_SLOWDOWN_DEG`. الطاقة الحركية تتناسب
-        مع مربّع المعدل، فخفض المعدل قبل القطع يقلّص التجاوز أكثر من نسبياً.
+        قوة اللفّ لحظياً: كاملة حتى يقترب الهدف، ثم تنزل خطياً إلى `floor`
+        داخل آخر `TURN_SLOWDOWN_DEG`. الطاقة الحركية تتناسب مع مربّع المعدل،
+        فخفض المعدل قبل القطع يقلّص التجاوز أكثر من نسبياً.
 
         ⚠ التهدئة **لا تبدأ قبل أن يدور فعلاً** (`turned` > 0.5°): كسر السكون
            يحتاج القوة الكاملة، ولفّة تصحيح صغيرة تبدأ داخل قوس التهدئة أصلاً
            فلو خُفّضت قوّتها من اللحظة الأولى لما تحرّك الروبوت إطلاقاً.
+        ⚠ `floor` يرتفع مع كاسر الانحشار: على أرضية عالية الاحتكاك تُعيد
+           الأرضية الثابتة (0.25) الروبوتَ إلى القوة التي انحشر عندها.
         """
+        floor = max(0.0, min(float(floor), base))
         if abs(turned_deg) < 0.5 or remaining_deg >= TURN_SLOWDOWN_DEG:
             return base
         frac = max(0.0, remaining_deg) / TURN_SLOWDOWN_DEG
-        p = TURN_MIN_POWER + (base - TURN_MIN_POWER) * frac
-        return max(TURN_MIN_POWER, min(base, p))
+        p = floor + (base - floor) * frac
+        return max(floor, min(base, p))
 
     def _measure_coast(self) -> float:
         """
@@ -769,7 +775,12 @@ class WaveRoverBridge:
             #    المتكاملة تبقى صفراً فيلفّ الروبوت حتى المهلة.
             self.heading_source.set_phase("turn")
             spikes0 = self.heading_source.cond.spikes
-            self.turn(direction, power)
+            # 🔴 كاسر الانحشار: القوة الفعّالة تُرفع **بالقياس** حين تُؤمر
+            #    المحركات ولا يدور الروبوت (أرضية عالية الاحتكاك: سجاد/فرش).
+            power_now = float(power)
+            stall_t0 = None
+            boosts = 0
+            self.turn(direction, power_now)
             start = time.time()
             self.heading_source.update()      # يثبّت مرجع الزمن/الزاوية
             while abs(turned) < abs(degrees):
@@ -802,12 +813,40 @@ class WaveRoverBridge:
                 lead = min(abs(rate_at_cut) * self._coast_tau, TURN_MAX_LEAD_DEG)
                 if abs(turned) + lead >= abs(degrees):
                     break
+                # ── كاسر الانحشار (سجاد/فرش) ────────────────────────
+                # ⚠ **بعد** فحوص الإشارة والمصدر والاستباق عمداً: لا نرفع
+                #    القوة على روبوت يدور عكسياً أو على حسّاس معطّل.
+                if abs(rate_at_cut) < TURN_STALL_DPS:
+                    now_s = time.time()
+                    if stall_t0 is None:
+                        stall_t0 = now_s
+                    elif (now_s - stall_t0 >= TURN_STALL_AFTER_S
+                          and power_now < MAX_MOTOR_POWER):
+                        power_now = min(MAX_MOTOR_POWER,
+                                        power_now + TURN_STALL_BOOST)
+                        boosts += 1
+                        stall_t0 = now_s
+                        if boosts == 1:
+                            self._event(
+                                "turn_stall_boost",
+                                f"⚠ لا دوران عند قوة {power:.2f} — أرضية "
+                                f"عالية الاحتكاك (سجاد/فرش؟). تُرفع القوة "
+                                f"تدريجياً حتى {MAX_MOTOR_POWER:.2f}.")
+                else:
+                    stall_t0 = None
+                # ⚠ أرضية التهدئة ترتفع مع القوة: الأرضية الثابتة (0.25)
+                #    تُعيد الروبوت إلى القوة التي انحشر عندها أصلاً فيقف
+                #    داخل قوس التهدئة — وهو بالضبط عرَض «يلتفّ قليلاً ثم يقف».
+                floor_now = (TURN_MIN_POWER if not boosts else
+                             max(TURN_MIN_POWER,
+                                 power_now * TURN_STALL_FLOOR_FRAC))
                 # ⚠ **جدّد أمر اللفّ** كل دورة: بلا تجديد يمرّ 1.5ث فيعتبره
                 # حارس الـheartbeat انقطاعاً ويوقف المحركات في منتصف اللفّة
                 # (كانت اللفّة تتوقف عند ~24° لهذا السبب).
                 # القوة تتهدّأ قرب الهدف — لا قطع مفاجئ من 137°/ث إلى صفر.
                 self.turn(direction,
-                          self._turn_power(abs(degrees) - abs(turned), turned, power))
+                          self._turn_power(abs(degrees) - abs(turned), turned,
+                                           power_now, floor_now))
                 time.sleep(0.02)
         finally:
             self.stop()                      # ⚠ إيقاف مضمون لكل مرحلة
@@ -854,6 +893,7 @@ class WaveRoverBridge:
                 "rate_at_cut": rate_at_cut, "coast_tau": self._coast_tau,
                 "peak_rate": peak_rate, "link_fault": link_fault,
                 "no_rotation": no_rotation, "spikes": spikes,
+                "stall_boosts": boosts, "power_used": power_now,
                 "source_ok": self.heading_source.ok}
 
     def turn_by_angle(self, degrees: float,
@@ -899,12 +939,17 @@ class WaveRoverBridge:
         peak = 0.0
         spikes_total = 0
         no_rotation = False
+        # كاسر الانحشار: يُجمع عبر المراحل والتصحيحات ليصل المهمة والواجهة
+        stall_boosts = 0
+        power_used = float(power)
         try:
             for i, seg in enumerate(segments):
                 r = self._turn_segment(seg, timeout, power)
                 turned_total += r["turned"]
                 peak = max(peak, r.get("peak_rate", 0.0))
                 spikes_total += r.get("spikes", 0)
+                stall_boosts += r.get("stall_boosts", 0)
+                power_used = max(power_used, r.get("power_used", power))
                 no_rotation = no_rotation or r.get("no_rotation", False)
                 if r.get("link_fault"):
                     aborted = "rover_link_fault"
@@ -938,6 +983,8 @@ class WaveRoverBridge:
                 err = degrees - turned_total
                 c = self._turn_segment(err, TURN_CORRECTION_TIMEOUT_S, power)
                 turned_total += c["turned"]
+                stall_boosts += c.get("stall_boosts", 0)
+                power_used = max(power_used, c.get("power_used", power))
                 if c.get("sign_mismatch") or not c.get("source_ok", True):
                     break
                 # لم يتحرّك: الزاوية أصغر من أن تكسر السكون عند هذه القوة —
@@ -971,6 +1018,9 @@ class WaveRoverBridge:
         return {"requested_deg": degrees, "turned_deg": round(turned_total, 1),
                 "peak_rate_dps": round(peak, 1), "no_rotation": no_rotation,
                 "spikes": spikes_total,
+                # كاسر الانحشار: تصاعده عبر المهمة = الأرضية تزداد مقاومة
+                # (سجاد سميك) أو البطارية تنهك — كلاهما يستحق أن يُرى.
+                "stall_boosts": stall_boosts, "power_used": round(power_used, 3),
                 "timed_out": timed_out, "aborted": aborted,
                 "heading": round(self.heading, 1),
                 "segments": len(segments),
