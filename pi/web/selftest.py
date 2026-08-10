@@ -382,6 +382,28 @@ def main() -> None:
     check("سبب آخر رفض راديو مكشوف (لا رقم عارياً)",
           "last_reject" in st and "echoes" in st)
 
+    # ── 🔴 فشل التسلسل يُقال ولا يُبتلع ────────────────────────────
+    # عطل مقاس 2026-08-10: بايتات JPEG في الحمولة جعلت `json.dumps` يرمي
+    # **قبل** أي إرسال، و`except: pass` في الحلقة يبتلعه — فبقيت الحلقة
+    # حيّة وكل بثّة تفشل بصمت إلى الأبد. الصمت هو ما أطال التشخيص لا العطل.
+    section("ف) حدّ التسلسل: الفشل معلَن لا صامت")
+    _n_ev = len(mission.events)
+    _bad = srv.dumps_or_report({"صورة": b"\xff\xd8\xff"}, "اختبار")
+    check("حمولة فيها بايتات ⇒ None (لا إرسال نصف مكتوب ولا استثناء يتسرّب)",
+          _bad is None)
+    check("والسبب مكتوب في سجل المهمة (يُقرأ من /api/mission/report)",
+          any(e["kind"] == "broadcast_error" for e in mission.events[_n_ev:]),
+          [e["msg"] for e in mission.events[_n_ev:]
+           if e["kind"] == "broadcast_error"][0][:60])
+    check("والحمولة السليمة تمرّ كما هي (لا كلفة على المسار الطبيعي)",
+          srv.dumps_or_report({"a": 1}, "اختبار") == '{"a": 1}')
+    # والحالة الحقيقية تُسلسَل — وجود الحارس لا يعني أن الحمولة سليمة
+    check("🔴 حالة المهمة الحقيقية تُسلسَل فعلاً (لا اتّكال على الحارس)",
+          srv.dumps_or_report(srv._full_state(include_full_grid=True),
+                              "حالة كاملة") is not None)
+    check("و/api/sim/status يردّ 200 لا 500",
+          c.get("/api/sim/status").status_code == 200)
+
     boot = c.get("/api/boot").json()
     check("البطارية بمصدرها في خلاصة الإقلاع",
           "battery" in boot["health"] and "source" in boot["health"]["battery"],

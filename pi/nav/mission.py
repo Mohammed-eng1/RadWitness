@@ -2202,6 +2202,22 @@ class MissionSim:
             self._set_phase(ph)
             out["phase_log"].append({"phase": ph, "note": note})
 
+        def document():
+            """
+            🔴 التوثيق يدخل الدورة **مجرَّداً من البايتات** — نقطة واحدة.
+
+            `self.cycle` يُبثّ **خاماً** في `state_dict` و`report`، و
+            `_document_source` يُعيد `self.documentation` بصور JPEG داخله.
+            فخمسة مسارات خروج × سطر خام = خمس فرص لإعادة نفس الانهيار
+            (`UnicodeDecodeError: byte 0xff` ⇒ 500 على `/api/sim/status`
+            و`/api/mission/report`، وكل بثّ WebSocket يموت **صامتاً** لأن
+            `except Exception: pass` يبتلعه قبل الإرسال).
+            الالتفاف عبر دالة واحدة يجعل النسيان مستحيلاً لا مستبعداً.
+            ⚠ `self.documentation` يبقى خاماً — منه تُقدَّم `/api/doc/image/{i}`.
+            """
+            self._document_source()
+            return self._doc_state()
+
         if self.locator is None:
             return out
         try:
@@ -2220,13 +2236,13 @@ class MissionSim:
                     reason=hz.get("alarm") or "تقييم خطر يأمر بالانسحاب") \
                     if self._can_move() else {"ok": False,
                                               "reason": "لا حركة مسموحة الآن"}
-                out["documentation"] = self._document_source()
+                out["documentation"] = document()
                 mark(PHASE_REPORT)
                 return out
 
             if not s.get("suspect"):
                 # لا اشتباه ⇒ لا تأكيد ولا اقتراب. التوثيق يُحجب بسببه صراحةً.
-                out["documentation"] = self._document_source()
+                out["documentation"] = document()
                 mark(PHASE_REPORT, "لا اشتباه — لا تأكيد ولا اقتراب")
                 return out
 
@@ -2246,7 +2262,7 @@ class MissionSim:
                               ("ready", "confirmed", "lambda_stat", "position",
                                "uncertainty_m", "n_in_region", "reason")}
             if not v.get("confirmed"):
-                out["documentation"] = self._document_source()
+                out["documentation"] = document()
                 mark(PHASE_REPORT, v.get("reason", "لم يُؤكَّد"))
                 return out
 
@@ -2256,7 +2272,7 @@ class MissionSim:
             out["approach_blockers"] = blockers
             if blockers:
                 # الموانع تحجب الاقتراب **والصورة** معاً
-                out["documentation"] = self._document_source()
+                out["documentation"] = document()
                 mark(PHASE_REPORT, " · ".join(blockers)[:120])
                 return out
             mark(PHASE_APPROACH)
@@ -2271,7 +2287,7 @@ class MissionSim:
             # ── ٥ توقف (قرار المنسّق داخل follow_gradient) ثم ٦ توثيق ──
             mark(PHASE_STOP)
             mark(PHASE_DOCUMENT)
-            out["documentation"] = self._document_source()
+            out["documentation"] = document()
             # 🔴 إغلاق الحكم وإعادة الفرز — بحث عن مصدر **آخر** في نفس الغرفة
             out["closed"] = self._close_finding_and_rescreen()
             mark(PHASE_REPORT)
@@ -2554,7 +2570,10 @@ class MissionSim:
             # المراحل الست + أثر المسار (البنود 4 و6)
             "phase": self.phase,
             "phase_ar": PHASE_AR.get(self.phase, self.phase),
-            "cycle": self.cycle,
+            # ⚠ حارس ثانٍ عند حدّ البثّ: `cycle` قاموس حرّ تُضاف إليه حقول
+            #   جديدة مع كل مرحلة، فأي حقل مستقبلي يحمل بايتات يُقتل هنا.
+            #   (القاموس صغير — الكلفة مهملة بخلاف تجريد الشبكة كلها.)
+            "cycle": json_safe(self.cycle),
             "breadcrumbs": [list(b["cell"]) for b in self.breadcrumbs[-200:]],
             "withdraw_pending": bool(self._withdraw_req),
             "source": self._source_state(),
@@ -2628,7 +2647,7 @@ class MissionSim:
             "max_reading": max_rec,
             "unverified_cells": self._unverified_cells,
             "phase": self.phase,
-            "cycle": self.cycle,
+            "cycle": json_safe(self.cycle),
             "documentation": self._doc_state(),
             "source": (self.locator.report() if self.locator else None),
             "anomalies": self.anomalies,

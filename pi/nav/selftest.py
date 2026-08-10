@@ -2529,6 +2529,28 @@ def main() -> int:
             return any(_has_bytes(x, d + 1) for x in v)
         return False
 
+    # 🔴 والحارس يمرّ بـ**تجميع الدورة الحقيقي** (`_run_cycle`) لا بإسناد
+    #    `.documentation` وحده: `self.cycle` يُبثّ خاماً، وخمسة مسارات خروج
+    #    كانت تضع فيه `_document_source()` بصوره. حارس يُسند الحقل مباشرةً
+    #    يترك `cycle = None` فيمرّ أخضر على شجرة معطوبة — وهو ما حدث فعلاً.
+    _doc_real = ms_ser.documentation
+
+    def _fake_document_source(_self=ms_ser, _d=_doc_real):
+        """يقف مقام «الكاميرا التقطت» — الجزء الوحيد غير القابل للمحاكاة."""
+        _self.documentation = _d
+        return _d
+
+    ms_ser._document_source = _fake_document_source
+    ms_ser._feed_locator(1.0, 1.0, {"counts": 5, "duration_s": 3.0})
+    ms_ser._run_cycle()                       # مسار التجميع الحقيقي
+    check("الدورة جُمّعت فعلاً (وإلا كان الحارس يفحص cycle=None)",
+          isinstance(ms_ser.cycle, dict) and "documentation" in ms_ser.cycle,
+          f"مفاتيح الدورة: {sorted(ms_ser.cycle)[:4]}")
+    check("🔴 والتوثيق يدخل الدورة **مجرَّداً** (n_images لا بايتات)",
+          (ms_ser.cycle["documentation"] or {}).get("n_images", 0) >= 1
+          and "images" not in (ms_ser.cycle["documentation"] or {}),
+          f"n_images={(ms_ser.cycle['documentation'] or {}).get('n_images')}")
+
     _st = ms_ser.state_dict(include_full_grid=True)
     _rp = ms_ser.report()
     _ser_ok, _ser_err = True, ""
@@ -2551,6 +2573,19 @@ def main() -> int:
     _nested = {"a": [{"b": {"c": b"\xff\xd8"}}]}
     check("`json_safe` يستبدل البايتات بواصف حجم بأي عمق",
           _mn.json_safe(_nested)["a"][0]["b"]["c"] == {"_bytes": 2})
+    # 🔴 الطبقة الثانية: حقل **مستقبلي** يُضاف إلى الدورة بلا انتباه.
+    #    `cycle` قاموس حرّ تُضاف إليه حقول مع كل مرحلة — فالحارس عند حدّ
+    #    البثّ هو ما يمنع تكرار العطل نفسه بمفتاح لم يُخترع بعد.
+    ms_ser.cycle["حقل_مستقبلي"] = {"لقطة": b"\xff\xd8\xff"}
+    try:
+        json.dumps(ms_ser.state_dict(), ensure_ascii=False)
+        json.dumps(ms_ser.report(), ensure_ascii=False)
+        _fut_ok = True
+    except Exception:                         # noqa: BLE001
+        _fut_ok = False
+    check("🔴 وحقل جديد يحمل بايتات في الدورة يُقتل عند حدّ البثّ",
+          _fut_ok and not _has_bytes(ms_ser.state_dict()),
+          "الحارس لا يعتمد على معرفة أسماء الحقول")
 
     # ── إزاحة أنبوب الجيجر: القراءة تُنسب للأنبوب لا لمركز الروبوت ──
     # ⚠ الأنبوب على يسار الهيكل (2026-08-09) — نسبته للمركز = انحياز موضع

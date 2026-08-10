@@ -221,8 +221,9 @@ async def _sim_loop() -> None:
                 mission.poll_power_clamp() # أحداث الجسر + heartbeat → السجل
                 mission.poll_reactive()    # بثّ السرعة وسببها (البند 3)
                 if _sim_clients:
-                    msg = json.dumps(_full_state(include_full_grid=False))
-                    for ws in list(_sim_clients):
+                    msg = dumps_or_report(_full_state(include_full_grid=False),
+                                          "حالة المهمة")
+                    for ws in (list(_sim_clients) if msg else ()):
                         try:
                             await ws.send_text(msg)
                         except Exception:      # noqa: BLE001
@@ -230,6 +231,43 @@ async def _sim_loop() -> None:
         except Exception:                      # noqa: BLE001 — لا نُسقط الحلقة
             pass
         await asyncio.sleep(0.01)
+
+
+_bcast_fail_ts = 0.0
+_bcast_fails = 0
+
+
+def dumps_or_report(payload, label: str):
+    """
+    🔴 تسلسل حمولة البثّ — والفشل **يُقال** لا يُبتلع. أداة خارجية للحلقات.
+
+    عطل مقاس 2026-08-10: بايتات JPEG في الحمولة جعلت `json.dumps` يرمي
+    **قبل** أي إرسال، فلا عميل يُسقَط ولا سطر يُكتب — و`except: pass` في
+    الحلقة يبتلعه. النتيجة: الحلقة حيّة وكل بثّة تفشل بصمت إلى الأبد، فتبدو
+    الواجهة متجمّدة بلا سبب في السجل. **الصمت هو ما جعل تشخيصه يستغرق
+    يومين، لا العطل نفسه.**
+
+    ⚠ يُطبع على stdout عمداً: القناة الوحيدة السالمة حين يكون البثّ هو
+      المكسور — كتابته في سجل المهمة وحده تعني كتابته حيث لا يصل.
+    """
+    global _bcast_fail_ts, _bcast_fails
+    try:
+        return json.dumps(payload)
+    except Exception as e:                     # noqa: BLE001
+        _bcast_fails += 1
+        now = time.time()
+        if now - _bcast_fail_ts >= 10.0:       # لا نُغرق الطرفية
+            _bcast_fail_ts = now
+            print(f"[بثّ] 🔴 تعذّر تسلسل حمولة «{label}» "
+                  f"({_bcast_fails} مرة): {type(e).__name__}: {e} — "
+                  f"الواجهة لن تتحدّث حتى يُصلَح هذا", flush=True)
+        try:
+            mission._log("broadcast_error",
+                         f"🔴 حمولة «{label}» غير قابلة للتسلسل: "
+                         f"{type(e).__name__} — الواجهة متجمّدة والسبب هنا")
+        except Exception:                      # noqa: BLE001
+            pass
+        return None
 
 
 def _full_state(include_full_grid: bool = False) -> dict:
@@ -286,8 +324,8 @@ async def _sensor_loop() -> None:
                 rover.set_home_from_gps(p["lat"], p["lng"])
             rover.update(dt)
             if _sensor_clients:
-                msg = json.dumps(_sensor_telemetry())
-                for ws in list(_sensor_clients):
+                msg = dumps_or_report(_sensor_telemetry(), "تيليمتري الحساسات")
+                for ws in (list(_sensor_clients) if msg else ()):
                     try:
                         await ws.send_text(msg)
                     except Exception:          # noqa: BLE001
@@ -855,8 +893,16 @@ async def ws_sim(ws: WebSocket):
     await ws.accept()
     _sim_clients.add(ws)
     try:
-        await ws.send_text(json.dumps({**platform_banner(),
-                                       **_full_state(include_full_grid=True)}))
+        # ⚠ المصافحة أثقل حمولة (الشبكة كاملة) — وفشلها هنا يقتل الاتصال
+        #   قبل أول إطار، فيُعيد المتصفح الوصل بلا توقف بلا أي تفسير.
+        _hello = dumps_or_report({**platform_banner(),
+                                  **_full_state(include_full_grid=True)},
+                                 "مصافحة /ws")
+        if _hello is None:
+            _hello = json.dumps({"t": "sim", "state": "broadcast_error",
+                                 "error": "تعذّر تسلسل حالة المهمة — راجع "
+                                          "طرفية السيرفر (broadcast_error)"})
+        await ws.send_text(_hello)
         while True:
             await ws.receive_text()            # الأوامر عبر REST؛ نبقي الاتصال حيّاً
     except WebSocketDisconnect:
