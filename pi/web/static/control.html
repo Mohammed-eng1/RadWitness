@@ -1074,17 +1074,40 @@ function renderSource(st){
 }
 
 /* ═══ التقرير النهائي ═══ */
-let _repShown = false;
+/* 🔴 التقرير يُعاد جلبه كلما تغيّر مضمونه — لا يُقفل عند أول عرض.
+   عطل مقاس 2026-08-11 وهو سبب «الصور لا تطلع بالموقع»: `_finish` يضبط
+   `state = DONE` **قبل** `_run_cycle()`، والدورة بعدها تعمل دقيقتين
+   (تأكيد → اقتراب → تصوير → تقرير). فالواجهة كانت تجلب التقرير عند أول
+   `done` — أي لقطة لحظة انتهاء **المسح**: خلاصة الفرز، ومدة المسح وحده،
+   و`n_images = 0` ⇒ صفر مصغّرات — ثم تقفل نفسها بـ`_repShown` فلا تُحدَّث.
+   المفتاح يجمع كل ما قد يتغيّر بعد أول عرض: الطور · عدد الصور · طول سجل
+   المراحل. أي تقدّم في الدورة يُعيد الرسم. */
+let _repKey = "";
 async function maybeShowReport(st){
   const done = st.state === "done" || st.phase === "report";
-  if (!done){ if (st.state === "running") { _repShown = false; $("#cardReport").style.display = "none"; } return; }
-  if (_repShown) return;
-  _repShown = true;
-  const rep = await api("/api/mission/report");
+  if (!done){ if (st.state === "running") { _repKey = ""; $("#cardReport").style.display = "none"; } return; }
+  const key = [st.state, st.phase,
+               (st.documentation || {}).n_images || 0,
+               ((st.cycle || {}).phase_log || []).length].join("|");
+  if (key === _repKey) return;
+  // ⚠ المفتاح يُقفل **بعد** الرسم لا قبله: قفله أولاً يعني أن أي فشل جلب
+  //   عابر (لحظة إعادة تشغيل، انقطاع شبكة) يُسقط التقرير **إلى الأبد** —
+  //   نفس عيب `_repShown` الذي نُصلحه هنا، بشكل أخفى.
+  let rep = null;
+  try { rep = await api("/api/mission/report"); }
+  catch (e) { return; }          // انقطاع عابر: نُعيد المحاولة في البثّة التالية
+  if (!rep || rep.ok === false) return;
   const src = rep.source || {};
   const mx = rep.max_reading || null;
   const doc = rep.documentation || {};
-  let h = '<div class="repgrid">';
+  let h = '';
+  // ⏳ لافتة صريحة ما دامت الدورة تعمل: تقرير مرحلي يبدو نهائياً أسوأ من
+  //    غياب التقرير — القارئ يبني عليه وهو ناقص (لا صور ولا تأكيد بعد).
+  if (st.state === "done" && st.phase && st.phase !== "report")
+    h += '<div class="warning">⏳ الدورة ما زالت تعمل (' +
+         esc(st.phase_ar || st.phase) + ') — هذا تقرير **مرحلي** ' +
+         'ويُحدَّث تلقائياً حتى تنتهي (الصور تظهر بعد مرحلة التوثيق).</div>';
+  h += '<div class="repgrid">';
   h += '<div class="repbox"><div class="k">الخلاصة</div><div class="v" style="font-size:13.5px">' + esc(src.headline || "—") + '</div></div>';
   h += '<div class="repbox"><div class="k">الموقع ± الشك</div><div class="v">' +
     // ⚠ found شرط لازم: بلا دليل يوجد «موضع» رياضي (مركز التوزيع) وعرضه
@@ -1115,6 +1138,7 @@ async function maybeShowReport(st){
     th.appendChild(im);
   }
   $("#cardReport").style.display = "";
+  _repKey = key;                 // نجح الرسم ⇒ الآن يُقفل حتى يتغيّر المضمون
 }
 $("#repCsv").onclick = () => { location.href = "/api/mission/csv"; };
 $("#repPrint").onclick = () => {
@@ -1423,7 +1447,13 @@ function apply(st){
   $("#tBatt").title = (b.text || "") + (b.source_reason ? " — " + b.source_reason : "")
     + (b.charge && b.charge.reason ? " · الشحن: " + b.charge.reason : "");
   $("#dBatt").style.background = b.color || "#8a93a6";
-  $("#cState").textContent = (st.ui_mode ? st.ui_mode.mode_ar : "") + " · " + (st.state || "—");
+  /* 🔴 «done» قبل انتهاء الدورة تضليل صريح: `_finish` يضبطها فور انتهاء
+     **المسح**، ثم تعمل الدورة دقيقتين (تأكيد → اقتراب → تصوير → تقرير)
+     والروبوت يقود فعلياً. فالشريط كان يقول «انتهت» بينما الروبوت يتحرّك،
+     ثم يقف بلا تفسير — وهو ما يُقرأ «تعليقاً». نعرض **الطور** حتى تكتمل. */
+  const cycleRunning = (st.state === "done" && st.phase && st.phase !== "report");
+  $("#cState").textContent = (st.ui_mode ? st.ui_mode.mode_ar : "") + " · "
+    + (cycleRunning ? "جارٍ: " + (st.phase_ar || st.phase) : (st.state || "—"));
 
   const rd = st.reading || {};
   $("#rCpm").textContent = Math.round(rd.cpm || 0);
