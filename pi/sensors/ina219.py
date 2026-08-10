@@ -33,6 +33,7 @@ from pi.config import (
     INA219_ADDR, INA219_I2C_BUS, INA219_CONFIG_VALUE, INA219_LSB_V,
     INA219_MIN_PLAUSIBLE_V, INA219_MAX_PLAUSIBLE_V,
     INA219_SHUNT_OHM, INA219_CURRENT_LSB_V, INA219_CHARGING_A,
+    INA219_CURRENT_SIGN,
 )
 
 try:
@@ -135,22 +136,34 @@ class INA219Reader:
                                f"{INA219_MAX_PLAUSIBLE_V:.0f}V — "
                                f"خطأ عنوان/سجل لا حالة بطارية")}
         self.last_v = v
-        amps = self._read_amps()
-        self.last_a = amps
+        raw_a = self._read_amps()
+        # الاتجاه الفيزيائي = الخام × إشارة اللوحة المقاسة (0 ⇒ مجهول)
+        amps = (None if raw_a is None or not INA219_CURRENT_SIGN
+                else raw_a * INA219_CURRENT_SIGN)
+        self.last_a = amps if amps is not None else raw_a
+        # 🔴 «قيد الشحن» ليس زينة: الجهد أثناء الشحن **مضلّل**، ولهذا يُعفى
+        #    من الإطفاء المنظَّم. وهذا بالضبط ما يجعل ادّعاءه بلا دليل
+        #    خطراً: إشارة معكوسة تجعل تفريغ الراسبري العادي يُقرأ «شحناً»
+        #    ⇒ **الإطفاء لا يُطلق أبداً**. فبلا معايرة لا يُدّعى شحن أصلاً.
+        unknown = not INA219_CURRENT_SIGN
         return {"v": v, "ok": True, "ovf": False, "cnvr": cnvr, "raw": raw,
                 "amps": amps,
-                # 🔴 «قيد الشحن» ليس زينة: الجهد أثناء الشحن **مضلّل** (أعلى
-                #    من الحقيقي)، فأي قرار سلامة يُتَّخذ عليه خاطئ — ولهذا
-                #    تُستثنى هذه الحالة من الإطفاء.
-                "charging": (amps is not None and amps > INA219_CHARGING_A),
-                "watts": (round(v * abs(amps), 2) if amps is not None else None),
+                "amps_raw": raw_a,          # الخام دائماً — لأداة المعايرة
+                "charging": (not unknown and amps is not None
+                             and amps > INA219_CHARGING_A),
+                "charging_unknown": bool(unknown and raw_a is not None),
+                "watts": (round(v * abs(raw_a), 2) if raw_a is not None
+                          else None),       # القدرة من المطلق — لا تحتاج إشارة
                 "reason": None}
 
     def _read_amps(self):
         """
-        التيار من سجل الشنت: خطوة 10µV ÷ مقاومة الشنت. `None` عند الفشل.
-        ⚠ **مُوقَّع**: موجب = شحن داخل الحزمة، سالب = سحب. لا تأخذ المطلق
-           قبل فحص الإشارة وإلا اختفى الفرق بين الشحن والتفريغ.
+        التيار **الخام** من سجل الشنت: خطوة 10µV ÷ مقاومة الشنت.
+
+        🔴 مُوقَّع لكن **اتجاهه من اللوحة لا من المواصفة**: إشارة سجل الشنت
+        تتبع تركيب VIN+/VIN− فيزيائياً، وتنقلب مع مراجعة اللوحة. الاتجاه
+        الحقيقي يُضرب في `INA219_CURRENT_SIGN` **المقاس**، لا يُفترض هنا.
+        (كان هذا السطر يقول «موجب = شحن» افتراضاً — والقياس ناقضه.)
         """
         try:
             with self._lock:

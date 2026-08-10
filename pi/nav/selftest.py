@@ -697,6 +697,53 @@ def main() -> int:
           if good._bus.written else True,
           "يُكتب في __init__ الحقيقي")
 
+    # ── 🔴 إشارة التيار: «مجهول» لا يُقرأ «يشحن» ─────────────────
+    # شاهد مقاس 2026-08-10: البطارية **مفصولة عن الشاحن** والقراءة
+    # `+0.54A ⚡ يشحن · 6.5W` — و6.5W عند 11.97V حِمل راسبري 4 بالضبط.
+    # وخطره ليس في العرض: `charging` **يُعفي من الإطفاء المنظَّم**، فإشارة
+    # معكوسة تعني أن تفريغاً عادياً يُقرأ شحناً ⇒ الإطفاء لا يُطلق أبداً
+    # ⇒ تنقطع التغذية فجأةً عند قطع الحماية أثناء الكتابة على البطاقة.
+    class TwoRegBus(FakeBus):
+        """ناقل يميّز سجل الجهد عن سجل الشنت (الأول لا يكفي لاختبار الإشارة)."""
+        def __init__(self, raw_v, raw_shunt):
+            super().__init__(raw_v)
+            self.raw_shunt = raw_shunt & 0xFFFF
+        def read_i2c_block_data(self, addr, reg, n):
+            w = self.raw_shunt if reg == 0x01 else self.raw
+            return [(w >> 8) & 0xFF, w & 0xFF]
+
+    def reader_amps(raw_shunt):
+        r = reader_with(raw_1124)
+        r._bus = TwoRegBus(raw_1124, raw_shunt)
+        return r
+
+    from pi.config import INA219_SHUNT_OHM as _SH, INA219_CURRENT_LSB_V as _LSB
+    _shunt_pos = int(round(0.54 * _SH / _LSB))    # نفس القراءة المقاسة حيّاً
+    _sv_sign = _ina.INA219_CURRENT_SIGN
+    try:
+        _ina.INA219_CURRENT_SIGN = 0          # غير معايرة (الحالة الراهنة)
+        r0 = reader_amps(_shunt_pos).read()
+        check("🔴 إشارة غير معايرة ⇒ **لا يُدّعى شحن** والحالة تُعلَن مجهولة",
+              r0["charging"] is False and r0["charging_unknown"] is True
+              and r0["amps"] is None and r0["amps_raw"] is not None,
+              f"خام {r0['amps_raw']:+.2f}A · الاتجاه مجهول")
+        check("والقدرة تُحسب من المطلق (لا تحتاج إشارة أصلاً)",
+              r0["watts"] is not None and r0["watts"] > 0)
+        _ina.INA219_CURRENT_SIGN = -1         # الموجب = تفريغ
+        rm = reader_amps(_shunt_pos).read()
+        check("وبإشارة -1 يصير نفس الخام **تفريغاً** لا شحناً",
+              rm["charging"] is False and rm["amps"] < 0
+              and rm["charging_unknown"] is False,
+              f"{rm['amps']:+.2f}A")
+        _ina.INA219_CURRENT_SIGN = +1         # الموجب = شحن
+        rp = reader_amps(_shunt_pos).read()
+        check("وبإشارة +1 يصير شحناً (الفرق كله في ثابت مقاس)",
+              rp["charging"] is True and rp["amps"] > 0, f"{rp['amps']:+.2f}A")
+    finally:
+        _ina.INA219_CURRENT_SIGN = _sv_sign
+
+    # (أثر الإشارة على طبقة الإطفاء يُختبر بعد تعريف `shutdown_mission` أدناه)
+
     # الجسر: المصدر معلَن، وتجاوز المحاكاة يبقى عاملاً
     br_v = WaveRoverBridge(mode="sim")
     br_v.sim_set_voltage(10.4)
@@ -765,6 +812,22 @@ def main() -> int:
     check("🔴 مصدر غير INA219 ⇒ لا إطفاء (لا نُطفئ جهازاً على رقم غير مقيس)",
           not ms_x.fired
           and any("ليس INA219" in e["msg"] for e in ms_x.events))
+
+    # 🔴 وأثر إشارة التيار على هذه الطبقة بالذات — وهو الخطر الحقيقي:
+    #    `charging` **يُعفي من الإطفاء**، فإشارة معكوسة تعني أن تفريغاً
+    #    عادياً يُقرأ شحناً ⇒ الطبقة الرابعة تموت صامتة.
+    ms_unk = shutdown_mission()
+    feed(ms_unk, dict(base, charging=False, charging_unknown=True),
+         BATT_SHUTDOWN_CONSECUTIVE)
+    check("🔴 إشارة تيار مجهولة **لا تُعطّل** الإطفاء (الفشل نحو الأمان)",
+          bool(ms_unk.fired),
+          "ادّعاء شحن بلا دليل كان سيقتل الطبقة الرابعة بلا أثر")
+    ms_chg = shutdown_mission()
+    feed(ms_chg, dict(base, charging=True, charging_unknown=False),
+         BATT_SHUTDOWN_CONSECUTIVE + 2)
+    check("وشحن **مؤكَّد** (بإشارة معايرة) يبقى يُعفي كما صُمّم",
+          not ms_chg.fired,
+          "الجهد أثناء الشحن مضلّل — الإعفاء صحيح حين يُعرف لا حين يُفترض")
 
     # 🔴 الحارسان **مسلَّحان معاً** — الزمن لم يُحذف بعودة الجهد
     ms_g = MissionSim()

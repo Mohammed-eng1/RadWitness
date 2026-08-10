@@ -1414,7 +1414,10 @@ function apply(st){
   // 🔴 الجهد المجهول يُقال «مجهول» لا يُعرض صفراً (الفرق هو كل شيء)
   const b = st.battery || {};
   $("#tBatt").textContent = b.v != null
-    ? b.v.toFixed(2)+"V · " + (b.percent||0) + "%" + (b.charging ? " ⚡" : "")
+    // ⚠ «⚡؟» حين تكون إشارة التيار غير معايرة: مجهول يُقال مجهولاً — و«لا
+    //   يشحن» ادّعاء لا نملكه (وقراءة الشحن الكاذبة تعطّل طبقة الإطفاء).
+    ? b.v.toFixed(2)+"V · " + (b.percent||0) + "%"
+      + (b.charging ? " ⚡" : (b.charging_unknown ? " ⚡؟" : ""))
     : "جهد مجهول";
   $("#tBatt").title = (b.text || "") + (b.source_reason ? " — " + b.source_reason : "");
   $("#dBatt").style.background = b.color || "#8a93a6";

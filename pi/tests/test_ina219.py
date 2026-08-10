@@ -28,6 +28,7 @@ import time
 from pi.config import (
     ROVER_MODE, BATT_EXCELLENT_V, BATT_GOOD_V, BATT_LOW_V, BATT_CRITICAL_V,
     INA219_ADDR, INA219_I2C_BUS, BATTERY_MONITOR_ENABLED, MAX_MOTOR_POWER,
+    INA219_CURRENT_SIGN,
 )
 from pi.rover import battery as batt
 from pi.sensors.ina219 import INA219Reader
@@ -72,12 +73,81 @@ def sample(ina: INA219Reader, seconds: float, rover=None, power: float = 0.0) ->
             "stdev": statistics.pstdev(vals) if len(vals) > 1 else 0.0}
 
 
+def sample_amps(ina: INA219Reader, seconds: float, rover=None,
+                power: float = 0.0) -> float | None:
+    """وسيط التيار **الخام** (قبل إشارة اللوحة) — أساس قياس الإشارة."""
+    vals = []
+    t_end = time.time() + seconds
+    last_cmd = 0.0
+    try:
+        while time.time() < t_end:
+            if rover is not None and (time.time() - last_cmd) > RENEW_S:
+                rover.motors(power, power)
+                last_cmd = time.time()
+            a = ina.read().get("amps_raw")
+            if a is not None:
+                vals.append(a)
+            time.sleep(0.05)
+    finally:
+        if rover is not None:
+            rover.stop()
+    return statistics.median(vals) if vals else None
+
+
+def measure_sign(ina: INA219Reader, seconds: float, power: float) -> int:
+    """
+    🔴 يقيس `INA219_CURRENT_SIGN` **بالمحركات** لا بالشاحن.
+
+    المنطق الذي يجعله حاسماً: تشغيل المحركات **يزيد السحب من الحزمة**
+    يقيناً — لا احتمال آخر ولا حاجة إلى شاحن ولا إلى ثقة بحالته. فإن صار
+    التيار الخام **أكثر موجبيةً** تحت الحمل ⇒ الموجب **تفريغ** (الإشارة
+    ‎-1)، وإن صار أكثر سلبيةً ⇒ الموجب **شحن** (‎+1).
+
+    ⚠ ولا يُقاس بمقارنة «موصول/مفصول»: حالة الشاحن شهادة عين، وشهادة
+      العين هي التي قلبت ثوابت المحركات مرتين في يومين (§2).
+    """
+    print(f"\n  ⚠ **ارفع العجلات عن الأرض** — قوة {power:.2f} لمدة "
+          f"{seconds:.0f}ث")
+    input("      اضغط Enter حين تكون العجلات في الهواء… ")
+    from pi.rover.bridge import WaveRoverBridge
+    rover = WaveRoverBridge(mode="real")
+    idle = sample_amps(ina, 3.0)
+    load = sample_amps(ina, seconds, rover=rover, power=power)
+    rover.stop()
+    if idle is None or load is None:
+        print("  ⛔ تعذّرت قراءة التيار — لا معايرة")
+        return 0
+    delta = load - idle
+    print(f"      خام ساكناً = {idle:+.3f}A · تحت الحمل = {load:+.3f}A · "
+          f"الفرق = {delta:+.3f}A")
+    if abs(delta) < 0.10:
+        print("  ⛔ الفرق أصغر من أن يحسم (<0.10A). ارفع القوة أو تأكّد أن "
+              "المحركات دارت فعلاً — لا تخمّن الإشارة.")
+        return 0
+    sign = -1 if delta > 0 else +1
+    print(f"\n  ✅ **INA219_CURRENT_SIGN = {sign:+d}**  "
+          + ("(الموجب = تفريغ)" if sign < 0 else "(الموجب = شحن)"))
+    print(f"     الحمل زاد السحب فصار التيار الخام أكثر "
+          + ("موجبيةً" if delta > 0 else "سلبيةً")
+          + " — ولا مصدر آخر لهذا الاتجاه.")
+    print(f"     ضعها في pi/config.py:  INA219_CURRENT_SIGN = {sign:+d}")
+    if INA219_CURRENT_SIGN and INA219_CURRENT_SIGN != sign:
+        print(f"  🔴 القيمة الحالية ({INA219_CURRENT_SIGN:+d}) **معكوسة** — "
+              f"النظام يقرأ التفريغ شحناً وطبقة الإطفاء معطّلة عملياً.")
+    elif not INA219_CURRENT_SIGN:
+        print("  ⚠ القيمة الحالية 0 (غير معايرة): النظام لا يدّعي شحناً "
+              "وطبقة الإطفاء مسلَّحة — آمن لكنه ناقص.")
+    return sign
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--load", action="store_true",
                     help="⚠ يشغّل المحركات — ارفع العجلات عن الأرض")
     ap.add_argument("--power", type=float, default=0.30)
+    ap.add_argument("--sign", action="store_true",
+                    help="⚠ يشغّل المحركات — يقيس اتجاه إشارة التيار")
     a = ap.parse_args()
 
     print("\n=== قراءة جهد البطارية (INA219 على UPS Module 3S) ===")
@@ -157,6 +227,22 @@ def main() -> int:
         check("لا رفض قراءات تحت الحمل (ضجيج المحركات لا يفسد I2C)",
               ld["rejects"] <= max(1, ld["n"] // 50),
               f"{ld['rejects']}/{ld['n']}")
+
+    # ── (5) 🔴 إشارة التيار — تُقاس بالمحركات لا بالشاحن ────────
+    if a.sign:
+        print("\n[5] 🔴 قياس إشارة التيار")
+        if ROVER_MODE != "real":
+            print("      ⛔ يحتاج RMS_ROVER_MODE=real")
+            _ok.append(False)
+        else:
+            s = measure_sign(ina, a.seconds, min(a.power, MAX_MOTOR_POWER))
+            check("إشارة التيار حُسمت (لا تخمين)", s != 0,
+                  f"INA219_CURRENT_SIGN = {s:+d}" if s else "لم تُحسم")
+    elif not INA219_CURRENT_SIGN:
+        print("\n[5] ⚠ إشارة التيار **غير معايرة** — النظام لا يدّعي شحناً "
+              "(آمن) لكنه لا يعرفه أيضاً.")
+        print("      قِسها: RMS_ROVER_MODE=real python3 -m pi.tests.test_ina219 "
+              "--sign   (ارفع العجلات)")
 
     print(f"\n  العتبات الفاعلة: ممتاز>{BATT_EXCELLENT_V} · جيد>{BATT_GOOD_V} · "
           f"عودة<{BATT_LOW_V} · إيقاف<{BATT_CRITICAL_V}")
