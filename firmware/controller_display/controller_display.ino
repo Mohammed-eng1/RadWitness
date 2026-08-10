@@ -246,6 +246,13 @@ int btnAt(int x, int y) {
   return -1;
 }
 
+// Only these four are held to keep the robot moving. Everything else is a
+// one-shot event -- see the auto-repeat note in handleTouch().
+static bool isMotionCmd(const char *c) {
+  return strcmp(c, "FWD") == 0 || strcmp(c, "BACK") == 0 ||
+         strcmp(c, "LEFT") == 0 || strcmp(c, "RIGHT") == 0;
+}
+
 // Returns true and fills SCREEN coordinates when the panel is pressed.
 #if DISPLAY_MODEL == 1
 static bool readTouch(int &x, int &y) {
@@ -307,9 +314,18 @@ void handleTouch() {
       sendCommand(btns[i].cmd, 0.30f);
       lastRepeatMs = millis();
       uiDirty = true;
-    } else if (i >= 0) {
-      // Press-and-hold keeps moving: refresh the command before the
-      // radio command timeout (2s on the Pi) can cut it off.
+    } else if (i >= 0 && isMotionCmd(btns[i].cmd)) {
+      // Press-and-hold keeps the robot moving: refresh before the rover
+      // firmware's own 1500 ms heartbeat cuts the motors.
+      //
+      // MOTION ONLY -- this used to repeat EVERY held button, which was a
+      // safety defect, not just noise. Holding ESTOP (the natural human
+      // reaction) emitted ~2 ESTOP + 2 ACK frames per second into a
+      // half-duplex channel whose measured capacity is ~1.5 frames/s:
+      // the emergency button was jamming the very confirmation the
+      // operator was waiting for. The first frame already did the job.
+      // Holding RTH or WDRAW likewise re-invoked mission calls twice a
+      // second, neither of which is documented as idempotent.
       if (millis() - lastRepeatMs >= DRIVE_REPEAT_MS) {
         sendCommand(btns[i].cmd, 0.30f);
         lastRepeatMs = millis();
@@ -319,9 +335,7 @@ void handleTouch() {
   if (!touched && heldBtn >= 0) {
     // Finger lifted off a motion button => IMMEDIATE stop, not "wait
     // for the timeout to notice".
-    const char *c = btns[heldBtn].cmd;
-    bool motion = (strcmp(c, "FWD") == 0 || strcmp(c, "BACK") == 0 ||
-                   strcmp(c, "LEFT") == 0 || strcmp(c, "RIGHT") == 0);
+    bool motion = isMotionCmd(btns[heldBtn].cmd);
     heldBtn = -1;
     if (motion) sendCommand("STOP", 0);
     uiDirty = true;

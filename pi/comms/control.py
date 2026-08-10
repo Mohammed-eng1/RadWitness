@@ -73,8 +73,18 @@ class ManualControl:
         self.last_source = None
         self.last_cmd = None
         self.last_reason = ""
-        self.last_ts = None
+        self.last_ts = None           # آخر أمر **مقبول** (للعرض فقط)
         self._engaged = False         # محركات تعمل الآن بأمر يدوي/راديو
+        # 🔴 ساعة حارس المحركات — **مسار الحركة الناجح وحده يكتبها**.
+        #    كانت `last_ts` تؤدي الدورين، فصار كل أمر مقبول (STATUS · RTH ·
+        #    حتى WDRAW **مرفوضاً**) يجدّد مهلة إيقاف المحركات: بثّ STATUS كل
+        #    ثانية يُبقي الروبوت يتقدّم إلى الأبد بلا أمر حركة واحد. أُثبت
+        #    بتشغيل الكود لا بقراءته (2026-08-11).
+        self.last_motion_ts = None
+        # ومصدر **الاشتباك** لا مصدر آخر أمر: كان أي إطار راديو (ولو مرفوضاً)
+        # يوسّع مهلة قيادة المتصفح من 0.8ث إلى 2.0ث — مراقب على القناة يجعل
+        # حارس قناة أخرى أكثر تساهلاً بمقدار 2.5×.
+        self._engaged_source = None
         self.stops_by_timeout = 0
         self.blocked_count = 0
         self.rejected_count = 0
@@ -154,7 +164,9 @@ class ManualControl:
 
         # ── WDRAW: انسحاب على أثر الدخول — أولوية مطلقة في المهمة ──
         if cmd == CMD_WITHDRAW:
-            self.last_cmd, self.last_ts = cmd, now
+            # ⚠ `last_ts` **بعد** بوابة المهمة النشطة لا قبلها: كتابتها هنا
+            #    كانت تجعل WDRAW **مرفوضاً** يجدّد ساعة الأوامر (ثقب وحيد
+            #    خرق قاعدة «للمقبول وحده» التي يعلنها هذا الملف عن نفسه).
             # مهمة نشطة فقط: العلم المعلّق على idle يفاجئ المهمة التالية
             if self.mission.state not in ("running", "paused", "returning"):
                 self.rejected_count += 1
@@ -169,6 +181,7 @@ class ManualControl:
                 return self._reject(cmd, ACK_FAULT,
                                     f"تعذّر طلب الانسحاب: {e}", source)
             if res.get("ok"):
+                self.last_ts = now
                 return self._ok(cmd, ACK_OK,
                                 "طلب انسحاب — أولوية مطلقة على أي هدف مسح",
                                 source)
@@ -247,6 +260,9 @@ class ManualControl:
 
         self._engaged = True
         self.last_cmd, self.last_ts = cmd, now
+        # 🔴 المسار **الوحيد** الذي يجدّد حارس المحركات — ومعه مصدر الاشتباك
+        self.last_motion_ts = now
+        self._engaged_source = source
         return self._ok(cmd, ACK_OK, gate["reason"], source,
                         extra={"power": round(pwr, 3), "safety": gate})
 
@@ -258,15 +274,20 @@ class ManualControl:
         ⚠ يعمل **حتى لو أُغلقت القيادة اليدوية** ما دام `_engaged` — الحالة
         الخطرة هي بالضبط أن يختفي الآمر ويبقى الأمر سارياً.
         """
-        if not self._engaged or self.last_ts is None:
+        # 🔴 ساعة **الحركة** ومصدر **الاشتباك** — لا `last_ts`/`last_source`:
+        #    الأولان يتغيّران مع كل أمر مقبول أو مرفوض أياً كان نوعه، فكان
+        #    بثّ STATUS يُبقي المحركات دائرة، وإطارُ راديو واحد يوسّع مهلة
+        #    قيادة المتصفح 0.8ث → 2.0ث. (أُثبت الاثنان بتشغيل الكود.)
+        if not self._engaged or self.last_motion_ts is None:
             return None
         now = self._clock() if now is None else now
-        limit = (LORA_COMMAND_TIMEOUT_S if self.last_source == SOURCE_RADIO
+        src = self._engaged_source
+        limit = (LORA_COMMAND_TIMEOUT_S if src == SOURCE_RADIO
                  else MANUAL_HEARTBEAT_S)
-        if (now - self.last_ts) <= limit:
+        if (now - self.last_motion_ts) <= limit:
             return None
         self.stops_by_timeout += 1
-        self._hard_stop(f"انقطاع الأوامر > {limit:.1f}ث ({_ar_source(self.last_source)})")
+        self._hard_stop(f"انقطاع أوامر الحركة > {limit:.1f}ث ({_ar_source(src)})")
         return {"stopped": True, "reason": self.last_reason, "limit_s": limit}
 
     # ── طبقة السلامة ────────────────────────────────────────────
@@ -327,6 +348,8 @@ class ManualControl:
     def _hard_stop(self, reason: str) -> None:
         self._safe_stop()
         self._engaged = False
+        self.last_motion_ts = None     # لا ساعة قديمة تُورَّث لاشتباك جديد
+        self._engaged_source = None
         self.last_reason = reason
         self._log("manual_timeout", f"⛔ أُوقفت المحركات — {reason}")
 

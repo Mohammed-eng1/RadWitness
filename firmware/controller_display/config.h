@@ -69,7 +69,7 @@
 #define TOUCH_CAL_TAG 0x43594431UL   // 'CYD1' -- rotation 0, 3x3 button grid
 // Model 1: print raw + converted touch values over USB while STANDALONE.
 // Leave at 1 while proving the panel; set to 0 once buttons respond.
-#define TOUCH_DEBUG 1
+#define TOUCH_DEBUG 0
 
 // === Protocol (must match pi/comms/protocol.py) ===============
 #define MAX_PAYLOAD     56     // = LORA_MAX_PAYLOAD
@@ -78,10 +78,28 @@
 // === Timing ===================================================
 #define TFT_BACKLIGHT_PCT   60
 #define UI_UPDATE_MS        250    // redraw changed fields only
-// Held-button command refresh: MUST be shorter than the radio command
-// timeout on the Pi (2000ms in pi/config.py). 500ms means losing two
-// consecutive frames still does not cut the motion off.
-#define DRIVE_REPEAT_MS     500
+// Held-button command refresh (MOTION buttons only -- see handleTouch()).
+//
+// The binding deadline is NOT the Pi's 2000 ms radio timeout: the Wave Rover
+// ESP32 firmware runs its own 1500 ms heartbeat (ROVER_SAFETY_TIMEOUT_S in
+// pi/config.py) and cuts the motors first. It is also the only guard that
+// survives a stall on the Pi, so it is the number to design against.
+//
+// Why 1200 and not the old 500: the HC-14 link is half-duplex and measured
+// at roughly 0.67 s of channel occupancy per frame at S3 -- about 1.5
+// frames/s of real capacity. A 500 ms repeat alone put 2 frames/s of
+// commands on it, and with acks and telemetry the link ran at ~300% of
+// capacity: most of the "slow to respond" delay was collision retries, not
+// radio speed. At 1200 ms the link fits inside its capacity and the FIRST
+// command -- the one the operator is waiting on -- gets through promptly.
+//
+// The honest trade at S3: 1200 ms tolerates ZERO lost repeats (one loss
+// makes a 2400 ms gap, past the 1500 ms heartbeat, so the robot stutters to
+// a stop). That bias is deliberate for an emergency channel -- degraded
+// link means stop, not coast. Smooth continuous driving needs a faster air
+// rate: after raising BOTH HC-14 units to S5/S6 on the bench, set this to
+// about 600 and the stutter goes away with the safety property intact.
+#define DRIVE_REPEAT_MS     1200
 // No telemetry for this long => the link is declared dead (the robot
 // broadcasts every 2s).
 #define LORA_TIMEOUT_MS     8000

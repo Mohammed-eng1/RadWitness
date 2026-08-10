@@ -440,8 +440,49 @@ def main() -> None:
     check(f"🔴 **انقطاع أوامر الراديو > {LORA_COMMAND_TIMEOUT_S}ث ⇒ إيقاف**",
           mc4.poll(clk3.advance(LORA_COMMAND_TIMEOUT_S)) is not None,
           str(m3.rover.last))
-    check("ومهلة الراديو أقصر من مهلة الروفر العتادية (تسبقها)",
-          LORA_COMMAND_TIMEOUT_S < 1.5 + LORA_COMMAND_TIMEOUT_S)
+    # ⚠ تصحيح ادعاء قديم: كان هنا «مهلة الراديو أقصر من مهلة الروفر
+    #   العتادية (تسبقها)» بتأكيد تحصيلِ حاصل يمرّ دائماً. الحقيقة عكسه:
+    #   heartbeat فيرموير الروفر **1.5ث** (ROVER_SAFETY_TIMEOUT_S) يسبق
+    #   مهلتنا 2.0ث ويقطع المحركات أولاً — وهو الحدّ **الملزم** لتجديد
+    #   أوامر الحركة، وعليه يُعاير DRIVE_REPEAT_MS في الشاشة لا على 2.0ث.
+    from pi.config import ROVER_SAFETY_TIMEOUT_S
+    check("🔴 الحدّ الملزم لتجديد الحركة هو heartbeat الروفر لا مهلتنا",
+          ROVER_SAFETY_TIMEOUT_S < LORA_COMMAND_TIMEOUT_S,
+          f"روفر {ROVER_SAFETY_TIMEOUT_S}ث يسبق راديو {LORA_COMMAND_TIMEOUT_S}ث")
+
+    # ═══ ز٢) 🔴 حارس المحركات لا يُجدَّد إلا بحركة ═════════════════
+    # كشفتها مراجعة نقدية شغّلت الكود فعلاً (2026-08-11): كانت `last_ts`
+    # تؤدي دورين، فأي أمر مقبول — بل وWDRAW **مرفوضاً** — يُبقي المحركات.
+    section("ز٢) حارس المحركات: الحركة وحدها تجدّده:")
+    for keep, label in ((["STATUS"], "STATUS"), (["RTH"], "RTH"),
+                        (["WDRAW"], "WDRAW مرفوضاً"), (["REBOOT"], "أمر تالف")):
+        mk = FakeMission()
+        clkk = FakeClock()
+        mck = ManualControl(mk, clock=clkk)
+        mck.set_enabled(True)
+        mck.command("FWD", 0.3, source=SOURCE_RADIO)   # اشتباك حقيقي
+        stopped = None
+        for _ in range(6):                              # 6 × 1.0ث = 6ث
+            clkk.advance(1.0)
+            for k in keep:
+                mck.command(k, source=SOURCE_RADIO)     # «حياة» زائفة
+            if stopped is None and mck.poll(clkk.t) is not None:
+                stopped = round(clkk.t - 1000.0, 1)
+        check(f"🔴 بثّ {label} كل ثانية **لا** يُبقي المحركات دائرة",
+              stopped is not None and mk.rover.last[0] == "stop",
+              f"توقّفت عند {stopped}ث" if stopped else "لم تتوقف أبداً ⇒ ثغرة")
+
+    # وإطار راديو واحد لا يوسّع مهلة قيادة المتصفح 0.8ث → 2.0ث
+    mx = FakeMission()
+    clkx = FakeClock()
+    mcx = ManualControl(mx, clock=clkx)
+    mcx.set_enabled(True)
+    mcx.command("FWD", 0.3, source=SOURCE_MANUAL)       # اشتباك من الواجهة
+    mcx.command("STATUS", source=SOURCE_RADIO)          # مراقب على القناة
+    check("🔴 إطار راديو لا يوسّع حارس قناة الواجهة (0.8ث تبقى 0.8ث)",
+          mcx.poll(clkx.advance(MANUAL_HEARTBEAT_S + 0.15)) is not None
+          and mx.rover.last[0] == "stop",
+          f"المصدر المشتبِك={mcx._engaged_source}")
 
     m4 = FakeMission()
     mc5 = ManualControl(m4, clock=FakeClock())
@@ -501,6 +542,64 @@ def main() -> None:
     tel = link._send_telemetry(clk5.t)
     check("التيليمتري يُبنى إطاراً صالحاً", parse_frame(tel).startswith("T,"),
           tel.strip())
+
+    # ── 🔴 ضبط الهواء: القناة نصف مزدوجة وسعتها ~1.5 إطار/ثانية ──
+    #    قِيس: الطرفان يبثّان كل 2ث ⇒ نجا ثلث الأطر. وكنا نُحمّل القناة
+    #    ~4.5 إطار/ث (أمر 2 + إقرار 2 + تيليمتري 0.5) = 300% من سعتها،
+    #    والتأخير الذي يشكو منه المشغّل نصفه إعادة إرسال بسبب التصادم.
+    m6 = FakeMission()
+    clk6 = FakeClock()
+    mc7 = ManualControl(m6, clock=clk6)
+    mc7.set_enabled(True)
+    link6 = LoRaLink(m6, mc7, enabled=False, clock=clk6)
+    n0 = len(link6._tx_recent)
+    for i in range(8):                       # ضغطة مستمرة: 8 تكرارات
+        clk6.advance(0.5)
+        link6.handle_line(encode_command(i + 1, "FWD", 0.3), now=clk6.t)
+    acks = len(link6._tx_recent) - n0
+    check("🔴 تكرار الزرّ المضغوط لا يولّد إقراراً لكل إطار",
+          acks <= 3 and link6.acks_suppressed >= 5,
+          f"{acks} إقرارات لـ8 أوامر · كُتم {link6.acks_suppressed}")
+
+    m6.reactive.decision = {"action": "stop", "speed": 0.0, "priority": "ir",
+                            "rung": "ir_both", "reason": "عائق أمامي",
+                            "unknown": []}
+    n1 = len(link6._tx_recent)
+    clk6.advance(0.5)
+    link6.handle_line(encode_command(20, "FWD", 0.3), now=clk6.t)
+    check("🔴 وأول رفض SAFE بعد سلسلة OK يصل **فوراً** (الرفض لا يُكتم)",
+          len(link6._tx_recent) == n1 + 1,
+          "تغيّر الرمز يكسر الكتم")
+    m6.reactive.decision = {"action": "go", "speed": 0.4, "priority": "clear",
+                            "rung": "≥100سم", "reason": "سالك", "unknown": []}
+    n2 = len(link6._tx_recent)
+    clk6.advance(0.2)
+    link6.handle_line(encode_command(21, "ESTOP"), now=clk6.t)
+    check("🔴 و ESTOP يُقرّ دائماً مهما تقارب (المشغّل ينتظر تأكيد التوقف)",
+          len(link6._tx_recent) == n2 + 1)
+
+    # التعارض الذي لا يظهر إلا بجمع التحسينين: كتم الإقرارات + صمت
+    # التيليمتري ⇒ صفر إطار وارد ⇒ الشاشة تُعلن «NO LINK» والروبوت يسير.
+    m7 = FakeMission()
+    clk7 = FakeClock()
+    mc8 = ManualControl(m7, clock=clk7)
+    mc8.set_enabled(True)
+    link7 = LoRaLink(m7, mc8, enabled=False, clock=clk7)
+    worst = 0.0
+    last_out = clk7.t
+    for i in range(40):                      # ضغط مستمر 20 ثانية
+        clk7.advance(0.5)
+        before = len(link7._tx_recent)
+        link7.handle_line(encode_command(i + 1, "FWD", 0.3), now=clk7.t)
+        link7._maybe_send_telemetry(clk7.t)
+        if len(link7._tx_recent) > before:
+            worst = max(worst, clk7.t - last_out)
+            last_out = clk7.t
+    worst = max(worst, clk7.t - last_out)
+    check("🔴 ولا تصمت القناة فوق 3ث أبداً — لا «NO LINK» كاذبة أثناء القيادة",
+          worst <= 3.05, f"أطول صمت {worst:.1f}ث (حدّ الشاشة 8ث)")
+    check("والتيليمتري تنحّى فعلاً للأوامر (لم يُلغَ بل أُجّل)",
+          link7.telem_held > 0, f"أُجّل {link7.telem_held} مرة")
 
     # ── 🔴 كسر حلقة الصدى (عطل مقاس 2026-08-06) ──────────────────
     # العتاد أعاد كل ما يُرسل، وكان الرد بإقرار على كل إطار مرفوض يولّد

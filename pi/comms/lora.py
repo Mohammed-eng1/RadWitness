@@ -32,11 +32,23 @@ from collections import deque
 from pi.comms.control import ManualControl, SOURCE_RADIO
 from pi.comms.protocol import (
     ProtocolError, SequenceGuard, decode_command, encode_ack, encode_telemetry,
-    parse_frame, ACK_BADCRC, ACK_BADCMD, ACK_BADSEQ, CMD_STATUS,
+    parse_frame, ACK_BADCRC, ACK_BADCMD, ACK_BADSEQ, ACK_OK,
+    CMD_STATUS, CMD_STOP, CMD_ESTOP,
 )
 from pi.config import (
     LORA_ENABLED, LORA_PORT, LORA_BAUD, LORA_TELEMETRY_PERIOD_S,
 )
+
+# ⚠ هذه الثوابت **مكانها `pi/config.py`** (قاعدة: لا أرقام مبعثرة) — وهي
+#   هنا مؤقتاً لأن ذلك الملف خارج نطاق هذه الجلسة (شجرة مشتركة). تُنقل
+#   بطلب المستخدم. القيم مشتقة من قياس هذا الأسبوع لا من تخمين:
+#   الطرفان يبثّان كل 2ث ⇒ نجا ثلث الأطر ⇒ إشغال القناة ~0.67ث لكل إطار
+#   عند S3، أي سعة عملية ~1.5 إطار/ثانية. وكنا نُحمّلها ~4.5 إطار/ثانية.
+LORA_SERIAL_TIMEOUT_S = 0.05    # نافذة القراءة: كانت 0.3 فتؤخّر الإقرار
+LORA_ACK_MIN_GAP_S = 1.5        # لا إقرار OK مكرَّر أسرع من ذلك
+LORA_TELEM_HOLDOFF_S = 1.0      # اصمت بعد أمر وارد: نصف ازدواج
+LORA_TELEM_MAX_SILENCE_S = 3.0  # 🔴 لكن لا تصمت أكثر — الشاشة تُعلن الوصلة
+                                #    ميتة بعد 8ث بلا إطار وارد أياً كان نوعه
 
 # ⚠ استيراد العتاد خلف try/except مع بديل معلن (يعمل على ويندوز بلا عتاد)
 try:
@@ -84,6 +96,12 @@ class LoRaLink:
         #    2473 إطاراً في دقائق، كلها مرفوضة، والقناة الهوائية مشوَّشة.
         self._tx_recent = deque(maxlen=32)   # (إطار مُرسَل، وقت إرساله)
         self.echoes = 0
+        # ── ضبط الهواء: القناة نصف مزدوجة وسعتها ~1.5 إطار/ث ──────
+        self._last_rx_cmd_ts = 0.0    # آخر أمر وارد — نصمت بعده لحظة
+        self._last_ack_code = None    # لا نكرّر إقرار OK نفسه بلا داعٍ
+        self._last_ack_ts = 0.0
+        self.acks_suppressed = 0      # يُعرض: كم إطاراً وفّرناه من الهواء
+        self.telem_held = 0
 
     # ── دورة الحياة ─────────────────────────────────────────────
     def start(self) -> dict:
@@ -97,7 +115,11 @@ class LoRaLink:
         if self._thread is not None and self._thread.is_alive():
             return self.state()
         try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.3)
+            # ⚠ نافذة القراءة قصيرة عمداً: `read(64)` يحجب حتى تمتلئ 64 بايتاً
+            #    أو تنتهي المهلة، وإطارنا 20 بايتاً فلا يملؤها أبداً ⇒ كل
+            #    قراءة كانت تحرق بقية الـ0.3ث قبل أن يُبنى الإقرار.
+            self._ser = serial.Serial(self.port, self.baud,
+                                      timeout=LORA_SERIAL_TIMEOUT_S)
             self.ok, self.error = True, None
         except Exception as e:                       # noqa: BLE001
             self.ok = False
@@ -221,16 +243,36 @@ class LoRaLink:
             self._log("lora_seq", self.seq_guard.last_reason)
 
         # ٤) البوابة (طبقة السلامة فوق أمر الراديو)
+        self._last_rx_cmd_ts = now          # ابدأ نافذة صمت التيليمتري
         res = self.control.command(cmd.cmd, power=(cmd.p1 or None),
                                    source=SOURCE_RADIO, now=now)
         self._bad_streak = 0
         self._last_bad_reason = ""
         if res.get("ok"):
             self.commands_ok += 1
-        self._send(encode_ack(cmd.seq, res.get("ack", "OK")))
+        self._send_ack(cmd, res.get("ack", "OK"), now)
         if cmd.cmd == CMD_STATUS:
             self._send_telemetry(now)
         return res
+
+    def _send_ack(self, cmd, code: str, now: float) -> None:
+        """
+        🔴 إقرار **لكل ما يهمّ**، وصمت عن التكرار العقيم.
+
+        الزرّ المضغوط يعيد أمره مرات في الثانية، وكل إقرار OK مطابق يسرق
+        من الهواء ما تحتاجه ضغطة الطوارئ التالية. فلا يُكتم إلا إقرار
+        **OK مكرَّر لأمر غير طارئ** داخل نافذة قصيرة. ويبقى مضموناً:
+          - ESTOP و STOP: يُقرّان دائماً (المشغّل ينتظر تأكيد التوقف).
+          - أي رمز غير OK (SAFE · BUSY · FAULT · BADSEQ): رفضٌ لا يُبتلع.
+          - أي **تغيّر** في الرمز: أول SAFE بعد سلسلة OK يصل فوراً.
+        """
+        always = (cmd.cmd in (CMD_ESTOP, CMD_STOP) or code != ACK_OK
+                  or code != self._last_ack_code)
+        if not always and (now - self._last_ack_ts) < LORA_ACK_MIN_GAP_S:
+            self.acks_suppressed += 1
+            return
+        self._last_ack_code, self._last_ack_ts = code, now
+        self._send(encode_ack(cmd.seq, code))
 
     def _bad(self, ack: str, reason: str, seq: int = 0,
              send_ack: bool = True) -> dict:
@@ -269,9 +311,25 @@ class LoRaLink:
             self.error = f"تعذّر الإرسال: {e}"
 
     def _maybe_send_telemetry(self, now: float = None) -> None:
+        """
+        🔴 التيليمتري يتنحّى للأوامر — بأرضية صلبة تمنع كذبة «لا وصلة».
+
+        القناة نصف مزدوجة: بثّ الروبوت يُصمّه عن ضغطة المشغّل. فبعد كل أمر
+        وارد نصمت لحظة كي يمرّ الأمر التالي وإقراره بلا تصادم.
+
+        ⚠ والأرضية إلزامية لا تحسين: الشاشة تُعلن الوصلة ميتة بعد 8ث بلا
+        **أي** إطار وارد، وكتم الإقرارات المكرَّرة يجري بالتوازي — فلولا
+        هذا السقف لأنتج ضغطٌ مستمرّ لعشر ثوانٍ شاشةَ «NO LINK» والروبوت
+        يسير تحت أمر المشغّل نفسه. (تعارضٌ لا يظهر إلا بجمع التحسينين.)
+        """
         now = self._clock() if now is None else now
-        if (now - self._last_tx) >= LORA_TELEMETRY_PERIOD_S:
-            self._send_telemetry(now)
+        if (now - self._last_tx) < LORA_TELEMETRY_PERIOD_S:
+            return
+        busy = (now - self._last_rx_cmd_ts) < LORA_TELEM_HOLDOFF_S
+        if busy and (now - self._last_tx) < LORA_TELEM_MAX_SILENCE_S:
+            self.telem_held += 1
+            return
+        self._send_telemetry(now)
 
     def _send_telemetry(self, now: float = None) -> str:
         now = self._clock() if now is None else now
@@ -300,6 +358,9 @@ class LoRaLink:
             # سبب آخر رفض — رقم «مرفوضة» العاري بلا سببه نصف معلومة
             "last_reject": self._last_bad_reason,
             "reject_streak": self._bad_streak,
+            # ضبط الهواء: كم إطاراً وُفّر (تشخيص ازدحام القناة)
+            "acks_suppressed": self.acks_suppressed,
+            "telem_held": self.telem_held,
             "last_frame": self.last_frame,
             "last_rx_ts": self.last_rx_ts,
             "seq": self.seq_guard.state(),
