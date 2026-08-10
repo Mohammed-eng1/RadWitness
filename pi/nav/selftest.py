@@ -719,30 +719,94 @@ def main() -> int:
 
     from pi.config import INA219_SHUNT_OHM as _SH, INA219_CURRENT_LSB_V as _LSB
     _shunt_pos = int(round(0.54 * _SH / _LSB))    # نفس القراءة المقاسة حيّاً
-    _sv_sign = _ina.INA219_CURRENT_SIGN
-    try:
-        _ina.INA219_CURRENT_SIGN = 0          # غير معايرة (الحالة الراهنة)
-        r0 = reader_amps(_shunt_pos).read()
-        check("🔴 إشارة غير معايرة ⇒ **لا يُدّعى شحن** والحالة تُعلَن مجهولة",
-              r0["charging"] is False and r0["charging_unknown"] is True
-              and r0["amps"] is None and r0["amps_raw"] is not None,
-              f"خام {r0['amps_raw']:+.2f}A · الاتجاه مجهول")
-        check("والقدرة تُحسب من المطلق (لا تحتاج إشارة أصلاً)",
-              r0["watts"] is not None and r0["watts"] > 0)
-        _ina.INA219_CURRENT_SIGN = -1         # الموجب = تفريغ
-        rm = reader_amps(_shunt_pos).read()
-        check("وبإشارة -1 يصير نفس الخام **تفريغاً** لا شحناً",
-              rm["charging"] is False and rm["amps"] < 0
-              and rm["charging_unknown"] is False,
-              f"{rm['amps']:+.2f}A")
-        _ina.INA219_CURRENT_SIGN = +1         # الموجب = شحن
-        rp = reader_amps(_shunt_pos).read()
-        check("وبإشارة +1 يصير شحناً (الفرق كله في ثابت مقاس)",
-              rp["charging"] is True and rp["amps"] > 0, f"{rp['amps']:+.2f}A")
-    finally:
-        _ina.INA219_CURRENT_SIGN = _sv_sign
+    r0 = reader_amps(_shunt_pos).read()
+    check("🔴 قارئ INA219 **لا يحكم بالشحن إطلاقاً** (الشنت على مسار الحِمل)",
+          "charging" not in r0 and r0["load_a"] is not None,
+          f"تيار حِمل {r0['load_a']:.2f}A — بلا اتجاه")
+    check("والقدرة من المطلق (لا تحتاج إشارة أصلاً)",
+          r0["watts"] is not None and r0["watts"] > 0, f"{r0['watts']}W")
 
-    # (أثر الإشارة على طبقة الإطفاء يُختبر بعد تعريف `shutdown_mission` أدناه)
+    # 🔴 كاشف الشحن من **ميل الجهد** — البديل الوحيد على هذا العتاد
+    from pi.config import BATT_CHARGE_QUIET_S as _QUIET
+    _Q = _QUIET + 10.0                    # «ساكن منذ وقت طويل»
+    _cd = _b.ChargeDetector()
+    _t = 1000.0
+    check("نافذة غير مكتملة ⇒ **مجهول** لا «لا يشحن»",
+          _cd.feed(_t, 11.9, _Q) is False and _cd.state()["unknown"] is True,
+          _cd.reason)
+    # شحن بالمعدّل المقاس فعلياً (+90 mV/دقيقة) لمدة تتجاوز النافذة
+    for i in range(1, 121):
+        _cd.feed(_t + i * 0.5, 11.90 + (i * 0.5) * (0.090 / 60.0), _Q)
+    check("🔴 شحن حقيقي (+90 mV/دقيقة كما قِيس) يُكشف بلا إشارة تيار",
+          _cd.charging is True and _cd.state()["unknown"] is False,
+          _cd.reason)
+    _cd2 = _b.ChargeDetector()
+    for i in range(1, 121):                    # تفريغ ساكن بطيء
+        _cd2.feed(_t + i * 0.5, 11.90 - (i * 0.5) * (0.010 / 60.0), _Q)
+    check("وتفريغ ساكن بطيء لا يُقرأ شحناً", not _cd2.charging, _cd2.reason)
+    _cd3 = _b.ChargeDetector()                 # ضجيج بلا اتجاه (σ≈14mV مقاسة)
+    _noise = [0.014, -0.011, 0.008, -0.014, 0.012, -0.006, 0.013, -0.012]
+    for i in range(1, 121):
+        _cd3.feed(_t + i * 0.5, 11.90 + _noise[i % len(_noise)], _Q)
+    check("والضجيج المقاس (σ≈14mV) لا يصنع شحناً كاذباً",
+          not _cd3.charging, _cd3.reason)
+
+    # 🔴 الشَرَك الحقيقي: **ارتداد الجهد بعد رفع الحمل** يرتفع كالشحن
+    _cd4 = _b.ChargeDetector()
+    for i in range(1, 121):                    # نافذة شحن مكتملة أولاً
+        _cd4.feed(_t + i * 0.5, 11.90 + (i * 0.5) * (0.090 / 60.0), _Q)
+    _was = _cd4.charging
+    _cd4.feed(_t + 61.0, 11.60, 0.0)           # أمر حركة الآن (سكون = 0)
+    check("🔴 أي حركة **تمسح النافذة** (لا تُخاط عبرها)",
+          _was and not _cd4.charging and _cd4.state()["samples"] == 0,
+          "ارتداد ما بعد الحمل يرتفع كالشحن تماماً")
+    # وارتداد سريع خلال فترة السكون لا يُقبل أصلاً
+    _cd5 = _b.ChargeDetector()
+    for i in range(1, 60):
+        _cd5.feed(_t + i * 0.5, 11.60 + i * 0.004, 2.0)   # سكون 2ث ≪ الحدّ
+    check("وعيّنات ما قبل انقضاء السكون تُهمَل كلها",
+          _cd5.state()["samples"] == 0 and not _cd5.charging)
+
+    # 🔴 الفحص الحاسم: **منحنى ارتداد أُسّي حقيقي** بعد رفع الحمل — أخطر
+    #    شبيه بالشحن على الإطلاق، ويقع بالضبط حين يُركن الروبوت بعد مهمة
+    #    منهِكة (أي عند أدنى جهد، حيث يهمّ إعفاء الإطفاء فعلاً).
+    def _rebound_charging(tau_s, quiet_s, drop_v=0.30):
+        """
+        V(t) = V∞ − ΔV·exp(−t/τ) — استرخاء الحزمة بعد رفع الحمل.
+        `quiet_s` = حدّ السكون المطبَّق (يُحقن ليُقارَن القديم بالحالي).
+        """
+        _sv = _b.BATT_CHARGE_QUIET_S
+        try:
+            _b.BATT_CHARGE_QUIET_S = quiet_s
+            d = _b.ChargeDetector()
+            for i in range(0, 361):           # 180ث من العيّنات كل 0.5ث
+                t_since_stop = quiet_s + i * 0.5
+                v = 9.90 - drop_v * math.exp(-t_since_stop / tau_s)
+                d.feed(_t + i * 0.5, v, t_since_stop)
+                if d.charging:
+                    return True, d.reason
+            return False, d.reason
+        finally:
+            _b.BATT_CHARGE_QUIET_S = _sv
+    _rb8, _why8 = _rebound_charging(90.0, 8.0)
+    check("🔴 وحدّ سكون 8ث **كان يقرأ الارتداد شحناً** (لهذا صار 180)",
+          _rb8 is True, f"τ=90ث ⇒ {_why8}")
+    _rb180, _why180 = _rebound_charging(90.0, _QUIET)
+    check("🔴 وبالحدّ الفعلي يسقط الارتداد بالشرطين معاً (لا إعفاء كاذب)",
+          _rb180 is False, f"τ=90ث بعد {_QUIET:.0f}ث ⇒ {_why180}")
+    for _tau in (20.0, 40.0, 60.0):
+        _rb, _w = _rebound_charging(_tau, _QUIET)
+        check(f"وكذلك عند τ={_tau:.0f}ث (مدى ثوابت الزمن المعقولة)",
+              _rb is False, _w)
+    # ومع ذلك الشحن الحقيقي بعد السكون نفسه يُكشف — الحدّ لم يُعطّل الميزة
+    _cd6 = _b.ChargeDetector()
+    for i in range(1, 241):
+        _cd6.feed(_t + i * 0.5, 11.90 + (i * 0.5) * (0.090 / 60.0),
+                  _QUIET + i * 0.5)
+    check("والشحن الحقيقي يُكشف بعد انقضاء السكون (الحدّ لم يقتل الميزة)",
+          _cd6.charging is True, _cd6.reason)
+
+    # (أثر ادّعاء الشحن على طبقة الإطفاء يُختبر بعد `shutdown_mission` أدناه)
 
     # الجسر: المصدر معلَن، وتجاوز المحاكاة يبقى عاملاً
     br_v = WaveRoverBridge(mode="sim")
@@ -806,7 +870,7 @@ def main() -> int:
     ms_c = shutdown_mission()
     feed(ms_c, dict(base, charging=True), BATT_SHUTDOWN_CONSECUTIVE + 2)
     check("قيد الشحن ⇒ **لا إطفاء** (الجهد أثناء الشحن مضلّل)",
-          not ms_c.fired, f"تيار > {INA219_CHARGING_A}A")
+          not ms_c.fired, "الشحن مؤكَّد بميل الجهد")
     ms_x = shutdown_mission()
     feed(ms_x, dict(base, source="sim_override"), BATT_SHUTDOWN_CONSECUTIVE + 2)
     check("🔴 مصدر غير INA219 ⇒ لا إطفاء (لا نُطفئ جهازاً على رقم غير مقيس)",
@@ -819,9 +883,20 @@ def main() -> int:
     ms_unk = shutdown_mission()
     feed(ms_unk, dict(base, charging=False, charging_unknown=True),
          BATT_SHUTDOWN_CONSECUTIVE)
-    check("🔴 إشارة تيار مجهولة **لا تُعطّل** الإطفاء (الفشل نحو الأمان)",
+    check("🔴 شحن مجهول (نافذة الميل لم تكتمل) **لا يُعطّل** الإطفاء",
           bool(ms_unk.fired),
           "ادّعاء شحن بلا دليل كان سيقتل الطبقة الرابعة بلا أثر")
+
+    # 🔴 والحالة الواقعية: الروبوت يتحرّك ⇒ النافذة ممسوحة دائماً ⇒ الإطفاء
+    #    مسلَّح طوال المهمة. وهذا هو السلوك المطلوب حرفياً.
+    br_mv = WaveRoverBridge(mode="sim")
+    br_mv._moving = True
+    for i in range(140):
+        br_mv._feed_charge_detector(11.90 + i * 0.001)   # صعود حادّ متعمَّد
+    check("🔴 وأثناء الحركة لا يُدّعى شحن مهما صعد الجهد (النافذة ممسوحة)",
+          br_mv.battery_charging is False
+          and br_mv.charge_detector.state()["samples"] == 0,
+          "صعود 140mV أثناء الحركة لم يُقرأ شحناً")
     ms_chg = shutdown_mission()
     feed(ms_chg, dict(base, charging=True, charging_unknown=False),
          BATT_SHUTDOWN_CONSECUTIVE + 2)

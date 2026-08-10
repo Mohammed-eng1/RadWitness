@@ -32,8 +32,7 @@ import threading
 from pi.config import (
     INA219_ADDR, INA219_I2C_BUS, INA219_CONFIG_VALUE, INA219_LSB_V,
     INA219_MIN_PLAUSIBLE_V, INA219_MAX_PLAUSIBLE_V,
-    INA219_SHUNT_OHM, INA219_CURRENT_LSB_V, INA219_CHARGING_A,
-    INA219_CURRENT_SIGN,
+    INA219_SHUNT_OHM, INA219_CURRENT_LSB_V, INA219_CURRENT_SIGN,
 )
 
 try:
@@ -141,19 +140,16 @@ class INA219Reader:
         amps = (None if raw_a is None or not INA219_CURRENT_SIGN
                 else raw_a * INA219_CURRENT_SIGN)
         self.last_a = amps if amps is not None else raw_a
-        # 🔴 «قيد الشحن» ليس زينة: الجهد أثناء الشحن **مضلّل**، ولهذا يُعفى
-        #    من الإطفاء المنظَّم. وهذا بالضبط ما يجعل ادّعاءه بلا دليل
-        #    خطراً: إشارة معكوسة تجعل تفريغ الراسبري العادي يُقرأ «شحناً»
-        #    ⇒ **الإطفاء لا يُطلق أبداً**. فبلا معايرة لا يُدّعى شحن أصلاً.
-        unknown = not INA219_CURRENT_SIGN
+        # 🔴 **لا يُحكَم بالشحن من هنا إطلاقاً** (مقاس 2026-08-11): الشنت على
+        #    مسار الحِمل، فالتيار سحب الراسبري ولا يصير سالباً مهما كانت
+        #    الحالة — وُصل الشاحن فقفز الجهد 180mV والتيار لم يتغيّر.
+        #    الحكم من **ميل الجهد** في `battery.ChargeDetector`.
         return {"v": v, "ok": True, "ovf": False, "cnvr": cnvr, "raw": raw,
-                "amps": amps,
-                "amps_raw": raw_a,          # الخام دائماً — لأداة المعايرة
-                "charging": (not unknown and amps is not None
-                             and amps > INA219_CHARGING_A),
-                "charging_unknown": bool(unknown and raw_a is not None),
+                "amps": amps,               # موقّع فقط إن عُوير (وهنا لا)
+                "amps_raw": raw_a,          # الخام = **تيار الحِمل** (مقدار)
+                "load_a": (abs(raw_a) if raw_a is not None else None),
                 "watts": (round(v * abs(raw_a), 2) if raw_a is not None
-                          else None),       # القدرة من المطلق — لا تحتاج إشارة
+                          else None),
                 "reason": None}
 
     def _read_amps(self):

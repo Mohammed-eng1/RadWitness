@@ -16,6 +16,8 @@ from pi.config import (
     BATT_EXCELLENT_V, BATT_GOOD_V, BATT_LOW_V, BATT_CRITICAL_V,
     BATT_FULL_V, BATT_EMPTY_V, BATT_CELLS, CALIB_VOLTAGE_DELTA_WARN,
     BATT_CURVE, BATT_R_INTERNAL_OHM, BATT_SHUTDOWN_V,
+    BATT_CHARGE_WINDOW_S, BATT_CHARGE_MIN_SPAN_S, BATT_CHARGE_MIN_SAMPLES,
+    BATT_CHARGE_SLOPE_MV_MIN, BATT_CHARGE_MIN_RISE_MV, BATT_CHARGE_QUIET_S,
 )
 
 # (الإجراء، الاسم، اللون)
@@ -44,6 +46,89 @@ def percent(v: float, amps: float = None) -> int:
         if v2 <= vv <= v1:
             return int(round(p2 + (vv - v2) * (p1 - p2) / (v1 - v2)))
     return 0
+
+
+class ChargeDetector:
+    """
+    🔴 يكشف الشحن من **ميل الجهد** — لا من إشارة التيار.
+
+    السبب مقاس لا مفترض (2026-08-11): شنت INA219 على هذه اللوحة يقع على
+    **مسار الحِمل**. وُصل الشاحن في منتصف مراقبة 120ث فقفز الجهد
+    11.92→12.10V و**التيار لم يتغيّر** (0.505–0.621 قبله · 0.495–0.615
+    بعده). فهو يقرأ سحب الراسبري لا تيار الحزمة، ولا يصير سالباً أبداً ⇒
+    اتجاه الشحن **غير مستخرَج منه أصلاً**.
+
+    والميل مرجع مستقل: الشحن قِيس **+90 mV/دقيقة** مستمرة، والتفريغ الساكن
+    عند 4.0V/خلية بضعة ملّي-فولت سالبة. فصل واسع.
+
+    🔴 **يفشل نحو الأمان بالبناء**: `charging` يُعفي من الإطفاء المنظَّم،
+    وحِمل المحركات يُنزل الجهد — فأقصى ما يفعله الضجيج أن يمنع ادّعاء
+    الشحن، فتبقى الطبقة الرابعة مسلَّحة. العكس (ادّعاء شحن كاذب) هو الخطر،
+    ولذلك كل شروطه مجتمعة لا أيّها.
+
+    ⚠ وأخطر شَرَك: **ارتداد الجهد بعد رفع الحمل** يرتفع تماماً كالشحن
+    (الحزمة تسترخي فتستعيد 0.2–0.3V). لهذا تُهمَل كل عيّنة قبل مرور
+    `BATT_CHARGE_QUIET_S` على آخر أمر حركة، و**أي حركة تمسح النافذة
+    كاملة** — لا تُرمَّم بعيّنات ما قبل الحركة.
+
+    أداة داخلية: يُغذّيها `WaveRoverBridge.voltage()` وتُقرأ في
+    `battery_state()`.
+    """
+
+    def __init__(self):
+        self._pts = []             # [(t, v)] داخل النافذة، بعد السكون فقط
+        self.slope_mv_min = None   # الميل المحسوب أو None (لا يكفي بعد)
+        self.charging = False
+        self.reason = "لا عيّنات بعد"
+
+    def reset(self, why: str = "حركة — النافذة مُسحت") -> None:
+        self._pts.clear()
+        self.slope_mv_min = None
+        self.charging = False
+        self.reason = why
+
+    def feed(self, t: float, v: float, quiet_for_s: float) -> bool:
+        """يضيف عيّنة ويُعيد `charging`. `quiet_for_s` = منذ آخر أمر حركة."""
+        if v is None:
+            return self.charging
+        if quiet_for_s < BATT_CHARGE_QUIET_S:
+            # ⚠ المسح لا الإهمال: عيّنات ما قبل الحركة + ارتداد ما بعدها
+            #   يصنعان ميلاً صاعداً كاذباً لو خُيّطت النافذة عبر الحركة.
+            self.reset()
+            return False
+        self._pts.append((float(t), float(v)))
+        cutoff = t - BATT_CHARGE_WINDOW_S
+        while self._pts and self._pts[0][0] < cutoff:
+            self._pts.pop(0)
+        n = len(self._pts)
+        span = self._pts[-1][0] - self._pts[0][0] if n > 1 else 0.0
+        if n < BATT_CHARGE_MIN_SAMPLES or span < BATT_CHARGE_MIN_SPAN_S:
+            self.slope_mv_min = None
+            self.charging = False
+            self.reason = (f"نافذة غير مكتملة ({n} عيّنة · {span:.0f}ث) — "
+                           f"الشحن **مجهول** لا منفيّ")
+            return False
+        # انحدار خطي (أقل المربعات) — لا فرق طرفين: قفزة واحدة تخدعه
+        mt = sum(p[0] for p in self._pts) / n
+        mv = sum(p[1] for p in self._pts) / n
+        num = sum((p[0] - mt) * (p[1] - mv) for p in self._pts)
+        den = sum((p[0] - mt) ** 2 for p in self._pts)
+        slope = (num / den) if den > 1e-9 else 0.0        # V/ث
+        self.slope_mv_min = round(slope * 60000.0, 1)
+        rise_mv = (self._pts[-1][1] - self._pts[0][1]) * 1000.0
+        # 🔴 الشرطان **معاً**: الميل وحده يمرّره ضجيج منحاز، والارتفاع
+        #    الصافي وحده تمرّره قفزة واحدة ثم استواء.
+        self.charging = (self.slope_mv_min >= BATT_CHARGE_SLOPE_MV_MIN
+                         and rise_mv >= BATT_CHARGE_MIN_RISE_MV)
+        self.reason = (f"ميل {self.slope_mv_min:+.0f} mV/دقيقة · ارتفاع "
+                       f"{rise_mv:+.0f} mV خلال {span:.0f}ث")
+        return self.charging
+
+    def state(self) -> dict:
+        return {"charging": self.charging, "slope_mv_min": self.slope_mv_min,
+                "samples": len(self._pts), "reason": self.reason,
+                # «مجهول» ≠ «لا يشحن»: النافذة لم تكتمل بعد (§6.1)
+                "unknown": self.slope_mv_min is None}
 
 
 def cell_voltage(v: float) -> float:

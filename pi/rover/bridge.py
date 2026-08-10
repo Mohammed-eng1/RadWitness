@@ -164,9 +164,10 @@ class WaveRoverBridge:
         self.voltage_reason = None
         self.battery_amps = None
         self.battery_charging = False
-        # إشارة التيار غير معايرة ⇒ الشحن **مجهول** لا منفيّ (§6.1)
-        self.battery_charging_unknown = False
+        # الشحن يُكشف من **ميل الجهد** — الشنت على مسار الحِمل (config §INA219)
+        self.battery_charging_unknown = True
         self.battery_amps_raw = None
+        self.charge_detector = batt.ChargeDetector()
         self._sim_v_override = False
         # صحّة وصلة السيريال — **حالة معلنة لا استثناء منتشر** (انظر `_send`)
         self.link_ok = True
@@ -550,14 +551,17 @@ class WaveRoverBridge:
             if r["v"] is not None:
                 self.voltage_source, self.voltage_reason = self.VSRC_INA, None
                 self.battery_amps = r.get("amps")
-                self.battery_charging = bool(r.get("charging"))
-                # ⚠ «مجهول» ≠ «لا يشحن»: تُعرض ⚡؟ لا ⚡ ولا فراغ (§6.1)
-                self.battery_charging_unknown = bool(r.get("charging_unknown"))
                 self.battery_amps_raw = r.get("amps_raw")
+                # 🔴 الشحن من **ميل الجهد** لا من التيار: الشنت على مسار
+                #    الحِمل فلا يحمل اتجاهاً (مقاس — config §INA219).
+                self._feed_charge_detector(r["v"])
                 return r["v"]
             self.voltage_reason = r["reason"]
         self.battery_amps, self.battery_charging = None, False
-        self.battery_charging_unknown, self.battery_amps_raw = False, None
+        # بلا جهد لا ميل ⇒ الشحن **مجهول** لا منفيّ، والنافذة تُمسح
+        self.battery_amps_raw = None
+        self.charge_detector.reset("لا قراءة جهد — الشحن مجهول")
+        self.battery_charging_unknown = True
         v = self.last_status.get("v")
         if v is not None:
             self.voltage_source = self.VSRC_ROVER
@@ -566,6 +570,21 @@ class WaveRoverBridge:
         if self.voltage_reason is None:
             self.voltage_reason = "لا INA219 ولا حقل v في رسالة الروفر"
         return None
+
+    def _feed_charge_detector(self, v) -> None:
+        """
+        يغذّي كاشف الشحن بالجهد **ومدّة السكون منذ آخر أمر حركة**.
+
+        ⚠ السكون ليس تفصيلاً: ارتداد الجهد بعد رفع الحمل (0.2–0.3V خلال
+        ثوانٍ) يرتفع تماماً كالشحن، ولولا هذا الشرط لادّعى النظام شحناً
+        بعد كل توقّف — وادّعاء الشحن **يُعفي من الإطفاء المنظَّم**.
+        """
+        quiet = (0.0 if self._moving
+                 else max(0.0, time.time() - self._last_cmd_ts))
+        self.battery_charging = self.charge_detector.feed(
+            time.time(), v, quiet)
+        self.battery_charging_unknown = bool(
+            self.charge_detector.state()["unknown"])
 
     def _ina(self):
         """قارئ INA219 المشترك — يُهيَّأ كسولاً ولا يُسقط الجسر إن غاب."""
@@ -596,6 +615,8 @@ class WaveRoverBridge:
         info["charging"] = self.battery_charging
         info["charging_unknown"] = self.battery_charging_unknown
         info["amps_raw"] = self.battery_amps_raw
+        # الدليل نفسه لا الحكم وحده — «يشحن» بلا ميل معروض ادّعاء بلا سند
+        info["charge"] = self.charge_detector.state()
         ina = self._ina_reader if self._ina_reader not in (None, False) else None
         info["ina219"] = ina.state() if ina is not None else None
         return info

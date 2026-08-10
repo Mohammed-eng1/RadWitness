@@ -1419,7 +1419,9 @@ function apply(st){
     ? b.v.toFixed(2)+"V · " + (b.percent||0) + "%"
       + (b.charging ? " ⚡" : (b.charging_unknown ? " ⚡؟" : ""))
     : "جهد مجهول";
-  $("#tBatt").title = (b.text || "") + (b.source_reason ? " — " + b.source_reason : "");
+  // الدليل في التلميح: «يشحن» بلا ميل معروض ادّعاء بلا سند
+  $("#tBatt").title = (b.text || "") + (b.source_reason ? " — " + b.source_reason : "")
+    + (b.charge && b.charge.reason ? " · الشحن: " + b.charge.reason : "");
   $("#dBatt").style.background = b.color || "#8a93a6";
   $("#cState").textContent = (st.ui_mode ? st.ui_mode.mode_ar : "") + " · " + (st.state || "—");
 
