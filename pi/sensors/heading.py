@@ -497,6 +497,18 @@ class MPU6050GyroHeading(HeadingSource):
         v = self.mpu.gyro_z_dps()
         return None if v is None else self.sign * float(v)
 
+    def _try_recover(self):
+        """
+        🔴 يفوّض الإحياء إلى قارئ MPU (يسأل الشريحة ثم يوقظها من السكون).
+
+        كان **مفقوداً كلياً** حتى 2026-08-10 — بينما يملكه مصدرا BNO055
+        التالفة! فكان «الصفر المضبوط» على MPU طريقاً بلا رجعة يُجهض المهمة،
+        رغم أن سببه الأشيع (سكون بعد إعادة تشغيل ذاتية من هبوط جهد المحركات)
+        علاجه سطر إيقاظ واحد.
+        """
+        rec = getattr(self.mpu, "recover", None)
+        return rec() if callable(rec) else None
+
     def state(self) -> dict:
         st = super().state()
         st["sensor"] = self.mpu.state() if self.mpu else None

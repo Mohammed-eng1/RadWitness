@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import struct
 import threading
+import time
 
 from pi.config import (
     MPU6050_ADDR, MPU6050_I2C_BUS, MPU6050_GYRO_LSB, MPU6050_ACCEL_LSB,
@@ -95,6 +96,49 @@ class MPU6050Reader:
                           f"@ {hex(self.addr)}: {e} — تحقّق بـ"
                           f"`i2cdetect -y {self.bus_num}` (توقّع 0x68)")
             self._close_bus()
+
+    def recover(self) -> dict:
+        """
+        🔴 **اسأل الشريحة قبل إعلان الوفاة** (CLAUDE.md §1.1، بنسخة MPU).
+
+        عطل مقاس (2026-08-10): المهمة أُجهضت بـ«40 قراءة صفر مضبوط — الحسّاس
+        لا يرسل شيئاً (ميت؟)» بينما `i2cdetect -y 4` يُظهر 0x68 حاضراً. وهذا
+        بالضبط مكافئ عودة BNO055 إلى CONFIG: هبوط جهد 3.3V لحظي عند اندفاع
+        تيار المحركات يُعيد تشغيل الشريحة ذاتياً، فتُقلع في وضع **السكون**
+        (بت SLEEP في PWR_MGMT_1) وتردّ بهويتها ويقرأ الجايرو صفراً مضبوطاً
+        إلى الأبد. نفس بصمة الحسّاس الميت تماماً — وعلاجهما مختلف كلياً.
+
+        ⚠ الإحياء **لا يُعلَن إلا بقراءة تحقّق**: نُوقظ ثم نقرأ WHO_AM_I
+           وبت السكون فعلياً — نجاح الكتابة وحده ليس دليلاً (وهو الدرس
+           نفسه المحفور في مسار BNO055).
+        """
+        if self._bus is None:
+            return {"recovered": False, "detail": "لا ناقل مفتوح"}
+        with self._lock:
+            try:
+                who = self._bus.read_byte_data(self.addr, REG_WHO_AM_I)
+                pwr = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_1)
+                asleep = bool(pwr & 0x40)
+                if who != WHO_AM_I_VAL:
+                    return {"recovered": False,
+                            "detail": f"WHO_AM_I={hex(who)} ≠ "
+                                      f"{hex(WHO_AM_I_VAL)} — ليست MPU-6050"}
+                self._bus.write_byte_data(self.addr, REG_PWR_MGMT_1, 0)
+                time.sleep(0.05)
+                pwr2 = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_1)
+                if pwr2 & 0x40:
+                    return {"recovered": False,
+                            "detail": "الإيقاظ كُتب ولم يثبت (PWR_MGMT_1 "
+                                      f"={hex(pwr2)}) — تغذية 3.3V غير مستقرة"}
+                self.ok = True
+                self.error = None
+                return {"recovered": True,
+                        "detail": ("أُوقظت من **السكون** (إعادة تشغيل ذاتية — "
+                                   "هبوط جهد عند اندفاع المحركات)" if asleep
+                                   else "كانت مستيقظة؛ أُعيدت التهيئة")}
+            except Exception as e:    # noqa: BLE001
+                return {"recovered": False,
+                        "detail": f"الناقل لا يردّ: {e}"}
 
     def _close_bus(self) -> None:
         try:

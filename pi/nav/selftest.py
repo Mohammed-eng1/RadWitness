@@ -2101,6 +2101,44 @@ def main() -> int:
     check("وعلى جسر sim يبقى المصدر المحاكى مشروعاً (لا حجب زائفاً)",
           not any("محاكى" in b for b in ms_hd.mission_readiness()["blockers"]))
 
+    # ── 🔴 «صفر مضبوط» على MPU: إيقاظ من السكون لا إعلان وفاة ────────
+    # عطل مقاس 2026-08-10: المهمة أُجهضت بـ«40 قراءة صفر مضبوط — الحسّاس لا
+    # يرسل شيئاً (ميت؟)» و`i2cdetect` يُظهر 0x68 حاضراً. المسار كان مفقوداً
+    # كلياً لـMPU بينما يملكه مصدرا BNO055 **التالفة**.
+    from pi.sensors.heading import MPU6050GyroHeading as _MPUH
+
+    class _SleepyMPU:
+        """MPU نائمة: ترد بهويتها وتعيد أصفاراً مضبوطة حتى تُوقَظ."""
+        ok = True
+        error = None
+        def __init__(self): self.awake = False
+        def gyro_z_dps(self): return 12.0 if self.awake else 0.0
+        def state(self): return {"awake": self.awake}
+        def recover(self):
+            self.awake = True
+            return {"recovered": True, "detail": "أُوقظت من **السكون**"}
+
+    sleepy = _SleepyMPU()
+    hs_slp = _MPUH(sleepy, scale=1.0, sign=1)
+    for _ in range(60):
+        hs_slp.update()
+    check("🔴 صفر مضبوط على MPU **يوقظها** تلقائياً ولا يُعلَن عطلاً",
+          hs_slp.ok and sleepy.awake and hs_slp.recoveries >= 1,
+          f"إحياءات={hs_slp.recoveries} · مستيقظة={sleepy.awake} · "
+          f"ok={hs_slp.ok}")
+    check("وتفصيل الإحياء يسمّي السبب (سكون لا موت)",
+          "السكون" in ((hs_slp.last_recovery or {}).get("detail") or ""),
+          (hs_slp.last_recovery or {}).get("detail", ""))
+    hs_slp.update()
+    check("ويستأنف التكامل بعدها (لا عطل أبدي)", hs_slp.ok)
+    dead = _SleepyMPU()
+    dead.recover = lambda: {"recovered": False, "detail": "الناقل لا يردّ"}
+    hs_dead = _MPUH(dead, scale=1.0, sign=1)
+    for _ in range(60):
+        hs_dead.update()
+    check("وحسّاس لا يستجيب للإحياء يبقى عطلاً بسببه المقروء (لا تظاهر)",
+          not hs_dead.ok and not hs_dead.attempt_recovery()["recovered"])
+
     # ── 🔴 كاسر الانحشار: اللفّ على أرضية عالية الاحتكاك (سجاد/فرش) ──
     # عرَض مقاس 2026-08-10: «يرتجف ويلتفّ قليلاً ثم يقف». سببان مركّبان:
     # القوة 0.40 لا تكسر احتكاك الوبر، **والتهدئة تنزل بها إلى 0.25** قرب
