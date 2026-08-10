@@ -2263,6 +2263,13 @@ class MissionSim:
             # الكاميرا والدوران **اختياريان**: غيابهما يُبلَّغ ولا يُسقط المهمة
             x = self.dr.x if self.dr else 0.0
             y = self.dr.y if self.dr else 0.0
+            # ⚠ سطر **قبل** التوثيق لا بعده: التصوير ثم تحليل الرؤية أطول
+            #    مقطع صامت في المهمة (كاميرا + شبكة)، وبلا هذا السطر يبدو
+            #    أي تعليق فيه وكأن المهمة ماتت بلا سبب — والسجل ينتهي عند
+            #    «المرحلة ٦ توثيق» بلا حرف بعده (مقاس 2026-08-10).
+            self._log("documentation_start",
+                      f"اقتراب وتصوير عند ({x:.2f}, {y:.2f}) · "
+                      f"اتجاه {self.heading:.0f}°")
             self.documentation = run_documentation(
                 rep, robot_xy=(x, y), robot_heading_deg=self.heading,
                 camera=self.camera, turn_fn=self._doc_turn_fn())

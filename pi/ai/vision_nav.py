@@ -34,9 +34,11 @@ import importlib.util
 import io
 import json
 import os
+import threading
 import time
 
 from pi.config import (
+    VISION_CONNECT_TIMEOUT_S, VISION_CALL_DEADLINE_S,
     VISION_ENABLED, VISION_MODEL, VISION_API_BASE, VISION_TIMEOUT_S,
     VISION_IMAGE_MAX_PX, VISION_JPEG_QUALITY, VISION_THINKING_BUDGET,
     VISION_COOLDOWN_S, VISION_MAX_CALLS_PER_MISSION, VISION_MAX_IMAGES_PER_CALL,
@@ -209,6 +211,8 @@ class VisionProvider:
         """عدّاد الاستدعاءات والتكلفة التقديرية — للواجهة (وعي الرصيد)."""
         return {"provider": self.name, "calls": self.calls,
                 "failures": self.failures,
+                # نداءات قُطعت بالسقف الصلب — تصاعدها يعني **شبكة** لا رصيداً
+                "timeouts": int(getattr(self, "timeouts", 0)),
                 "budget_left": self.budget_left(),
                 "estimated_cost_usd": round(self.calls * VISION_COST_PER_CALL_USD, 4),
                 "total_tokens": self.total_tokens,
@@ -273,6 +277,46 @@ class GeminiVisionProvider(VisionProvider):
         self.api_key = api_key or _load_api_key()
         self.model = model
         self.timeout_s = float(timeout_s)
+        self.deadline_s = float(VISION_CALL_DEADLINE_S)
+        self.timeouts = 0             # نداءات قُطعت بالسقف الصلب (للواجهة)
+
+    def _post_with_deadline(self, url: str, body: dict):
+        """
+        🔴 سقف صلب للنداء كله — مهلة `requests` **لكل عملية مقبس** لا للنداء.
+
+        urllib3 يجرّب كل عنوان من `getaddrinfo` بمهلة مستقلة (AAAA ثم A)،
+        و**حلّ الاسم خارجها كلياً**. فعلى شبكة تحجب أو تبتلع الحزم يمتدّ
+        النداء الواحد دقائق — وهو يقع على **خيط المهمة** بعد التقاط الصور
+        وقبل التقرير، فتتجمّد المهمة بلا سطر سجل ولا صورة معروضة.
+
+        الخيط العالق يبقى عالقاً (daemon) لكن **المهمة تمضي** — نفس علاج
+        لقطة V4L2 في `pi/sensors/camera.py`. والقاعدة محفوظة: الرؤية
+        تقترح والحساسات تحمي، فانقطاعها لا يوقف شيئاً.
+        """
+        box = {}
+
+        def _work():
+            try:
+                box["resp"] = requests.post(
+                    url, json=body,
+                    # (اتصال، قراءة) لا رقماً مفرداً: يقصّ زمن كل عنوان فاشل
+                    timeout=(VISION_CONNECT_TIMEOUT_S, self.timeout_s),
+                    headers={"x-goog-api-key": self.api_key,
+                             "Content-Type": "application/json"})
+            except Exception as e:        # noqa: BLE001
+                box["err"] = e
+
+        w = threading.Thread(target=_work, daemon=True)
+        w.start()
+        w.join(self.deadline_s)
+        if w.is_alive():
+            self.timeouts += 1
+            raise TimeoutError(
+                f"تجاوز السقف الصلب {self.deadline_s:.0f}ث (حلّ اسم/اتصال/"
+                f"قراءة) — النداء مقطوع والمهمة تمضي")
+        if "err" in box:
+            raise box["err"]
+        return box["resp"]
 
     def available(self) -> bool:
         return bool(VISION_ENABLED and self.api_key and _REQUESTS_OK)
@@ -310,10 +354,7 @@ class GeminiVisionProvider(VisionProvider):
         t0 = time.time()
         self.calls += 1
         try:
-            resp = requests.post(
-                url, json=body, timeout=self.timeout_s,
-                headers={"x-goog-api-key": self.api_key,
-                         "Content-Type": "application/json"})
+            resp = self._post_with_deadline(url, body)
             self.last_latency_s = round(time.time() - t0, 2)
             if resp.status_code != 200:
                 self.failures += 1

@@ -2291,6 +2291,68 @@ def main() -> int:
     check("ومقبض ميت يُطرح ليُعاد الفتح (لا `isOpened()=False` أبدية)",
           cam2._ensure_open() in (True, False) and cam2._cap is not True)
 
+    # 🔴 لقطة تحجب بلا نهاية لا تجمّد المهمة (مقاس 2026-08-10: تجمّد دقائق
+    #    عند التوثيق — `cv2` ينادي V4L2 بلا أي مهلة).
+    cam3 = _CamR()
+    cam3.available = True
+    cam3._snapshot_blocking = lambda: time.sleep(30) or b"never"
+    _t0 = time.time()
+    _res = cam3.snapshot_jpeg(timeout_s=0.4)
+    _dt = time.time() - _t0
+    check("🔴 لقطة عالقة تُقطع بمهلتها ولا تجمّد خيط المهمة",
+          _res is None and _dt < 3.0 and cam3.timeouts == 1,
+          f"عادت خلال {_dt:.1f}ث · مهلات={cam3.timeouts}")
+    check("والسبب معلَن في الحالة (لا فشل صامت)",
+          "لا يستجيب" in (cam3.state().get("error") or "")
+          and cam3.state()["stuck"] is True,
+          (cam3.state().get("error") or "")[:50])
+    check("ولا تُكدَّس خيوط عالقة (النداء التالي يرفض فوراً)",
+          cam3.snapshot_jpeg(timeout_s=0.4) is None and cam3.timeouts == 1)
+    cam4 = _CamR()
+    cam4.available = True
+    cam4._snapshot_blocking = lambda: b"JPEG-OK"
+    check("واللقطة السليمة تمرّ عبر المهلة بلا تغيير",
+          cam4.snapshot_jpeg(timeout_s=2.0) == b"JPEG-OK"
+          and cam4.timeouts == 0)
+
+    # 🔴 القفل **الحقيقي** لا محاكاته: الاختبارات أعلاه تستبدل
+    #    `_snapshot_blocking` نفسه، فلا تمرّ بالقفل أصلاً — والانحدار الذي
+    #    نحرسه هنا يقع **داخله**: العامل المهجور يبقى ممسكاً بالقفل بحكم
+    #    التصميم، و`close()` يُنادى من **حلقة asyncio** (تبديل النمط عبر
+    #    `/api/mode` وإغلاق السيرفر). فانتظار بلا مهلة ينقل التجمّد من خيط
+    #    المهمة إلى الواجهة كلها: لا تيليمتري ولا زرّ إيقاف — والمحركات
+    #    ماضية. (انحدار أدخلَته مهلةُ اللقطة نفسها.)
+    import pi.sensors.camera as _cammod
+    _cv2_saved = _cammod._CV2_OK
+    _cammod._CV2_OK = True                # المسار الحقيقي بلا opencv مثبّتة
+    try:
+        class _HangCap(_FakeCap):
+            def read(self):
+                time.sleep(30)            # V4L2 يحجب بلا نهاية
+                return (True, b"frame")
+
+        cam5 = _CamR()
+        cam5.available = True
+        cam5._cap = _HangCap()
+        cam5._opened = True
+        cam5.snapshot_jpeg(timeout_s=0.4)  # عامل يعلق **ممسكاً بالقفل**
+        check("عامل اللقطة العالق يملك القفل فعلاً (لا محاكاة للمسار)",
+              cam5._lock.locked() is True and cam5.timeouts == 1)
+        _t1 = time.time()
+        cam5.close()
+        _dt1 = time.time() - _t1
+        check("🔴 `close()` لا ينتظر قفلاً محتجزاً — الواجهة لا تتجمّد",
+              _dt1 < 3.0 and cam5._cap is None and cam5.abandoned == 1,
+              f"عاد خلال {_dt1:.1f}ث · مهجورة={cam5.abandoned}")
+        check("والهجر معلَن في الحالة (لا تسريب صامت لمقبض)",
+              "هُجر" in (cam5.state().get("error") or "")
+              and cam5.state()["abandoned"] == 1)
+        # الجيل يرتفع عند الهجر: العامل إن استفاق يحرّر **مقبضه هو** فقط
+        check("ورفع الجيل يمنع عاملاً مهجوراً من تحرير مقبض فُتح بعده",
+              cam5._gen == 1)
+    finally:
+        _cammod._CV2_OK = _cv2_saved
+
     # ── 🔴 العودة الإجبارية تُنتج تقريراً وتوثيقاً (لا تخرج بلا مخرَج) ──
     # عطل مقاس 2026-08-10: `_finish` يستدعي الدورة في فرع «انتهى المسح»
     # وحده، والعودة الإجبارية (زمن 480ث أو جهد 10.2–10.8V) شبه حتمية —
