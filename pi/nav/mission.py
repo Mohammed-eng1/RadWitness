@@ -1502,6 +1502,24 @@ class MissionSim:
         n = int(positions if positions is not None else CONFIRM_POSITIONS)
         # الخطة من المنسّق نفسه (حلقة زوايا متفرقة) — مصدر واحد للحقيقة
         plan = self.locator.confirmation_plan(tuple(center_xy), r)[:max(1, n)]
+        # 🔴 **ترتيب الأقرب-فالأقرب** بدل ترتيب الزوايا: الخطة حلقة حول
+        #    المركز، وزيارتها بترتيب الزاوية تجعل كل نقطتين متعاكستين على
+        #    القطر فتُنتج **لفّات 180° متتالية**. مقاس على العتاد
+        #    (2026-08-10): ثماني لفّات كبيرة في تأكيد واحد — كل لفّة مرحلتان
+        #    بتوقف وقياس قصور وتصحيح، فتستهلك عشرات الثواني **وتراكم خطأ
+        #    اتجاه** (شكّ الاتجاه تجاوز 15° فسقطت بوابة تصحيح الجدران).
+        # ⚠ لا يمسّ **أي** خاصية إحصائية: نفس النقاط ونفس التنويع الزاوي —
+        #    الترتيب وحده يتغيّر، والتأكيد لا يعتمد على تسلسل الزيارة.
+        here = ((self.dr.x, self.dr.y) if self.dr
+                else self.grid.cell_center(*self.current))
+        ordered, remaining, cur = [], list(plan), here
+        while remaining:
+            nxt = min(remaining,
+                      key=lambda p: (p[0] - cur[0]) ** 2 + (p[1] - cur[1]) ** 2)
+            remaining.remove(nxt)
+            ordered.append(nxt)
+            cur = nxt
+        plan = ordered
         self._log("rescan",
                   f"إعادة مسح منطقة حول ({center_xy[0]:.2f},{center_xy[1]:.2f}) "
                   f"نصف قطر {r:.2f}م — {len(plan)} موضعاً × {dwell:.0f}ث")

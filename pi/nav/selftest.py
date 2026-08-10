@@ -313,9 +313,17 @@ def main() -> int:
     br2 = WaveRoverBridge(mode="sim")
     br2.calibrate_gyro_bias(seconds=0.3)
     r360 = br2.turn_by_angle(360)
-    check("turn_by_angle(360) يُنفَّذ على 3 مراحل",
-          r360["segments"] == 3 and not r360["timed_out"],
+    # ⚠ العدد يُشتقّ من الثابت لا يُثبَّت: رُفع الحدّ 120→180 (2026-08-10)
+    #    لخفض كلفة لفّات الـ180 الشائعة، ورقم مثبت هنا يكسر الاختبار بلا
+    #    علاقة بما يقيسه (أن اللفّة الطويلة **تُجزَّأ** أصلاً).
+    _exp_seg = math.ceil(360.0 / MAX_TURN_SEGMENT_DEG)
+    check(f"turn_by_angle(360) يُنفَّذ على {_exp_seg} مراحل (حدّ "
+          f"{MAX_TURN_SEGMENT_DEG:.0f}°)",
+          r360["segments"] == _exp_seg and not r360["timed_out"],
           f"مراحل={r360['segments']} · دار {r360['turned_deg']}°")
+    check("ولفّة 180° صارت مرحلة واحدة (نصف كلفة التوقف والتصحيح)",
+          math.ceil(180.0 / MAX_TURN_SEGMENT_DEG) == 1,
+          f"حدّ المرحلة {MAX_TURN_SEGMENT_DEG:.0f}°")
     check("الزاوية التراكمية عبر المراحل صحيحة",
           abs(abs(r360["turned_deg"]) - 360) < 30, f"{r360['turned_deg']}°")
     check("حدث التجزئة يظهر في السجل",
