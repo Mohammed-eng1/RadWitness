@@ -608,6 +608,19 @@ async def api_drive_mode(req: Request):
                                     allow_sim=bool(d.get("allow_sim", False)))
 
 
+@app.post("/api/mission/batt_rth_override")
+async def api_batt_rth_override(req: Request):
+    """
+    رفع/إعادة **العودة الإجبارية بسبب الجهد** وحدها (10.0–10.8V).
+
+    🔴 لا يمسّ الإيقاف الفوري دون الأرضية، ولا الإطفاء المنظَّم، ولا
+    الحاجز الزمني. الشرح الكامل في `MissionSim.set_batt_rth_override`.
+    ⚠ مُسجَّل قبل مسار `/api/mission/{action}` العام عمداً — وإلا ابتلعه.
+    """
+    d = await req.json()
+    return mission.set_batt_rth_override(bool(d.get("enabled", False)))
+
+
 @app.post("/api/mission/training_source")
 async def api_training_source(req: Request):
     """

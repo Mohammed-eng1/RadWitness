@@ -373,6 +373,14 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <input type="checkbox" id="driveMotors" style="width:17px;height:17px;accent-color:var(--acc)">
       </label>
       <div id="driveMsg"></div>
+      <!-- 🔋 رفع العودة الإجبارية بسبب الجهد — بأرضية صلبة معروضة نصّاً:
+           الخيار الذي لا يُظهر ثمنه ليس خياراً بل فخّ -->
+      <label class="row" style="cursor:pointer;margin-bottom:6px"
+             title="يرفع العودة في نطاق 10.0–10.8V فقط. الإيقاف الفوري والإطفاء المنظَّم والحاجز الزمني لا تُمسّ.">
+        <span>🔋 ارفع العودة التلقائية عند انخفاض البطارية</span>
+        <input type="checkbox" id="battRthOverride" style="width:17px;height:17px;accent-color:var(--acc)">
+      </label>
+      <div id="battRthMsg"></div>
       <!-- 🎯 مصدر تدريبي: قيادة حقيقية + عدّ جيجر مصنّع — بروفة الاختبار -->
       <details style="margin:7px 0">
         <summary class="muted" style="cursor:pointer">🎯 مصدر تدريبي افتراضي (بروفة)</summary>
@@ -560,6 +568,22 @@ $("#ignoreSensors").onchange = async e => {
   addEvent("sys", e.target.checked
     ? "⚠ تجاوز حساسات العوائق مفعّل — التقدّم لن يُمنع ولو وُجد عائق"
     : "أُعيد تفعيل حساسات العوائق", Date.now()/1000);
+};
+
+/* ═══ رفع العودة الإجبارية بسبب الجهد — الثمن معروض لا مخفيّ ═══ */
+$("#battRthOverride").onchange = async e => {
+  const want = e.target.checked;
+  const r = await api("/api/mission/batt_rth_override", {enabled: want});
+  if (!r || r.ok === false){
+    e.target.checked = !want;
+    showMsg("#battRthMsg", "⛔ " + ((r && r.error) || "رُفض التبديل"), "err");
+    return;
+  }
+  addEvent("sys", want
+    ? ("⚠ العودة التلقائية بسبب البطارية مرفوعة — الحماية تعود تلقائياً دون "
+       + r.floor_v + "V، وعندها **إيقاف في المكان لا عودة**"
+       + (r.note ? " · " + r.note : ""))
+    : "✅ العودة التلقائية بسبب البطارية أُعيدت", Date.now()/1000);
 };
 
 /* ═══ مفتاح قيادة المحركات — الرفض يُعرض بسببه ويعود المفتاح لحاله ═══ */
@@ -1437,6 +1461,15 @@ function apply(st){
   const dm = $("#driveMotors");
   if (document.activeElement !== dm && dm.checked !== !!st.drive_motors)
     dm.checked = !!st.drive_motors;
+  // مزامنة مفتاح رفع العودة + إبقاء ثمنه معروضاً ما دام مرفوعاً
+  const bro = $("#battRthOverride");
+  if (document.activeElement !== bro && bro.checked !== !!st.batt_rth_override)
+    bro.checked = !!st.batt_rth_override;
+  if (st.batt_rth_override)
+    showMsg("#battRthMsg", "⚠ العودة عند انخفاض البطارية **مرفوعة**. الحماية "
+      + "تعود تلقائياً دون " + (st.batt_rth_floor_v ?? 10) + "V — وعندها إيقاف "
+      + "في المكان لا عودة. (الإطفاء المنظَّم والحاجز الزمني لم يُمسّا.)", "err");
+  else $("#battRthMsg").innerHTML = "";
   if (st.state === "running" && !st.drive_motors)
     showMsg("#driveMsg", "⚠ المسح الجاري منطقي — الخريطة تتقدّم والروبوت ساكن. أوقفه وفعّل المفتاح ثم ابدأ من جديد.", "err");
   else if (!st.drive_motors && st.state === "idle")

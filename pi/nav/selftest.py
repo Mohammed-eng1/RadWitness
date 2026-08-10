@@ -785,6 +785,106 @@ def main() -> int:
           [e["msg"] for e in ms_g.events
            if e["kind"] == "battery_source"][0][:70])
 
+    # ── 🔋 رفع العودة الإجبارية بخيار المشغّل — **وأرضيته لا تُعبَر** ──
+    # الخيار الأمني الذي لا يُختبر حدُّه ليس خياراً بل ثغرة: كل قيمته في
+    # أنه يرفع طبقةً **واحدة** ويترك الباقي مسلَّحاً. فنختبر ما لا يمسّه
+    # أكثر ممّا يمسّه.
+    from pi.config import (BATT_RTH_OVERRIDE_FLOOR_V, BATT_CRITICAL_V,
+                           BATT_GOOD_V as _BGV)
+
+    def _batt_mission(v, override):
+        m = MissionSim()
+        m.configure_room(1.0, 1.0)
+        m.set_calibration(newp)
+        m.rover.sim_set_voltage(12.4)         # ابدأ سليماً (الحاجب ⑦)
+        m.start()
+        m.set_batt_rth_override(override)
+        m.rover.sim_set_voltage(v)
+        m._check_battery()
+        return m
+
+    _v_band = round((BATT_RTH_OVERRIDE_FLOOR_V + _BGV) / 2.0, 2)   # وسط النطاق
+    m_on = _batt_mission(_v_band, True)
+    check("🔋 التجاوز مرفوع ⇒ لا عودة إجبارية داخل النطاق (المهمة تمضي)",
+          not m_on._returning and not m_on._rth_triggered
+          and m_on.state == "running",
+          f"{_v_band}V داخل [{BATT_RTH_OVERRIDE_FLOOR_V}, {_BGV}) — الحالة {m_on.state}")
+    check("والكتم **معلَن** في السجل لا صامت (وفيه أرضيته وثمنها)",
+          any(e["kind"] == "battery" and "مكتومة" in e["msg"]
+              and "إيقاف في المكان" in e["msg"] for e in m_on.events))
+    m_off = _batt_mission(_v_band, False)
+    check("وبلا التجاوز تنطلق العودة كما كانت (السلوك الافتراضي لم يتغيّر)",
+          m_off._returning and m_off._rth_triggered,
+          f"{_v_band}V ⇒ عودة إجبارية")
+
+    # 🔴 الأرضية: تحتها **لا شيء قابل للتجاوز**
+    m_floor = _batt_mission(BATT_CRITICAL_V - 0.2, True)
+    check("🔴 تحت الأرضية: التجاوز مرفوع ومع ذلك **إيقاف فوري**",
+          m_floor.state == "estop",
+          f"{BATT_CRITICAL_V - 0.2}V < {BATT_RTH_OVERRIDE_FLOOR_V}V ⇒ "
+          f"{m_floor.state}")
+    check("والأرضية هي عتبة الإيقاف نفسها (لا فجوة بين الطبقتين)",
+          BATT_RTH_OVERRIDE_FLOOR_V == BATT_CRITICAL_V,
+          f"{BATT_RTH_OVERRIDE_FLOOR_V}V")
+
+    # 🔴 الحاجز الزمني طبقة **مستقلة** — التجاوز لا يمسّها
+    m_time = MissionSim()
+    m_time.configure_room(1.0, 1.0)
+    m_time.set_calibration(newp)
+    m_time.rover.sim_set_voltage(12.4)
+    m_time.start()
+    m_time.set_batt_rth_override(True)
+    m_time._started_ts = time.time() - (MISSION_TIME_LIMIT_S + 1)
+    m_time._check_battery()
+    check("🔴 التجاوز لا يرفع الحاجز الزمني (طبقة مستقلة عمداً)",
+          m_time._returning and m_time._time_rth,
+          "عودة زمنية نُفّذت رغم رفع عودة الجهد")
+
+    # 🔴 ولا يرفع الإطفاء المنظَّم (الطبقة الرابعة تحت الإيقاف)
+    m_sd = shutdown_mission()
+    m_sd.set_batt_rth_override(True)
+    feed(m_sd, dict(base), BATT_SHUTDOWN_CONSECUTIVE + 1)
+    check("🔴 ولا يرفع الإطفاء المنظَّم لنظام التشغيل",
+          m_sd.fired, "الإطفاء نُفّذ رغم رفع عودة الجهد")
+
+    # الحاجب ⑦ يسقط بسقوط علّته — لكن **دون الأرضية يبقى حاجباً**
+    m_rd = MissionSim()
+    m_rd.configure_room(1.0, 1.0)
+    m_rd.set_calibration(newp)
+    m_rd.rover.sim_set_voltage(_v_band)
+    _blk_before = m_rd.mission_readiness()["blockers"]
+    m_rd.set_batt_rth_override(True)
+    _rd_after = m_rd.mission_readiness()
+    check("حاجب «نطاق العودة» يسقط برفع العودة (علّته كانت دورة بدء-وعودة)",
+          any("نطاق العودة" in b for b in _blk_before)
+          and not any("نطاق العودة" in b for b in _rd_after["blockers"])
+          and any("مرفوعة بخيارك" in w for w in _rd_after["warnings"]),
+          f"حواجب {len(_blk_before)} → {len(_rd_after['blockers'])}")
+    m_rd.rover.sim_set_voltage(BATT_CRITICAL_V - 0.2)
+    check("🔴 لكنه يبقى حاجباً دون الأرضية مهما كان الخيار",
+          any("نطاق العودة" in b
+              for b in m_rd.mission_readiness()["blockers"]),
+          "بدء مهمة على جهد الإيقاف الفوري ليس اختياراً")
+
+    # 🔴 التجاوز يبقى بين المهمات ⇒ يُعلَن عند بدء **كل** مهمة
+    m_next = MissionSim()
+    m_next.configure_room(1.0, 1.0)
+    m_next.set_calibration(newp)
+    m_next.rover.sim_set_voltage(12.4)
+    m_next.set_batt_rth_override(True)
+    m_next.events.clear()                     # كأنها جولة جديدة
+    m_next.start()
+    check("وخيار مرفوع من جولة سابقة يُعاد إعلانه عند بدء كل مهمة",
+          any(e["kind"] == "battery" and "مرفوعة" in e["msg"]
+              for e in m_next.events),
+          "خيار أمان منسيّ أخطر من خيار لم يُتَح")
+
+    # الحالة تُبثّ (وإلا لم يمكن للواجهة أن تعكس الحقيقة ولا أن تُنذر)
+    _st_ov = m_on.state_dict()
+    check("الحالة تُبثّ مع أرضيتها (الواجهة تعرض الأرضية لا رقماً مكتوباً فيها)",
+          _st_ov["batt_rth_override"] is True
+          and _st_ov["batt_rth_floor_v"] == BATT_RTH_OVERRIDE_FLOOR_V)
+
     # ═══ (ك3) الحساسات: خمسة IR · الغائب مجهول · جاهزية المهمة ════
     print("\nك3) أعلام الحساسات وجاهزية المهمة:")
     from pi.config import (IR_PRESENT, IR_PULL_UP, IR_FRONT_MID_GPIO,

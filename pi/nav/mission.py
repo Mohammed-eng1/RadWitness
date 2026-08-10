@@ -25,6 +25,7 @@ from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
     TURN_RELIABILITY_MIN_V, BATT_GOOD_V, BATT_LOG_MIN_GAP_S,
+    BATT_RTH_OVERRIDE_FLOOR_V,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -202,6 +203,9 @@ class MissionSim:
         self._batt_source = None       # مصدر الحماية الفاعل (يُسجَّل عند تغيّره)
         self._shutdown_streak = 0      # قراءات متتالية دون حدّ الإطفاء
         self._rth_triggered = False
+        # تجاوز يدوي للعودة الإجبارية بسبب الجهد — **لا يعبر الأرضية**
+        self.batt_rth_override = False
+        self._batt_override_log_ts = 0.0   # تقييد سطر «العودة مكتومة»
         # الحدّ الزمني (بديل حماية الجهد المعطّلة — القسم 9)
         self._started_ts = None
         self._time_warned = False
@@ -426,6 +430,16 @@ class MissionSim:
             self._log("battery",
                       f"جهد البدء {b0['v']}V ({b0['cell_v']}V/خلية · "
                       f"~{b0['percent']}%) — {b0['text']}")
+        # 🔴 التجاوز **يبقى بين المهمات** (لئلا يُعاد وضعه في كل جولة اختبار)
+        #    — فيجب أن يُعلَن عند بدء **كل** مهمة لا عند تبديله وحده. خيار
+        #    أمان منسيّ من جولة سابقة أخطر من خيار لم يُتَح أصلاً.
+        if self.batt_rth_override:
+            self._log("battery",
+                      f"⚠ **العودة الإجبارية بسبب الجهد مرفوعة** في هذه "
+                      f"المهمة — الحماية تعود تلقائياً دون "
+                      f"{BATT_RTH_OVERRIDE_FLOOR_V}V، وعندها **إيقاف في "
+                      f"المكان لا عودة**. (الإطفاء المنظَّم والحاجز الزمني "
+                      f"مسلَّحان.)")
         self._log("time_limit",
                   f"الحاجز الزمني مسلَّح كطبقة ثانية: عودة إجبارية عند "
                   f"{MISSION_TIME_LIMIT_S:.0f}ث، إيقاف عند "
@@ -603,9 +617,29 @@ class MissionSim:
                 self._log("battery", f"⚠ جهد حرج {info['v']}V — إيقاف المحركات فوراً")
                 self.estop()
         elif info["action"] == batt.ACTION_RTH:
-            if self.state == RUNNING and not self._rth_triggered:
+            # 🔴 التجاوز اليدوي — **بأرضية صلبة**: يسكت العودة في النطاق
+            #    10.0–10.8V وحده. تحت الأرضية لا يصل التنفيذ إلى هنا أصلاً
+            #    (التصنيف هناك `ACTION_STOP` وقد عولج في الفرع أعلاه)،
+            #    والشرط مكتوب صراحةً لا اتّكالاً على ترتيب الفروع: أرضية
+            #    أمان ضمنية أرضيةٌ تُكسر بأول إعادة ترتيب.
+            v_now = info.get("v")
+            floor_ok = (v_now is not None
+                        and float(v_now) >= BATT_RTH_OVERRIDE_FLOOR_V)
+            if self.batt_rth_override and floor_ok:
+                now = time.time()
+                if now - self._batt_override_log_ts >= BATT_LOG_MIN_GAP_S:
+                    self._batt_override_log_ts = now
+                    self._log("battery",
+                              f"⚠ جهد منخفض {v_now}V — العودة الإجبارية "
+                              f"**مكتومة بخيار المشغّل**. الحماية تعود "
+                              f"تلقائياً دون {BATT_RTH_OVERRIDE_FLOOR_V}V، "
+                              f"وعندها **إيقاف في المكان لا عودة**.")
+            elif self.state == RUNNING and not self._rth_triggered:
                 self._rth_triggered = True
-                self._log("battery", f"⚠ جهد منخفض {info['v']}V — عودة إجبارية")
+                reason = ("" if not self.batt_rth_override else
+                          " (التجاوز سقط تحت أرضيته — الحماية عادت تلقائياً)")
+                self._log("battery",
+                          f"⚠ جهد منخفض {info['v']}V — عودة إجبارية{reason}")
                 self.return_home()
         elif info["level"] != self._batt_level:
             # ⚠ نحن هنا في فرع **لا إجراء** (الإيقاف/العودة/الإطفاء عولجت
@@ -741,6 +775,39 @@ class MissionSim:
         self._log("drive_mode",
                   "قيادة المحركات مفعّلة ⚠" if enabled else "مسح منطقي (بلا محركات)")
         return {"ok": True, "drive_motors": self.drive_motors}
+
+    def set_batt_rth_override(self, enabled: bool) -> dict:
+        """
+        يرفع/يُعيد **العودة الإجبارية بسبب الجهد** — وحدها.
+
+        الغرض: مهمة اختبار قصيرة كانت تُقطع عند 10.8V بينما البطارية تكفيها.
+        🔴 وما **لا** يمسّه التجاوز إطلاقاً (وإعلانه جزء من الخيار لا زينة):
+          • الإيقاف الفوري دون `BATT_RTH_OVERRIDE_FLOOR_V` — الحماية تعود
+            تلقائياً هناك، والنتيجة **توقّف في المكان لا عودة**.
+          • الإطفاء المنظَّم للنظام عند `BATT_SHUTDOWN_V`.
+          • الحاجز الزمني (عودة 480ث · إيقاف 600ث) — طبقة مستقلة عمداً.
+          • حارس العجز عن اللفّ (لفّتان بلا دوران ⇒ إنهاء).
+
+        ⚠ يُسمح بتبديله **أثناء المهمة**: قد تُتخذ القرار وأنت تراقب. لكن
+          رفعه بعد أن انطلقت عودة إجبارية **لا يُلغيها** — العودة صارت
+          حالة ملاحية تحت التنفيذ، وقطعها في منتصف الطريق يترك الروبوت في
+          موضع لم يقصده أحد. يُعلَن ذلك في الردّ لا يُبتلع.
+        """
+        enabled = bool(enabled)
+        self.batt_rth_override = enabled
+        note = None
+        if enabled and self._rth_triggered:
+            note = ("العودة الإجبارية انطلقت بالفعل ولن تُلغى — "
+                    "التجاوز يسري على ما بعدها")
+        self._log("battery",
+                  (f"⚠ العودة الإجبارية بسبب الجهد **مرفوعة بخيار المشغّل** — "
+                   f"الحماية تعود تلقائياً دون {BATT_RTH_OVERRIDE_FLOOR_V}V "
+                   f"(وعندها إيقاف في المكان لا عودة)"
+                   + (f" · {note}" if note else ""))
+                  if enabled else
+                  "✅ العودة الإجبارية بسبب الجهد أُعيدت (السلوك الافتراضي)")
+        return {"ok": True, "batt_rth_override": enabled,
+                "floor_v": BATT_RTH_OVERRIDE_FLOOR_V, "note": note}
 
     def sensors(self) -> dict:
         """
@@ -1931,9 +1998,21 @@ class MissionSim:
                 #    داخل نطاق «العودة الإجبارية» (10.2–10.8) — فبدأت المهمة
                 #    لتعود فوراً بعد خلية واحدة. البدء في هذا النطاق عبث
                 #    بالتعريف، والحاجب أصدق من دورة بدء-وعودة محيّرة.
-                blockers.append(
-                    f"البطارية {v_now:.2f}V داخل نطاق العودة الإجبارية "
-                    f"(<{BATT_GOOD_V}V) — المهمة ستبدأ لتعود فوراً. اشحن أولاً.")
+                # ⚠ وعلّته **دورة البدء-والعودة** لا الجهد نفسه: مع رفع
+                #   العودة تسقط العلّة فيسقط الحاجب — ويبقى تحذيراً. لكن
+                #   دون أرضية التجاوز يبقى حاجباً مهما كان الخيار: بدء مهمة
+                #   على جهد الإيقاف الفوري ليس اختياراً بل عبث.
+                if (self.batt_rth_override
+                        and v_now >= BATT_RTH_OVERRIDE_FLOOR_V):
+                    warnings.append(
+                        f"⚠ البطارية {v_now:.2f}V داخل نطاق العودة الإجبارية "
+                        f"(<{BATT_GOOD_V}V) والعودة **مرفوعة بخيارك** — "
+                        f"المهمة ستمضي حتى {BATT_RTH_OVERRIDE_FLOOR_V}V ثم "
+                        f"**تتوقف في مكانها بلا عودة**.")
+                else:
+                    blockers.append(
+                        f"البطارية {v_now:.2f}V داخل نطاق العودة الإجبارية "
+                        f"(<{BATT_GOOD_V}V) — المهمة ستبدأ لتعود فوراً. اشحن أولاً.")
             elif v_now is not None and v_now < TURN_RELIABILITY_MIN_V:
                 warnings.append(
                     f"⚠ البطارية {v_now:.2f}V دون حدّ موثوقية اللفّ "
@@ -2502,6 +2581,10 @@ class MissionSim:
                               if self.perimeter is not None else None),
             },
             "drive_motors": self.drive_motors,
+            # حالة التجاوز + أرضيته: الواجهة تعرض الأرضية لا رقماً مكتوباً
+            # فيها — رقم مكرّر في مكانين ينحرف أحدهما يوماً بلا أن يُلاحَظ.
+            "batt_rth_override": self.batt_rth_override,
+            "batt_rth_floor_v": BATT_RTH_OVERRIDE_FLOOR_V,
             "training_source": self.training_source,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,
                       "gyro_bias": round(self.rover.gyro_bias, 4),
