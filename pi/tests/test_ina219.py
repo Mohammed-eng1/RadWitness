@@ -94,6 +94,64 @@ def sample_amps(ina: INA219Reader, seconds: float, rover=None,
     return statistics.median(vals) if vals else None
 
 
+def watch(ina: INA219Reader, seconds: float) -> None:
+    """
+    🔴 يراقب الجهد بمرور الزمن ويحسب **ميله** (mV/دقيقة).
+
+    السبب: «الفولت ثابت لا يتغيّر» قلقٌ محقّ الشكل خاطئ النتيجة — حزمة
+    ليثيوم عند ~4.0V/خلية تقع في **الوسط المسطّح** من منحنى التفريغ، وتحت
+    حِمل خفيف (0.55A) تهبط ببضعة ملّي-فولت في الدقيقة. فبضع قراءات
+    متتالية بينها ثوانٍ لا تُظهر شيئاً — **والسكون هنا فيزياء لا عطل**.
+
+    🔴 والأهم: **الميل يقول شحناً أم تفريغاً بلا حاجة إلى إشارة التيار
+    أصلاً**. موجب ⇒ يشحن. سالب ⇒ يفرّغ. وهو مرجع مستقل تماماً عن
+    `INA219_CURRENT_SIGN` — فيصلح حَكَماً عليه لا مجرّد بديل عنه.
+    """
+    print(f"\n  مراقبة {seconds:.0f}ث — أوصل الشاحن أو افصله أثناءها "
+          f"وراقب أثره")
+    print("  (الجهد الحيّ يتذبذب ±بضعة ملّي-فولت؛ الثبات التامّ حتى آخر "
+          "رقم = قراءة متجمّدة)\n")
+    t0 = time.time()
+    pts, seen_v = [], set()
+    last_print = 0.0
+    while time.time() - t0 < seconds:
+        r = ina.read()
+        if r["v"] is not None:
+            t = time.time() - t0
+            pts.append((t, r["v"]))
+            seen_v.add(round(r["v"], 3))
+            if t - last_print >= 2.0 or last_print == 0.0:
+                last_print = t
+                slope = ""
+                if len(pts) > 20 and pts[-1][0] - pts[0][0] > 5.0:
+                    dv = pts[-1][1] - pts[0][1]
+                    dt = pts[-1][0] - pts[0][0]
+                    slope = f" · الميل {dv / dt * 60000:+.0f} mV/دقيقة"
+                a = r.get("amps_raw")
+                print(f"    {t:5.1f}ث  {r['v']:6.3f}V  "
+                      f"{a:+.3f}A(خام)  {r['watts']:5.2f}W{slope}")
+        time.sleep(0.1)
+    if len(pts) < 10:
+        print("\n  ⛔ قراءات غير كافية")
+        return
+    dv = pts[-1][1] - pts[0][1]
+    dt = pts[-1][0] - pts[0][0]
+    rate = dv / dt * 60000.0
+    print(f"\n  📉 التغيّر الكلي {dv * 1000:+.0f} mV خلال {dt:.0f}ث "
+          f"⇒ **{rate:+.0f} mV/دقيقة**")
+    check("القراءة **حيّة** لا متجمّدة (تعدّد القيم المميّزة)",
+          len(seen_v) >= 3, f"{len(seen_v)} قيمة مميّزة في {len(pts)} قراءة")
+    if abs(rate) < 5:
+        print("     ⇒ مستقر: إمّا الوسط المسطّح من المنحنى تحت حِمل خفيف، "
+              "أو شاحن يوازن الحِمل بالضبط. **ليس عطلاً.**")
+    elif rate > 0:
+        print("     ⇒ 🔌 **يشحن فعلاً** (الجهد يصعد — دليل مستقل عن إشارة "
+              "التيار).")
+    else:
+        print("     ⇒ 🔋 **يفرّغ فعلاً** (الجهد ينزل). فإن كانت الواجهة "
+              "تقول «يشحن» في هذه اللحظة ⇒ `INA219_CURRENT_SIGN` معكوسة.")
+
+
 def measure_sign(ina: INA219Reader, seconds: float, power: float) -> int:
     """
     🔴 يقيس `INA219_CURRENT_SIGN` **بالمحركات** لا بالشاحن.
@@ -148,6 +206,8 @@ def main() -> int:
     ap.add_argument("--power", type=float, default=0.30)
     ap.add_argument("--sign", action="store_true",
                     help="⚠ يشغّل المحركات — يقيس اتجاه إشارة التيار")
+    ap.add_argument("--watch", type=float, metavar="ثوانٍ", default=0.0,
+                    help="يراقب ميل الجهد (شحن/تفريغ بلا حاجة إلى الإشارة)")
     a = ap.parse_args()
 
     print("\n=== قراءة جهد البطارية (INA219 على UPS Module 3S) ===")
@@ -227,6 +287,11 @@ def main() -> int:
         check("لا رفض قراءات تحت الحمل (ضجيج المحركات لا يفسد I2C)",
               ld["rejects"] <= max(1, ld["n"] // 50),
               f"{ld['rejects']}/{ld['n']}")
+
+    # ── (4ب) ميل الجهد — يحسم «شحن أم تفريغ» بلا إشارة التيار ───
+    if a.watch > 0:
+        print(f"\n[4ب] 🔴 ميل الجهد بمرور الزمن")
+        watch(ina, a.watch)
 
     # ── (5) 🔴 إشارة التيار — تُقاس بالمحركات لا بالشاحن ────────
     if a.sign:
