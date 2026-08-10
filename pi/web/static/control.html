@@ -1109,16 +1109,26 @@ async function maybeShowReport(st){
          'ويُحدَّث تلقائياً حتى تنتهي (الصور تظهر بعد مرحلة التوثيق).</div>';
   h += '<div class="repgrid">';
   h += '<div class="repbox"><div class="k">الخلاصة</div><div class="v" style="font-size:13.5px">' + esc(src.headline || "—") + '</div></div>';
-  h += '<div class="repbox"><div class="k">الموقع ± الشك</div><div class="v">' +
-    // ⚠ found شرط لازم: بلا دليل يوجد «موضع» رياضي (مركز التوزيع) وعرضه
-    //   يوحي بمصدر حيث لا شيء — نفس درس المحدِّد نفسه
-    (src.found && src.position
-      ? src.position[0].toFixed(2) + "," + src.position[1].toFixed(2) +
-        " م ± " + (src.uncertainty_m != null ? src.uncertainty_m.toFixed(2) : "؟") + " م"
+  /* 🔴 الحكم **المؤكَّد المغلق** يتقدّم على البواقي: `close_finding` يطرح
+     مساهمة المصدر ثم يُعيد الفرز، فتصير `src.found` كاذبة **بالتعريف**
+     بعد كل توثيق ناجح — وكانت البطاقة تعرض «لا موقع — لا دليل إحصائي»
+     وتحتها مباشرةً سطرُ التوثيق بموقعه وثقته. */
+  const pf = src.primary_finding || null;
+  const pos = (pf && pf.position) ? pf.position : (src.found ? src.position : null);
+  const unc = (pf && pf.uncertainty_m != null) ? pf.uncertainty_m : src.uncertainty_m;
+  const cnf = (pf && pf.confidence != null) ? pf.confidence : src.confidence;
+  const lam = (pf && pf.lambda_stat != null) ? pf.lambda_stat : src.lambda_stat;
+  h += '<div class="repbox"><div class="k">الموقع ± الشك' +
+    (pf ? ' <span class="muted">(حكم مؤكَّد)</span>' : '') + '</div><div class="v">' +
+    // ⚠ بلا دليل يوجد «موضع» رياضي (مركز التوزيع) وعرضه يوحي بمصدر حيث
+    //   لا شيء — نفس درس المحدِّد نفسه
+    (pos
+      ? pos[0].toFixed(2) + "," + pos[1].toFixed(2) +
+        " م ± " + (unc != null ? unc.toFixed(2) : "؟") + " م"
       : "لا موقع — لا دليل إحصائي على مصدر") + '</div></div>';
   h += '<div class="repbox"><div class="k">الثقة · Λ</div><div class="v">' +
-    (src.confidence != null ? Math.round(src.confidence*100) + "%" : "—") + " · " +
-    (src.lambda_stat != null ? Math.round(src.lambda_stat).toLocaleString("en") : "—") + '</div></div>';
+    (cnf != null ? Math.round(cnf*100) + "%" : "—") + " · " +
+    (lam != null ? Math.round(lam).toLocaleString("en") : "—") + '</div></div>';
   h += '<div class="repbox"><div class="k">أعلى جرعة</div><div class="v">' +
     (mx ? mx.usvh + " µSv/h (" + esc(mx.risk||"") + ")" : "—") + '</div></div>';
   h += '<div class="repbox"><div class="k">التغطية</div><div class="v" style="font-size:13px">' + esc(rep.coverage_text || "—") + '</div></div>';

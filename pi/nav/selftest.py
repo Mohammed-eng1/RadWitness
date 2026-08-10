@@ -1877,6 +1877,32 @@ def main() -> int:
           f"اشتباه جديد={rs2.get('suspect')} · Λ={rs2.get('lambda_stat')}")
     check("والأحكام المغلقة تظهر في التقرير (لا تُمحى بإعادة الفرز)",
           loc2.report()["n_findings"] == 1)
+
+    # 🔴 والتقرير **لا ينفي ما وثّقه**: الطرح يُفرّغ البواقي بالتعريف، وكان
+    #    المخرَج النهائي يقول «لا دليل إحصائي على وجود مصدر · Λ=0 · ثقة 0%»
+    #    بعد أن قاده الروبوت إلى المصدر وصوّره — وسطرُ التوثيق تحته يذكر
+    #    موقعه وثقته. تناقض في **وثيقة المهمة نفسها**، وهي المخرَج الوحيد
+    #    الذي يقرأه إنسان (مقاس 2026-08-11 على العتاد).
+    rep2 = loc2.report()
+    check("🔴 والتقرير النهائي لا ينفي المصدر الذي أُغلق حكمه وصُوِّر",
+          "لا دليل إحصائي على وجود مصدر" not in rep2["headline"]
+          and "مؤكَّد وموثَّق" in rep2["headline"],
+          rep2["headline"][:78])
+    check("وموقع الحكم المؤكَّد جاهز للتقرير (البواقي بلا موقع بعد الطرح)",
+          rep2["n_confirmed"] == 1
+          and (rep2["primary_finding"] or {}).get("position") is not None
+          and rep2["found"] is False,
+          f"مؤكَّد عند {(rep2['primary_finding'] or {}).get('position')} · "
+          f"البواقي found={rep2['found']}")
+    check("والثقة تُحفظ لحظة الإغلاق (بعد الطرح لا سبيل لاستعادتها)",
+          (rep2["primary_finding"] or {}).get("confidence") is not None,
+          f"ثقة محفوظة {(rep2['primary_finding'] or {}).get('confidence')}")
+    # ⚠ ولا تُمسّ حالة البواقي: موانع الاقتراب تبني عليها، وتزييفها يُطلق
+    #   اقتراباً ثانياً نحو مصدر وُثّق للتوّ.
+    from pi.ai.approach_document import approach_blockers as _apb2
+    check("🔴 ولا يُفتح اقتراب ثانٍ نحو مصدر وُثّق (البواقي لم تُزيَّف)",
+          len(_apb2(rep2)) > 0,
+          " · ".join(_apb2(rep2))[:70])
     # الرفض لا يُطرح منه شيء — الاشتباه كان ضوضاء لا مساهمة
     loc3 = SourceLocator(3.0, 4.0, background_cpm=20.0)
     loc3.detector.state = "rejected"
