@@ -125,6 +125,33 @@ def legacy_low_battery_profile() -> CalibrationProfile:
         battery_v=LOW_BATT_CALIB_V)
 
 
+def json_safe(v, _depth: int = 0):
+    """
+    🔴 يستبدل كل `bytes` بواصف نصّي **بأي عمق** — حارس حدّ التسلسل.
+
+    عطل مقاس 2026-08-10: بايتات صور التوثيق تسرّبت داخل `capture.images`،
+    فجرّدها `_doc_state` من المفتاح الأعلى ولم يرها في العمق. النتيجة:
+    `/api/sim/status` ردّ **500** بـ`UnicodeDecodeError: byte 0xff` (أول
+    بايت في JPEG)، و**كل WebSocket مات عند أول بثّ بعد التوثيق** فأعادت
+    الواجهة الاتصال بلا توقف. العرَض المرئي: الصفحة متجمّدة عند «المرحلة ٦
+    توثيق» بلا صورة — بينما المهمة كانت قد أتمّت التصوير والتقرير بنجاح.
+
+    ⚠ الحارس هنا **لا يُغني عن عدم التكرار في المصدر**: هذا يمنع الانهيار،
+    وذاك يمنع نسخ ميغابايتات في كل بثّ. الطبقتان معاً.
+
+    أداة خارجية: تُستدعى من `_doc_state` ومن حارس الاختبارات.
+    """
+    if _depth > 8:                            # حارس عمق (بنية دائرية)
+        return "…"
+    if isinstance(v, (bytes, bytearray)):
+        return {"_bytes": len(v)}             # الحجم يبقى معلومة مفيدة
+    if isinstance(v, dict):
+        return {k: json_safe(x, _depth + 1) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [json_safe(x, _depth + 1) for x in v]
+    return v
+
+
 def _heading_between(a, b) -> float:
     """اتجاه الغرفة من الخلية a إلى المجاورة b (0=+y أمام، 90=+x يمين)."""
     dr, dc = b[0] - a[0], b[1] - a[1]
@@ -2403,7 +2430,10 @@ class MissionSim:
         d = self.documentation
         if not d:
             return None
-        return {k: v for k, v in d.items() if k != "images"} | {
+        # 🔴 التجريد **بأي عمق** لا من المفتاح الأعلى وحده: نسخة ثانية من
+        #    البايتات كانت تعيش في `capture.images` فتمرّ من هنا سالمة،
+        #    فينهار ردّ الحالة وكل WebSocket بعد التوثيق (انظر `json_safe`).
+        return json_safe({k: v for k, v in d.items() if k != "images"}) | {
             "n_images": len(d.get("images") or [])}
 
     def state_dict(self, include_full_grid=False):

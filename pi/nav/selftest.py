@@ -2389,6 +2389,69 @@ def main() -> int:
     check("وعند الإخلاء يُمنع التوثيق (الفرار أولوية مطلقة)",
           any("الانسحاب أولاً" in b for b in _dcb(_evac)))
 
+    # ── 🔴 حدّ التسلسل: **لا بايتات في أي حمولة تُبثّ** ───────────────
+    # عطل مقاس 2026-08-10 وهو سبب «الموقع علق ولا طلعت صورة» فعلياً:
+    # `run_documentation` كان يضع نسخة ثانية من صور JPEG في
+    # `capture.images`، و`_doc_state` يجرّد المفتاح الأعلى وحده. فمرّت
+    # البايتات إلى حمولة الحالة ⇒ `/api/sim/status` ردّ **500**
+    # (`UnicodeDecodeError: byte 0xff` — أول بايت في JPEG) **وكل WebSocket
+    # مات عند أول بثّ بعد التوثيق**، فأعادت الواجهة الاتصال بلا توقف.
+    # المهمة كانت قد أتمّت التصوير والتقرير بنجاح — الذي مات هو العرض.
+    # ⚠ الحارس يسلك المسار **الحقيقي** (`run_documentation` بكاميرا تُعيد
+    #   JPEG فعلياً) لا قاموساً مُلفَّقاً: التسريب وقع في التركيب لا في
+    #   `_doc_state` وحده، فقاموس مُلفَّق كان سيمرّ ويُخفي العطل نفسه.
+    from pi.ai.approach_document import run_documentation as _run_doc
+    import pi.nav.mission as _mn
+
+    class _JpegCam:
+        def snapshot_jpeg(self, *a, **k):
+            return b"\xff\xd8\xff\xe0JFIF-fake-payload"   # بايت 0xff الحقيقي
+
+    _doc_rep = dict(_hot, position=(1.5, 1.5), uncertainty_m=0.2,
+                    confidence=0.9, headline="اختبار")
+    ms_ser = MissionSim()
+    ms_ser.configure_room(2.0, 2.0)
+    ms_ser.documentation = _run_doc(_doc_rep, robot_xy=(0.5, 0.5),
+                                    robot_heading_deg=0.0,
+                                    camera=_JpegCam(), turn_fn=lambda d: True)
+    check("التوثيق التُقطت صوره فعلاً (شرط أن يكون الحارس ذا معنى)",
+          len(ms_ser.documentation.get("images") or []) >= 1,
+          f"{len(ms_ser.documentation.get('images') or [])} صورة خام")
+
+    def _has_bytes(v, d=0):
+        if d > 9:
+            return False
+        if isinstance(v, (bytes, bytearray)):
+            return True
+        if isinstance(v, dict):
+            return any(_has_bytes(x, d + 1) for x in v.values())
+        if isinstance(v, (list, tuple)):
+            return any(_has_bytes(x, d + 1) for x in v)
+        return False
+
+    _st = ms_ser.state_dict(include_full_grid=True)
+    _rp = ms_ser.report()
+    _ser_ok, _ser_err = True, ""
+    try:
+        json.dumps(_st, ensure_ascii=False)
+        json.dumps(_rp, ensure_ascii=False)
+    except Exception as e:                    # noqa: BLE001
+        _ser_ok, _ser_err = False, str(e)[:70]
+    check("🔴 حمولة الحالة والتقرير تُسلسَلان JSON بلا استثناء (لا 500 بعد التوثيق)",
+          _ser_ok, _ser_err or "state_dict + report نظيفان")
+    check("ولا بايتة واحدة تنجو **بأي عمق** (لا في capture.images)",
+          not _has_bytes(_st) and not _has_bytes(_rp))
+    check("والصور تُعدّ ولا تُبثّ — مسارها /api/doc/image/{i}",
+          (_st.get("documentation") or {}).get("n_images", 0) >= 1
+          and "images" not in (_st.get("documentation") or {}),
+          f"n_images={(_st.get('documentation') or {}).get('n_images')}")
+    check("والبايتات الخام تبقى في الذاكرة ليقدّمها المسار (لم تُتلف)",
+          isinstance((ms_ser.documentation.get("images") or [None])[0], bytes))
+    # وحارس العمق نفسه مُختبَر مستقلاً (بنية متداخلة كما في capture)
+    _nested = {"a": [{"b": {"c": b"\xff\xd8"}}]}
+    check("`json_safe` يستبدل البايتات بواصف حجم بأي عمق",
+          _mn.json_safe(_nested)["a"][0]["b"]["c"] == {"_bytes": 2})
+
     # ── إزاحة أنبوب الجيجر: القراءة تُنسب للأنبوب لا لمركز الروبوت ──
     # ⚠ الأنبوب على يسار الهيكل (2026-08-09) — نسبته للمركز = انحياز موضع
     #   ثابت بحجم الإزاحة في كل تقدير، وخطأ الموقع المستهدف 18سم.
