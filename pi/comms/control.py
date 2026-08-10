@@ -219,15 +219,29 @@ class ManualControl:
 
         pwr = self._clamp_power(power)
         gate = self._safety_gate(cmd)
-        if not gate["allow"] and self.ignore_sensors:
-            # 🔴 تجاوز مقصود بطلب المشغّل: البوابة **تُحتسب وتُسجَّل** لكنها
-            #    لا تمنع — والسبب الأصلي يبقى في الردّ مسبوقاً بالتحذير حتى
-            #    تعرف الواجهة ماذا كان سيُمنع. heartbeat وحدّ القوة باقيان.
-            self.overridden_count += 1
-            self._log("safety_override",
-                      f"⚠ تجاوز الحساسات: نُفّذ {cmd} رغم «{gate['reason']}»")
-            gate = dict(gate, allow=True, overridden=True,
-                        reason="⚠ تجاوز مفعّل — " + str(gate.get("reason", "")))
+        # 🔴 التجاوز يرفع **القصّ كما يرفع المنع** — وكان يرفع المنع وحده.
+        #    عطل مقاس 2026-08-11: منفذ مفتوح تماماً والتقدّم عالق على 0.25
+        #    رغم تفعيل «تجاوز حساسات العوائق». السبب أن أشيع حالة قصّ ليست
+        #    منعاً أصلاً: الأمامي فوق عتبة الثقة (30سم) ⇒ `ultrasonic_cm`
+        #    مجهولة ⇒ درجة `no_reading` = 0.25 **دائماً** في الفضاء المفتوح.
+        #    فالبوابة تسمح ولا تُطلق فرع التجاوز، والقصّ يبقى مطبَّقاً.
+        #    (التعليق أدناه كان يقول «والتجاوز يعطّله أيضاً» — والكود لا يفعل.)
+        # ⚠ ما يبقى مهما فُعّل التجاوز: heartbeat · حدّ القوة · الإيقاف الطارئ.
+        if self.ignore_sensors:
+            blocked = not gate["allow"]
+            capped = (gate.get("speed_cap") is not None and cmd == CMD_FWD
+                      and float(gate["speed_cap"]) < pwr)
+            if blocked or capped:
+                self.overridden_count += 1
+                self._log("safety_override",
+                          f"⚠ تجاوز الحساسات: نُفّذ {cmd} رغم "
+                          f"«{gate['reason']}»"
+                          + ("" if blocked else
+                             f" — ورُفع قصّ السرعة {gate['speed_cap']:.2f}"
+                             f"→{pwr:.2f}"))
+                gate = dict(gate, allow=True, overridden=True,
+                            reason="⚠ تجاوز مفعّل — "
+                                   + str(gate.get("reason", "")))
         if not gate["allow"]:
             self.blocked_count += 1
             self._safe_stop()

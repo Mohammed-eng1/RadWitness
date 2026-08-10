@@ -144,6 +144,41 @@ def main() -> None:
           max(abs(v) for v in mission.rover._cmd_lr) <= 0.5,
           f"_cmd_lr={mission.rover._cmd_lr}")
 
+    # 🔴 التجاوز يرفع **القصّ** كما يرفع المنع ──────────────────────
+    # عطل مقاس 2026-08-11: منفذ مفتوح تماماً والتقدّم عالق على 0.25 رغم
+    # تفعيل «تجاوز حساسات العوائق». السبب أن أشيع حالة قصّ **ليست منعاً**:
+    # الأمامي فوق عتبة الثقة (30سم) ⇒ `ultrasonic_cm` مجهولة ⇒ درجة
+    # `no_reading` = 0.25 دائماً في الفضاء المفتوح. فالبوابة تسمح ولا
+    # تُطلق فرع التجاوز، والقصّ يبقى مطبَّقاً — بينما التعليق في الكود كان
+    # يعِد بعكس ذلك. (الحارس هنا لا في comms/selftest تفادياً لتصادم
+    # تحرير متزامن جارٍ على ذلك الملف.)
+    from pi.config import SPEED_NO_READING as _SNR
+    _sv_sensors = mission.sensors
+    mission.sensors = lambda: {"ultrasonic_cm": None,
+                               "ultrasonic_raw_cm": 180.0,
+                               "ir_left": 1, "ir_right": 1, "ir_mid": 1}
+    try:
+        manual.ignore_sensors = False
+        r_cap = c.post("/api/manual/command",
+                       json={"cmd": "FWD", "power": 0.5}).json()
+        manual.ignore_sensors = True
+        r_free = c.post("/api/manual/command",
+                        json={"cmd": "FWD", "power": 0.5}).json()
+    finally:
+        mission.sensors = _sv_sensors
+        manual.ignore_sensors = False
+    check("بلا تجاوز: التقدّم يُقصّ إلى درجة «لا قراءة» (السلامة سليمة)",
+          r_cap.get("ok") and abs(r_cap.get("power", 0) - _SNR) < 1e-9,
+          f"قوة مطلوبة 0.50 → منفَّذة {r_cap.get('power')}")
+    check("🔴 ومع التجاوز يُرفع **القصّ** لا المنع وحده (الوعد يُنفَّذ)",
+          r_free.get("ok") and abs(r_free.get("power", 0) - 0.5) < 1e-9
+          and (r_free.get("safety") or {}).get("overridden") is True,
+          f"قوة منفَّذة {r_free.get('power')} · تجاوز="
+          f"{(r_free.get('safety') or {}).get('overridden')}")
+    check("والرفع **معلَن** في السبب (لا سلامة تُرفع بصمت)",
+          "تجاوز مفعّل" in (r_free.get("reason") or ""),
+          (r_free.get("reason") or "")[:56])
+
     c.post("/api/mode", json={"mode": "sim", "confirm": True})
     r = c.post("/api/manual/command", json={"cmd": "FWD"}).json()
     check("🔴 وأمر حركة خارج نمط القيادة اليدوية يُرفض (حصرية)",
