@@ -2131,6 +2131,32 @@ def main() -> int:
           (hs_slp.last_recovery or {}).get("detail", ""))
     hs_slp.update()
     check("ويستأنف التكامل بعدها (لا عطل أبدي)", hs_slp.ok)
+    # 🔴 نوم وسط لفّة: الزاوية المفقودة تُجهض اللفّة ولا تقتل المهمة
+    class SleepyBridge(WaveRoverBridge):
+        """جسر ينام حسّاسه بعد أول قراءات اللفّة (اندفاع تيار المحركات)."""
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._n = 0
+        def read_imu(self):
+            d = super().read_imu()
+            self._n += 1
+            if 12 <= self._n <= 60:       # نافذة نوم وسط اللفّة
+                d["gz"] = 0.0
+            return d
+
+    slp_br = SleepyBridge(mode="sim")
+    slp_br.calibrate_gyro_bias(seconds=0.3)
+    slp_br.heading_source._try_recover = lambda: {"recovered": True,
+                                                  "detail": "أُوقظت (اختبار)"}
+    r_slp = slp_br.turn_by_angle(90, timeout=6.0)
+    check("🔴 نوم الحسّاس **وسط لفّة** يُجهضها (زاوية مفقودة لا تُبتلع)",
+          r_slp.get("aborted") == "heading_slept_midturn"
+          and any(e["kind"] == "heading_slept_midturn" for e in slp_br.events),
+          f"aborted={r_slp.get('aborted')}")
+    check("وليس من القاتلات — المهمة تعيد الخطوة (عطل تغذية عابر)",
+          r_slp.get("aborted") not in ("heading_source_fault", "sign_mismatch",
+                                       "rover_link_fault"))
+
     dead = _SleepyMPU()
     dead.recover = lambda: {"recovered": False, "detail": "الناقل لا يردّ"}
     hs_dead = _MPUH(dead, scale=1.0, sign=1)

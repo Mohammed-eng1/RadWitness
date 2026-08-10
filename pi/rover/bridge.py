@@ -780,6 +780,9 @@ class WaveRoverBridge:
             power_now = float(power)
             stall_t0 = None
             boosts = 0
+            # 🔴 الإحياء وسط اللفّة يُفقد زاويةً صامتاً — انظر الحارس أدناه
+            rec0 = self.heading_source.recoveries
+            slept = False
             self.turn(direction, power_now)
             start = time.time()
             self.heading_source.update()      # يثبّت مرجع الزمن/الزاوية
@@ -805,6 +808,25 @@ class WaveRoverBridge:
                 if not self.heading_source.ok:
                     self._event("heading_fault",
                                 f"⚠ مصدر الاتجاه توقّف: {self.heading_source.error}")
+                    break
+                # 🔴 **نام الحسّاس وأُحيي وسط اللفّة ⇒ الزاوية غير موثوقة**
+                # مقاس على العتاد (2026-08-10، check_imu_health --motors):
+                # اندفاع تيار المحركات أنام MPU في النبضة الثانية من ستّ.
+                # وأثناء النوم يقرأ الجايرو صفراً مضبوطاً — فدوران تلك
+                # المللي‑ثانية **يُفقد من التكامل صامتاً**، واللفّة تظنّ
+                # نفسها ناقصة فتواصل وتتجاوز هدفها فعلياً. الإحياء التلقائي
+                # (وهو صحيح) لا يستطيع استرجاع ما فات، فالحكم الوحيد الأمين:
+                # أجهض هذه اللفّة **وأعدها** — الزاوية بعدها مقيسة من جديد.
+                # ⚠ ليست قاتلة للمهمة: العطل عابر بطبيعته (نبضة تيار)،
+                #    والمهمة تعيد الخطوة بتهدئتها المعتادة.
+                if self.heading_source.recoveries > rec0:
+                    slept = True
+                    self._event(
+                        "heading_slept_midturn",
+                        f"⚠ نام مصدر الاتجاه وأُحيي **أثناء لفّة** "
+                        f"{degrees:+.0f}° — زاوية مفقودة، تُعاد اللفّة. "
+                        f"(هبوط تغذية عند اندفاع المحركات ⇒ إصلاح عتادي: "
+                        f"مكثّف عند الحسّاس أو فصل تغذيته عن خط المحركات)")
                     break
                 # ── الاستباق: اقطع الطاقة **قبل** الهدف بزاوية القصور ────
                 # التصحيح بعد الوقوع لا يقارب: لفّة تصحيح صغيرة تحتاج القوة
@@ -894,6 +916,7 @@ class WaveRoverBridge:
                 "peak_rate": peak_rate, "link_fault": link_fault,
                 "no_rotation": no_rotation, "spikes": spikes,
                 "stall_boosts": boosts, "power_used": power_now,
+                "slept_midturn": slept,
                 "source_ok": self.heading_source.ok}
 
     def turn_by_angle(self, degrees: float,
@@ -964,6 +987,11 @@ class WaveRoverBridge:
                     break
                 if r.get("sign_mismatch"):
                     aborted = "sign_mismatch"
+                    break
+                # ⚠ **ليس في قائمة القاتلات**: عطل تغذية عابر تُعاد الخطوة
+                #    بعده — لا سبب لقتل مهمة كاملة بنبضة تيار.
+                if r.get("slept_midturn"):
+                    aborted = "heading_slept_midturn"
                     break
                 if not r.get("source_ok", True):
                     aborted = "heading_source_fault"
