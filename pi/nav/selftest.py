@@ -1325,6 +1325,7 @@ def main() -> int:
     from pi.nav.motion_check import (
         AccelWitness, verify_motion, tolerance_for,
         VERIFIED, SHORT, OVERSHOOT, NO_MOTION, UNVERIFIED,
+        reference_ok as _mc_ref_ok,
     )
     from pi.config import (
         MOTION_REF_MAX_CM, MOTION_STUCK_LIMIT, MOTION_UNVERIFIED_DRIFT,
@@ -1561,6 +1562,36 @@ def main() -> int:
           and mres["accel"]["samples"] > 0,
           f"{mres['verdict']} · مقاس={mres['measured_m']}م · "
           f"عيّنات تسارع={mres['accel']['samples']}")
+
+    # 🔴 المرجع يُقرأ **خاماً**: عتبة ثقة الأمامي (30سم) تخصّ المسافة
+    #    المطلقة لقرارات العوائق، والتحقق يستعمل **فرق قراءتين** فينجو من
+    #    أي انحياز ثابت — وحدّ صلاحيته الخاص MOTION_REF_MAX_CM (250سم).
+    #    عطل مقاس 2026-08-11 تكرّر في **كل** جولة: في غرفة 2×1م تتجاوز
+    #    المسافة 30سم دائماً ⇒ المقصوصة None ⇒ «7 من 8 خلايا بثقة منخفضة
+    #    (حركة غير متحقَّقة)» ⇒ الخريطة كلها مفتوحة الحلقة، وأثره يمتدّ إلى
+    #    محدِّد المصدر الذي يبني تقديره على مواضع القراءات (§2.2).
+    class CappedSensors(MovingSensors):
+        """يحاكي العتاد الحقيقي: المقصوصة None فوق 30سم والخام موجودة."""
+        def __call__(self):
+            d = super().__call__()
+            raw = d["ultrasonic_cm"]
+            d["ultrasonic_cm"] = raw if raw <= 30.0 else None
+            d["ultrasonic_raw_cm"] = raw
+            return d
+
+    ex_cap = DriveExecutor(MotionRover(), ReactiveSafety(enabled=False),
+                           CappedSensors(start_cm=150.0), newp, imu=ShakingIMU())
+    m_cap = ex_cap.forward_cell(0.2).get("motion") or {}
+    check("🔴 مرجع الحركة يُقرأ خاماً فوق عتبة ثقة العوائق (لا يضيع المرجع)",
+          m_cap.get("d_start_cm") is not None
+          and m_cap.get("d_end_cm") is not None
+          and m_cap.get("measured_m") is not None,
+          f"{m_cap.get('d_start_cm')}→{m_cap.get('d_end_cm')}سم ⇒ "
+          f"{m_cap.get('verdict')}")
+    check("ولا يُعتدّ بقراءة فوق حدّ صلاحية التحقق نفسه (250سم)",
+          not _mc_ref_ok(MOTION_REF_MAX_CM + 1.0)
+          and _mc_ref_ok(MOTION_REF_MAX_CM - 1.0),
+          f"حدّان مختلفان لغرضين: 30سم للعوائق · {MOTION_REF_MAX_CM:.0f}سم للتحقق")
 
     # ⑦ **اختبار تكامل** — المهمة تستهلك الحكم وتغيّر سلوكها به
     from pi.nav.mission import RUNNING, ESTOP, DONE
