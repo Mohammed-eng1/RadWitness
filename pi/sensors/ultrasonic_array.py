@@ -38,7 +38,7 @@ from pi.config import (
 )
 from pi.sensors.ultrasonic import (
     DistanceFilter, QualityTracker, GroundEchoDetector,
-    SPEED_CM_PER_US, ECHO_TIMEOUT_S, MAX_PLAUSIBLE_CM,
+    SPEED_CM_PER_US, ECHO_TIMEOUT_S, MAX_PLAUSIBLE_CM, MIN_PLAUSIBLE_CM,
 )
 
 try:
@@ -152,7 +152,10 @@ class UltrasonicChannel:
         raw = None
         if self._st["width"] is not None:
             cm = (self._st["width"] / 1000.0) * SPEED_CM_PER_US / 2.0
-            raw = None if (cm <= 0 or cm > MAX_PLAUSIBLE_CM) else cm
+            # ⚠ دون MIN_PLAUSIBLE_CM = رنين المرسِل لا جسم (§ ultrasonic.py):
+            #    قراءة 0.8سم شلّت مهمة كاملة بشبح عائق (2026-08-10).
+            raw = (None if (cm < MIN_PLAUSIBLE_CM or cm > MAX_PLAUSIBLE_CM)
+                   else cm)
         self.raw_cm = raw
         self.measurements += 1
         self.quality.add(raw is not None)

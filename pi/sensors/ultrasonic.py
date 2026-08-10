@@ -39,7 +39,22 @@ except Exception:                     # noqa: BLE001 — ويندوز/تطوير
 SPEED_CM_PER_US = 0.0343              # سرعة الصوت (~343 م/ث)
 ECHO_TIMEOUT_S = 0.06                 # مهلة الصدى (~4م ذهاباً وإياباً)
 MAX_PLAUSIBLE_CM = 450.0
+# 🔴 **أدنى مدى فيزيائي لـHC-SR04 ≈ 2سم** — وما دونه ليس جسماً قريباً بل
+#    رنين المرسِل نفسه يُقرأ صدىً (أو تسرّب كهربائي على خط ECHO). عطل مقاس
+#    (2026-08-10): الأمامي أعطى **0.8سم ثابتة** والطريق خالٍ وIR الثلاثة
+#    خضراء، فرأت طبقة السلامة «عائقاً على 1سم» ورفضت كل حركة — فأُجهضت
+#    المهمة من الخلية الأولى وعُلّمت خمس خلايا «غير قابلة للوصول» زوراً.
+#    ⚠ القراءة دون هذا الحدّ تصير **مجهولة** (None) لا «عائقاً»: المجهول
+#    يُبقي سلّم السلامة على درجة «احترس» ويترك المدى القريب لـIR (2–30سم)
+#    وهو الحسّاس المؤهَّل له أصلاً — أما اعتبارها عائقاً فيشلّ الروبوت
+#    بشبح لا وجود له.
+MIN_PLAUSIBLE_CM = 2.5
 _MEASURE_GAP_S = 0.06                 # فاصل يحتاجه HC-SR04 بين القياسات
+
+
+def _plausible(cm) -> bool:
+    """هل القراءة داخل المدى الفيزيائي للحسّاس؟ (خارجه = مجهول لا قيمة)."""
+    return cm is not None and MIN_PLAUSIBLE_CM <= float(cm) <= MAX_PLAUSIBLE_CM
 
 
 def median(vals):
@@ -293,7 +308,7 @@ class UltrasonicReader:
         if self.backend == "gpiozero":
             try:
                 cm = self._gz.distance * 100.0
-                return None if (cm <= 0 or cm > MAX_PLAUSIBLE_CM) else cm
+                return None if not _plausible(cm) else cm
             except Exception:             # noqa: BLE001
                 return None
         self._st["rise"] = 0
@@ -307,7 +322,7 @@ class UltrasonicReader:
         if self._st["width"] is None:
             return None
         cm = (self._st["width"] / 1000.0) * SPEED_CM_PER_US / 2.0   # ns→µs→سم
-        return None if (cm <= 0 or cm > MAX_PLAUSIBLE_CM) else cm
+        return None if not _plausible(cm) else cm
 
     def _run(self):
         while not self._stop:
