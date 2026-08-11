@@ -439,6 +439,86 @@ def main() -> None:
     check("و/api/sim/status يردّ 200 لا 500",
           c.get("/api/sim/status").status_code == 200)
 
+    # ── 🎥 تسجيل المهمة على الراسبري ──────────────────────────────
+    section("ق) تسجيل المهمة:")
+    import tempfile as _tf, os as _os2, json as _js2
+    from pi.web.recorder import MissionRecorder, list_sessions
+
+    class _RecCam:
+        """كاميرا وهمية: تُعيد JPEG صالحاً وتعدّ كم مرة طُلبت."""
+        def __init__(self): self.calls = 0
+        def snapshot_jpeg(self, *a, **k):
+            self.calls += 1
+            return b"\xff\xd8" + b"J" * 2048
+
+    _root = _tf.mkdtemp(prefix="rec_test_")
+    _cam = _RecCam()
+    rec = MissionRecorder(mission, _cam, root=_root)
+    check("🔴 التسجيل **معطّل افتراضياً** (لا كتابة على SD بلا طلب)",
+          rec.enabled is False and rec.state()["recording"] is False)
+
+    _sv_state, _sv_phase = mission.state, mission.phase
+    try:
+        rec.set_enabled(True)
+        mission.state = "running"
+        mission.phase = "survey"
+        rec._tick()                       # تفتح الجلسة
+        rec._tick()                       # وتلتقط إطاراً
+        check("تُفتح جلسة مع بدء المهمة ويُلتقط إطار",
+              rec.session is not None and rec.frames >= 1,
+              f"{rec.frames} إطار · {_os2.path.basename(rec.session or '')}")
+        # 🔴 وأهم خاصية: لا يزاحم الكاميرا في مرحلة التوثيق
+        _before = _cam.calls
+        mission.phase = "document"
+        for _ in range(5):
+            rec._tick()
+        check("🔴 **لا يلمس الكاميرا في مرحلة التوثيق** (صور التقرير لا تُفقد)",
+              _cam.calls == _before and rec.skipped >= 5,
+              f"طلبات الكاميرا ثابتة عند {_before} · تُخطّي {rec.skipped}")
+        mission.phase = "survey"
+        rec._tick()
+        check("ويستأنف بعد انتهاء التوثيق", _cam.calls > _before)
+        # انتهاء المهمة ⇒ تُغلق الجلسة وتُكتب الملفات
+        _sess = rec.session
+        mission.state = "done"
+        rec._tick()
+        check("انتهاء المهمة يُغلق الجلسة ويكتب الملفات",
+              rec.session is None and rec.last_saved is not None)
+        _files = ["events.jsonl", "readings.csv", "report.json", "summary.txt"]
+        _missing = [f for f in _files
+                    if not _os2.path.exists(_os2.path.join(_sess, f))]
+        check("🔴 الجلسة تحوي السجل والقراءات والتقرير والخلاصة",
+              not _missing, "الناقص: " + (", ".join(_missing) or "لا شيء"))
+        check("والتقرير المحفوظ JSON صالح يُقرأ بلا السيرفر",
+              isinstance(_js2.load(open(_os2.path.join(_sess, "report.json"),
+                                        encoding="utf-8")), dict))
+        check("والجلسة تظهر في القائمة للمشغّل (يعرف أين ذهب التسجيل)",
+              any(s["name"] == _os2.path.basename(_sess)
+                  for s in list_sessions(root=_root)))
+        # الإطفاء وسط جلسة يحفظها لا يهدرها
+        rec.set_enabled(True)
+        mission.state = "running"
+        rec._tick(); rec._tick()
+        _sess2 = rec.session
+        rec.set_enabled(False)
+        check("🔴 وإطفاء التسجيل وسط جلسة **يحفظها** لا يتركها ناقصة",
+              rec.session is None
+              and _os2.path.exists(_os2.path.join(_sess2, "summary.txt")))
+    finally:
+        rec.shutdown()
+        mission.state, mission.phase = _sv_state, _sv_phase
+        try:
+            __import__("shutil").rmtree(_root, ignore_errors=True)
+        except Exception:                          # noqa: BLE001
+            pass
+
+    st_rec = c.get("/api/sim/status").json()
+    check("وحالة التسجيل تُبثّ للواجهة (لا تسجيل صامت)",
+          "record" in st_rec and "enabled" in st_rec["record"])
+    r_recs = c.get("/api/mission/recordings").json()
+    check("ومسار الجلسات مكشوف عبر نقطة صريحة",
+          r_recs["ok"] and "sessions" in r_recs)
+
     boot = c.get("/api/boot").json()
     check("البطارية بمصدرها في خلاصة الإقلاع",
           "battery" in boot["health"] and "source" in boot["health"]["battery"],

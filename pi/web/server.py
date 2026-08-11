@@ -26,11 +26,12 @@ from pydantic import BaseModel
 
 from pi.config import (
     WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
-    LORA_ENABLED, LORA_PORT,
+    LORA_ENABLED, LORA_PORT, MISSION_RECORD_DIR,
 )
 from pi.comms.control import ManualControl, SOURCE_MANUAL, SOURCE_RADIO
 from pi.comms.lora import LoRaLink
 from pi.web.modes import ModeManager, MODE_MANUAL
+from pi.web.recorder import MissionRecorder, list_sessions
 from pi.web.stream import mjpeg_frames, resolution_options
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
@@ -134,6 +135,9 @@ if LORA_ENABLED:
     lora.start()          # يُعلن سببه إن فشل — لا يُسقط الإقلاع
 # الأنماط الثلاثة الحصرية (طبقة واجهة — منطق الملاحة يبقى في mission)
 modes = ModeManager(mission, manual, camera)
+# 🎥 مسجّل المهمة — **معطّل حتى يطلبه المشغّل**. يقود دورة حياته بنفسه
+#    بمراقبة حالة المهمة، فلا سطر تسجيل واحد في `mission.py`.
+recorder = MissionRecorder(mission, camera)
 
 
 def init_side_ultrasonic(mission_obj, enabled: bool = None) -> dict:
@@ -281,6 +285,7 @@ def _full_state(include_full_grid: bool = False) -> dict:
             "ui_mode": modes.state(),
             "manual": manual.state(),
             "lora": lora.state(),
+            "record": recorder.state(),
             # حالة الانسحاب للشريط العلوي: «معلّق» قبل أن تخدمه الحلقة،
             # و«جارٍ» حين يصير الطور withdraw. (قراءة فقط — كما تقرأ
             # البوابة `mission._worker` — والمنطق كله يبقى في mission)
@@ -341,6 +346,7 @@ async def lifespan(_app: FastAPI):
     t2 = asyncio.create_task(_sensor_loop())
     yield
     t1.cancel(); t2.cancel()
+    recorder.shutdown()        # 🎥 جلسة جارية تُحفظ لا تُهدر عند الإغلاق
     lora.stop()                # ⚠ يوقف المحركات إن كان الراديو آمرها
     manual.set_enabled(False)  # ولا تُترك عجلة تدور عند إغلاق السيرفر
     geiger.close(); gps.close(); camera.close()
@@ -644,6 +650,24 @@ async def api_drive_mode(req: Request):
     d = await req.json()
     return mission.set_drive_motors(bool(d.get("motors", False)),
                                     allow_sim=bool(d.get("allow_sim", False)))
+
+
+@app.post("/api/mission/record")
+async def api_mission_record(req: Request):
+    """
+    🎥 تفعيل/إيقاف تسجيل المهمة كاملةً على الراسبري.
+
+    ⚠ مُسجَّل قبل مسار `/api/mission/{action}` العام عمداً — وإلا ابتلعه.
+    """
+    d = await req.json()
+    return recorder.set_enabled(bool(d.get("enabled", False)))
+
+
+@app.get("/api/mission/recordings")
+async def api_mission_recordings():
+    """الجلسات المحفوظة على القرص — ليعرف المشغّل أين ذهب التسجيل."""
+    return {"ok": True, "root": MISSION_RECORD_DIR,
+            "sessions": list_sessions()}
 
 
 @app.post("/api/mission/batt_rth_override")

@@ -381,6 +381,14 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <input type="checkbox" id="battRthOverride" style="width:17px;height:17px;accent-color:var(--acc)">
       </label>
       <div id="battRthMsg"></div>
+      <!-- 🎥 تسجيل المهمة كاملةً على الراسبري — بطلب صريح لا افتراضاً
+           (كتابة مستمرة على بطاقة SD تستهلك عمرها) -->
+      <label class="row" style="cursor:pointer;margin-bottom:6px"
+             title="إطارات كاميرا + سجل الأحداث + القراءات + التقرير + صور التوثيق، في مجلد واحد على الراسبري">
+        <span>🎥 سجّل المهمة كاملةً على الراسبري</span>
+        <input type="checkbox" id="recOn" style="width:17px;height:17px;accent-color:var(--acc)">
+      </label>
+      <div id="recMsg"></div>
       <!-- 🎯 مصدر تدريبي: قيادة حقيقية + عدّ جيجر مصنّع — بروفة الاختبار -->
       <details style="margin:7px 0">
         <summary class="muted" style="cursor:pointer">🎯 مصدر تدريبي افتراضي (بروفة)</summary>
@@ -568,6 +576,17 @@ $("#ignoreSensors").onchange = async e => {
   addEvent("sys", e.target.checked
     ? "⚠ تجاوز حساسات العوائق مفعّل — التقدّم لن يُمنع ولو وُجد عائق"
     : "أُعيد تفعيل حساسات العوائق", Date.now()/1000);
+};
+
+/* ═══ 🎥 تسجيل المهمة — الحالة تُعرض دائماً لا عند الطلب ═══ */
+$("#recOn").onchange = async e => {
+  const want = e.target.checked;
+  const r = await api("/api/mission/record", {enabled: want});
+  if (!r || r.ok === false){ e.target.checked = !want; return; }
+  addEvent("sys", want
+    ? "🎥 التسجيل مفعّل — تُفتح جلسة تلقائياً مع بدء كل مهمة"
+    : "التسجيل مطفأ" + (r.last_saved ? " · آخر جلسة: " + r.last_saved : ""),
+    Date.now()/1000);
 };
 
 /* ═══ رفع العودة الإجبارية بسبب الجهد — الثمن معروض لا مخفيّ ═══ */
@@ -1510,6 +1529,22 @@ function apply(st){
   const bro = $("#battRthOverride");
   if (document.activeElement !== bro && bro.checked !== !!st.batt_rth_override)
     bro.checked = !!st.batt_rth_override;
+  // 🎥 مزامنة مفتاح التسجيل + حالته الحيّة (لا تسجيل صامت ولا مفقود)
+  const rc = st.record || {};
+  const rcBox = $("#recOn");
+  if (document.activeElement !== rcBox && rcBox.checked !== !!rc.enabled)
+    rcBox.checked = !!rc.enabled;
+  if (rc.recording)
+    showMsg("#recMsg", "🎥 يسجّل الآن: " + (rc.frames||0) + " إطاراً · "
+      + (rc.mb||0) + "/" + (rc.max_mb||0) + "MB"
+      + ((rc.skipped||0) ? " · تُخطّي " + rc.skipped + " (التوثيق يملك الكاميرا)" : "")
+      + (rc.error ? " · ⚠ " + esc(rc.error) : ""), "muted");
+  else if (rc.last_saved)
+    showMsg("#recMsg", "✅ حُفظت آخر جلسة: " + esc(rc.last_saved)
+      + " — في captures/missions/ على الراسبري", "muted");
+  else if (rc.enabled)
+    showMsg("#recMsg", "🎥 جاهز — تُفتح الجلسة تلقائياً مع بدء المهمة.", "muted");
+  else $("#recMsg").innerHTML = "";
   if (st.batt_rth_override)
     showMsg("#battRthMsg", "⚠ العودة عند انخفاض البطارية **مرفوعة**. الحماية "
       + "تعود تلقائياً دون " + (st.batt_rth_floor_v ?? 10) + "V — وعندها إيقاف "
