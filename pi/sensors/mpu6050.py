@@ -123,19 +123,56 @@ class MPU6050Reader:
                     return {"recovered": False,
                             "detail": f"WHO_AM_I={hex(who)} ≠ "
                                       f"{hex(WHO_AM_I_VAL)} — ليست MPU-6050"}
-                self._bus.write_byte_data(self.addr, REG_PWR_MGMT_1, 0)
-                time.sleep(0.05)
-                pwr2 = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_1)
-                if pwr2 & 0x40:
+                # 🔴 **الإيقاظ يُعاد لا يُجرَّب مرة**، ومهلته أطول من 50ms.
+                #    عطل مقاس 2026-08-11: المهمة أُجهضت بـ«الإيقاظ كُتب ولم
+                #    يثبت (PWR_MGMT_1=0x40) — تغذية 3.3V غير مستقرة»، ثم
+                #    أثبت الفحص اليدوي عكس ذلك تماماً: `i2cset 0x6b 0x00`
+                #    نجح **وثبت بعد خمس ثوانٍ**، وستّ نبضات محركات مرّت بصفر
+                #    أخطاء وσ=0.33°/ث. أي أن التغذية سليمة والمحاولة الواحدة
+                #    القصيرة هي التي فشلت — وحكمُها **قاتل للمهمة**، فثمن
+                #    تسرّعها إجهاض جولة كاملة.
+                # ⚠ والمحاولة الثانية تبدأ بإعادة تعيين كاملة (0x80): أوصت
+                #   بها ورقة البيانات، ولا تُفقدنا شيئاً — التهيئة كلها على
+                #   القيم الافتراضية (لا سجل إعدادات آخر يُكتب في هذا الملف).
+                pwr2, why = pwr, ""
+                for attempt in range(3):
+                    if attempt:
+                        # إعادة تعيين الجهاز ثم إيقاظه من جديد
+                        self._bus.write_byte_data(self.addr,
+                                                  REG_PWR_MGMT_1, 0x80)
+                        time.sleep(0.12)
+                    self._bus.write_byte_data(self.addr, REG_PWR_MGMT_1, 0)
+                    time.sleep(0.12 + 0.08 * attempt)
+                    pwr2 = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_1)
+                    if not (pwr2 & 0x40):
+                        why = ("" if attempt == 0
+                               else f" (بعد {attempt + 1} محاولات وإعادة تعيين)")
+                        break
+                else:
                     return {"recovered": False,
-                            "detail": "الإيقاظ كُتب ولم يثبت (PWR_MGMT_1 "
-                                      f"={hex(pwr2)}) — تغذية 3.3V غير مستقرة"}
+                            "detail": f"الإيقاظ لم يثبت بعد 3 محاولات وإعادة "
+                                      f"تعيين (PWR_MGMT_1={hex(pwr2)}) — "
+                                      f"تغذية 3.3V غير مستقرة"}
+                # 🔴 الدليل القاطع على الحياة: **الجاذبية**. بت السكون مرفوع
+                #    عن الشريحة لا عن البيانات، ومقياس التسارع الحيّ يقرأ ~1g
+                #    دائماً — فأصفار مضبوطة فيه تعني «لا بيانات» مهما قال
+                #    السجل. (وهذا ما تفحصه أداة `check_imu_health` يدوياً.)
+                live = None
+                try:
+                    d = self._bus.read_i2c_block_data(self.addr, REG_ACCEL_X, 6)
+                    live = any(d[i] or d[i + 1] for i in (0, 2, 4))
+                except Exception:         # noqa: BLE001 — I2C عابر
+                    live = None           # تعذّرت القراءة: لا نفي ولا إثبات
+                if live is False:
+                    return {"recovered": False,
+                            "detail": "استيقظت لكن مقياس التسارع يقرأ أصفاراً "
+                                      "مضبوطة — لا جاذبية ⇒ لا بيانات فعلاً"}
                 self.ok = True
                 self.error = None
                 return {"recovered": True,
                         "detail": ("أُوقظت من **السكون** (إعادة تشغيل ذاتية — "
                                    "هبوط جهد عند اندفاع المحركات)" if asleep
-                                   else "كانت مستيقظة؛ أُعيدت التهيئة")}
+                                   else "كانت مستيقظة؛ أُعيدت التهيئة") + why}
             except Exception as e:    # noqa: BLE001
                 return {"recovered": False,
                         "detail": f"الناقل لا يردّ: {e}"}

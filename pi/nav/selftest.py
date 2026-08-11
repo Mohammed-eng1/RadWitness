@@ -564,6 +564,69 @@ def main() -> int:
           MPU6050GyroHeading(FakeIMU()).state()["mag_used"] is False
           and MPU6050GyroHeading(FakeIMU()).state()["calibrated"] is False)
 
+    # ── 🔴 إحياء MPU من السكون: **يُعاد لا يُجرَّب مرة** ─────────────
+    # عطل مقاس 2026-08-11: المهمة أُجهضت بـ«الإيقاظ كُتب ولم يثبت
+    # (PWR_MGMT_1=0x40) — تغذية 3.3V غير مستقرة»، ثم أثبت الفحص اليدوي
+    # عكسه تماماً: `i2cset 0x6b 0x00` نجح **وثبت بعد خمس ثوانٍ**، وستّ
+    # نبضات محركات مرّت بصفر أخطاء وσ=0.33°/ث. أي أن التغذية سليمة
+    # والمحاولة الواحدة القصيرة هي التي فشلت — وحكمها **قاتل للمهمة**.
+    from pi.sensors.mpu6050 import (MPU6050Reader, REG_PWR_MGMT_1,
+                                    REG_WHO_AM_I, REG_ACCEL_X, WHO_AM_I_VAL)
+
+    class SleepyBus:
+        """
+        شريحة وهمية نائمة تستيقظ بعد `wake_after` محاولات كتابة إيقاظ —
+        تحاكي ما رآه العتاد: الكتابة الأولى لا تثبت والتالية تثبت.
+        """
+        def __init__(self, wake_after=1, gravity=True):
+            self.pwr, self.writes = 0x40, 0
+            self.wake_after, self.gravity = wake_after, gravity
+        def read_byte_data(self, addr, reg):
+            return WHO_AM_I_VAL if reg == REG_WHO_AM_I else self.pwr
+        def write_byte_data(self, addr, reg, val):
+            if reg != REG_PWR_MGMT_1:
+                return
+            if val == 0x80:                       # إعادة تعيين ⇒ يعود نائماً
+                self.pwr = 0x40
+                return
+            self.writes += 1
+            if self.writes > self.wake_after:
+                self.pwr = 0x00
+        def read_i2c_block_data(self, addr, reg, n):
+            # 1g على المحور z (~16384 LSB) = دليل الحياة
+            return [0, 0, 0, 0, 0x40, 0x00] if self.gravity else [0] * n
+        def close(self):
+            pass
+
+    def reader_with_bus(bus):
+        r = MPU6050Reader.__new__(MPU6050Reader)
+        r.addr, r.bus_num = 0x68, 4
+        r.ok, r.error = False, "نائمة"
+        r._bus, r._lock = bus, __import__("threading").Lock()
+        r._gyro = (0.0, 0.0, 0.0)
+        return r
+
+    r_late = reader_with_bus(SleepyBus(wake_after=1))
+    res_late = r_late.recover()
+    check("🔴 إيقاظ لم يثبت أول مرة ⇒ يُعاد بإعادة تعيين ولا يُعلَن عطلاً",
+          res_late["recovered"] is True and r_late.ok is True,
+          res_late["detail"][:64])
+    r_ok = reader_with_bus(SleepyBus(wake_after=0))
+    check("والإيقاظ الناجح من أول مرة يبقى بلا إعادة تعيين",
+          r_ok.recover()["recovered"] is True)
+    # 🔴 والعطل الحقيقي **لا يُبتلع**: شريحة لا تستيقظ أبداً
+    r_dead = reader_with_bus(SleepyBus(wake_after=99))
+    res_dead = r_dead.recover()
+    check("🔴 وشريحة لا تستيقظ بعد 3 محاولات تُعلَن عطلاً (لا تفاؤل كاذب)",
+          res_dead["recovered"] is False and "3 محاولات" in res_dead["detail"],
+          res_dead["detail"][:56])
+    # 🔴 ومستيقظة بلا جاذبية = لا بيانات — الدليل القاطع لا بت السجل
+    r_flat = reader_with_bus(SleepyBus(wake_after=0, gravity=False))
+    res_flat = r_flat.recover()
+    check("🔴 واستيقاظ بلا جاذبية يُرفض (بت السكون يرفع عن الشريحة لا البيانات)",
+          res_flat["recovered"] is False and "جاذبية" in res_flat["detail"],
+          res_flat["detail"][:56])
+
     # 🔴 لا مصدر ميت يُقبل بديلاً على العتاد الحقيقي
     class RealishBridge(WaveRoverBridge):
         """جسر يدّعي وضع real لاختبار سياسة المصادر (بلا منفذ فعلي)."""
