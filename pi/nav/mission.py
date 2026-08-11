@@ -453,6 +453,40 @@ class MissionSim:
             self._worker.start()
         return {"ok": True}
 
+    def _ensure_worker(self) -> bool:
+        """
+        🔴 **لا حالة RUNNING بلا خيط يقودها.** يُعيد True إن صار خيط حيّاً.
+
+        عطل مقاس 2026-08-11 وهو أخطر ما ظهر: `_motor_worker` ينتهي بـ`break`
+        عند اكتمال المسح، وحلقته مشروطة بـ`state in (RUNNING, PAUSED)` —
+        فأي مسار يُعيد الحالة إلى RUNNING **بعد** خروج الخيط يترك النظام
+        معلَّقاً: الواجهة تقول «running» إلى الأبد والروبوت واقف بلا سبب
+        ولا سطر سجل. ثلاثة مسارات تفعل ذلك:
+          • `return_home()` بعد انتهاء المسح (زرّ العودة · حارس الجهد ·
+            الحاجز الزمني) — وهو ما شوهد: «عودة لنقطة الانطلاق» ثم صمت.
+          • `resume()` بعد `estop()` (الحلقة خرجت عند ESTOP).
+          • `request_withdraw()` والمهمة منتهية — والانسحاب أمر **سلامة**،
+            وقبوله بلا تنفيذ أسوأ من رفضه بوضوح.
+
+        ⚠ لا يُنشئ خيطاً بلا `drive_motors`: المسح المنطقي لا خيط له أصلاً.
+        """
+        if not self.drive_motors:
+            return False
+        w = self._worker
+        if w is not None and w.is_alive():
+            return True
+        if self.profile is None:
+            self._log("worker", "⚠ تعذّر إحياء خيط المحركات: لا ملف معايرة")
+            return False
+        self.executor = DriveExecutor(self.rover, self.reactive,
+                                      self.sensors, self.profile)
+        self._worker = threading.Thread(target=self._motor_worker, daemon=True)
+        self._worker.start()
+        self._log("worker",
+                  "أُعيد تشغيل خيط المحركات (الحالة RUNNING بلا خيط — "
+                  "كان يُنتج تعليقاً صامتاً)")
+        return True
+
     def pause(self):
         if self.state == RUNNING:
             self.state = PAUSED
@@ -463,6 +497,9 @@ class MissionSim:
         if self.state in (PAUSED, ESTOP):
             self.state = RUNNING
             self._log("resume", "استئناف")
+            # الخيط يخرج عند ESTOP (شرط الحلقة) — بلا إحيائه يبقى «running»
+            # بلا حركة، وهو تعليق صامت لا عطل معلَن.
+            self._ensure_worker()
 
     def estop(self):
         self.state = ESTOP
@@ -475,6 +512,8 @@ class MissionSim:
             self._returning = True
             self.state = RUNNING
             self._log("return_home", "عودة لنقطة الانطلاق")
+            # 🔴 المسح المنتهي أنهى خيطه — والعودة بلا خيط تعليق صامت
+            self._ensure_worker()
 
     def toggle_obstacle(self, row, col) -> dict:
         """أداة اختبار: وضع/إزالة عائق وهمي (الروبوت يعيد التخطيط فوراً)."""
@@ -1461,9 +1500,17 @@ class MissionSim:
             msg = "طلب انسحاب بلا قيادة محركات — لا حركة تُنفَّذ"
             self._log("withdraw_request", f"⚠ {msg}")
             return {"ok": False, "error": msg}
-        self._withdraw_req = {"until_cpm": until_cpm, "reason": reason or "أمر انسحاب"}
-        self._log("withdraw_request", f"🔴 طلب انسحاب — {self._withdraw_req['reason']}")
-        return {"ok": True, **self._withdraw_req}
+        # ⚠ نسخة محلية **قبل** إحياء الخيط: الخيط يخدم الطلب في رأس حلقته
+        #   ويصفّر `_withdraw_req` فوراً، فقراءته بعد التشغيل سباق يفشل.
+        req = {"until_cpm": until_cpm, "reason": reason or "أمر انسحاب"}
+        self._withdraw_req = req
+        self._log("withdraw_request", f"🔴 طلب انسحاب — {req['reason']}")
+        # 🔴 الانسحاب يخدمه الخيط في رأس حلقته — فبلا خيط حيّ يبقى الطلب
+        #    معلّقاً بلا تنفيذ. وأمر سلامة «مقبول» لا يُنفَّذ أسوأ من مرفوض.
+        if self.state in (DONE, IDLE):
+            self.state = RUNNING
+        self._ensure_worker()
+        return {"ok": True, **req}
 
     def _serve_withdraw(self) -> None:
         """يُنفّذ الطلب المعلّق ثم ينهي المهمة (لا استئناف مسح بعد انسحاب)."""

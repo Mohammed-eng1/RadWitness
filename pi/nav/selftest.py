@@ -1921,7 +1921,12 @@ def main() -> int:
         ms_p._advance_one_cell(ms_p._next_target())
     visited_before = ms_p.grid.counts()["visited"]
     ms_p.request_withdraw(until_cpm=0.0, reason="اختبار الأولوية")
-    ms_p._motor_worker()
+    # ⚠ الطلب صار يُحيي خيطاً بنفسه (لا طلب سلامة يبقى معلّقاً) — فننتظره
+    #   بدل تشغيل الحلقة يدوياً، وإلا تسابق نسختان على نفس الطلب.
+    if ms_p._worker is not None:
+        ms_p._worker.join(timeout=30)
+    else:
+        ms_p._motor_worker()
     check("🔴 أمر التراجع له **أولوية مطلقة** على المسح والتغطية",
           ms_p.grid.counts()["visited"] == visited_before
           and ms_p.current == ms_p.grid.start_cell()
@@ -2748,6 +2753,67 @@ def main() -> int:
     check("ولا تُنفَّذ فيها أي مرحلة حركية (الحالة IDLE تمنع القيادة)",
           ms_rt._can_drive() and not ms_rt._can_move(),
           f"can_drive={ms_rt._can_drive()} · can_move={ms_rt._can_move()}")
+
+    # ── 🔴 لا حالة RUNNING بلا خيط يقودها — التعليق الصامت ─────────
+    # عطل مقاس 2026-08-11 وهو أخطر ما ظهر: `_motor_worker` ينتهي بـ`break`
+    # عند اكتمال المسح، وحلقته مشروطة بـ`state in (RUNNING, PAUSED)`. فكل
+    # مسار يُعيد الحالة إلى RUNNING **بعده** يترك النظام معلَّقاً: الواجهة
+    # تقول «running» والروبوت واقف بلا سبب ولا سطر سجل. شوهد حرفياً:
+    # «عودة لنقطة الانطلاق» ثم صمت تامّ.
+    # ⚠ ولا يكشفه اختبار عادي: الحالة «صحيحة» والأحداث «سليمة» — الغائب
+    #   هو **الخيط**، فيجب فحصه صراحةً.
+    def _finished_mission():
+        m = full_mission(run=False)
+        m.drive_motors = True
+        m.state = DONE            # كما تتركها `_finish` بعد اكتمال المسح
+        m._worker = None          # والخيط خرج بـbreak
+        return m
+
+    def _not_stuck(m) -> bool:
+        """
+        الثابت الحقيقي: **لا حالة RUNNING وخيطها ميت**.
+
+        ⚠ ولا يُشترط أن يكون الخيط حيّاً لحظة الفحص: قد يُنهي عمله فوراً
+          (الروبوت في نقطة البداية أصلاً) فيخرج بحالة IDLE — وذاك نجاح
+          لا فشل. اشتراط `is_alive()` سباق يفشل عشوائياً.
+        """
+        w = m._worker
+        return w is not None and (w.is_alive() or m.state != RUNNING)
+
+    m_rth = _finished_mission()
+    m_rth.return_home()
+    check("🔴 العودة بعد انتهاء المسح **تُحيي الخيط** (لا «running» بلا حركة)",
+          _not_stuck(m_rth),
+          f"الحالة={m_rth.state} · خيط منشأ={m_rth._worker is not None}")
+    m_rth._stop_worker("انتهى الفحص")
+
+    m_res = _finished_mission()
+    m_res.estop()                 # الحلقة تخرج عند ESTOP
+    m_res.resume()
+    check("والاستئناف بعد إيقاف الطوارئ يُحيي الخيط كذلك", _not_stuck(m_res))
+    m_res._stop_worker("انتهى الفحص")
+
+    m_wd = _finished_mission()
+    _r_wd = m_wd.request_withdraw(reason="اختبار")
+    if m_wd._worker is not None:
+        m_wd._worker.join(timeout=20)
+    check("🔴 وطلب انسحاب بعد انتهاء المسح يُنفَّذ لا يبقى معلّقاً",
+          _r_wd["ok"] and m_wd._worker is not None
+          and m_wd._withdraw_req is None and m_wd.state != RUNNING,
+          "أمر سلامة مقبول ولا يُنفَّذ أسوأ من مرفوض بوضوح")
+    m_wd._stop_worker("انتهى الفحص")
+
+    # 🔴 والحالة العالقة نفسها تُكشف: RUNNING بخيط ميت **قبل** الإصلاح
+    m_stuck = _finished_mission()
+    m_stuck.state = RUNNING       # كما كان يتركها `return_home` القديم
+    check("والحارس يكشف الحالة العالقة فعلاً (لا يمرّ على أي شيء)",
+          _not_stuck(m_stuck) is False,
+          "RUNNING بخيط ميت = تعليق صامت")
+
+    m_log = _finished_mission()
+    m_log.drive_motors = False    # مسح منطقي: لا خيط أصلاً ولا يُختلق
+    check("وبلا قيادة محركات لا يُختلق خيط (المسح المنطقي بلا خيط بالتصميم)",
+          m_log._ensure_worker() is False and m_log._worker is None)
 
     # ── 🔴 التوثيق يُنفَّذ من المسافة الآمنة ولو مُنع الاقتراب ──────
     # ثغرة مقاسة 2026-08-09: تتبّع التدرّج بلغ عتبة التوقف وأعلن «جاهز
