@@ -90,21 +90,42 @@ def _resize_jpeg(data: bytes, size) -> bytes:
         return data
 
 
-def mjpeg_frames(camera, res: str = None, is_active=None):
+#: إطارات مفقودة متتالية قبل إعلان الكاميرا غائبة وإنهاء البثّ.
+#  ⚠ **لا يُنهى البثّ من أول إطار مفقود**: `snapshot_jpeg` يُعيد `None` حين
+#  تكون لقطة أخرى جارية (حارس تكديس الخيوط) — ومع وجود مستهلك ثانٍ
+#  (مسجّل المهمة) صار هذا حدثاً عادياً كل بضع ثوانٍ. الإنهاء الفوري كان
+#  يقتل البثّ لأتفه سبب ويُظهره «معطّلاً» وهو سليم.
+STREAM_MAX_MISSES = 24                               # ~2ث عند 12 إطار/ث
+
+
+def mjpeg_frames(camera, res: str = None, is_active=None, pause_fn=None):
     """
     مولّد إطارات multipart.
 
-    `is_active`: دالة تُسأل قبل كل إطار — **البثّ يتوقف فور مغادرة النمط**
-    ولا ينتظر انقطاع المتصفح. بدونها يبقى الجهاز مشغولاً بعد الخروج.
+    `is_active`: تُسأل قبل كل إطار — **البثّ يتوقف فور انتفائها** ولا ينتظر
+                 انقطاع المتصفح.
+    `pause_fn` : تُسأل قبل كل إطار — `True` ⇒ **توقّف مؤقت بلا إنهاء**: لا
+                 تُلمس الكاميرا ولا يُقطع الاتصال. تُستعمل لمرحلة التوثيق:
+                 الكاميرا هناك ملك التوثيق وحده (لقطة ثانية أثناء لقطة
+                 جارية تُرفض، فالمزاحمة تُفقد **صور التقرير** نفسها).
     """
     size = RESOLUTIONS.get(res or DEFAULT_RES)
     interval = 1.0 / max(1, CAMERA_STREAM_FPS)
+    misses = 0
     while True:
         if is_active is not None and not is_active():
-            break                                    # غادر النمط ⇒ أنهِ البثّ
+            break                                    # انتفت الصلاحية ⇒ أنهِ
+        if pause_fn is not None and pause_fn():
+            time.sleep(interval)                     # توقّف مؤقت لا إنهاء
+            continue
         data = camera.snapshot_jpeg()
         if data is None:
-            break                                    # الكاميرا غير متاحة
+            misses += 1
+            if misses >= STREAM_MAX_MISSES:
+                break                                # الكاميرا غائبة فعلاً
+            time.sleep(interval)
+            continue
+        misses = 0
         data = _resize_jpeg(data, size)
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
                b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"

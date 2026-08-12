@@ -211,10 +211,22 @@ def main() -> None:
 
     # ═══ و) الكاميرا: بثّ عند الطلب فقط ═══════════════════════════
     section("و) بثّ الكاميرا:")
-    r = c.get("/stream.mjpg")
-    check("🔴 **البثّ مرفوض خارج نمط القيادة اليدوية** بسبب مقروء",
-          r.status_code == 409 and "القيادة اليدوية" in r.text,
-          f"HTTP {r.status_code}")
+    # 🔴 البثّ صار مسموحاً **في كل الأنماط** (كان مقصوراً على القيادة
+    #    اليدوية، فيُرفض بـ409 بعد كل مهمة ذاتية — «الكاميرا ما تشتغل»
+    #    عند شرح الروبوت). والمنع صار على **المرحلة**: التوثيق يملك
+    #    الكاميرا وحده. وبلا كاميرا يُعلَن السبب بـ503 لا 409.
+    # ⚠ لا يُستهلك البثّ هنا: MJPEG تيّار لا نهائي، وعلى جهاز فيه كاميرا
+    #   فعلاً يفتح الطلبُ الجهازَ ويعلّق الاختبار. المنطق مُختبَر أدناه
+    #   على المولّد مباشرةً بجهاز وهمي.
+    _cam_ok = c.get("/api/camera/options").json().get("camera", {}).get("available")
+    if not _cam_ok:
+        r = c.get("/stream.mjpg")
+        check("🔴 بلا كاميرا: **503 بسبب مقروء** لا رفض بسبب النمط",
+              r.status_code == 503 and "الكاميرا غير متاحة" in r.text,
+              f"HTTP {r.status_code}")
+    else:
+        check("🔴 بلا كاميرا: 503 بسبب مقروء (تُخطّي — الكاميرا متاحة هنا)",
+              True, "لا يُستهلك بثّ حيّ في اختبار")
     opts = c.get("/api/camera/options").json()
     check("الدقّات المتاحة معروضة", opts["options"] == ["640x480", "320x240"],
           str(opts["options"]))
@@ -236,6 +248,48 @@ def main() -> None:
     n = sum(1 for _ in mjpeg_frames(DeadCam(), "320x240", is_active=lambda: True))
     check("🔴 كاميرا غائبة ⇒ البثّ ينتهي بلا إطارات (لا انهيار ولا تعليق)",
           n == 0, f"{n} إطاراً")
+
+    # 🔴 إطار مفقود **واحد لا يُنهي البثّ**: `snapshot_jpeg` يُعيد None حين
+    #    تكون لقطة أخرى جارية — ومع مسجّل المهمة صار ذلك حدثاً عادياً كل
+    #    بضع ثوانٍ. الإنهاء الفوري كان سيقتل البثّ ويُظهره «معطّلاً» وهو سليم.
+    from pi.web.stream import STREAM_MAX_MISSES
+
+    class _FlakyCam:
+        """يفقد إطاراً بين كل إطارين — كما يحدث مع مستهلك ثانٍ للكاميرا."""
+        def __init__(self): self.n = 0
+        def snapshot_jpeg(self, *a, **k):
+            self.n += 1
+            return None if self.n % 2 else b"\xff\xd8" + b"x" * 64
+
+    _flaky, _got = _FlakyCam(), 0
+    for _chunk in mjpeg_frames(_flaky, "320x240",
+                               is_active=lambda: _flaky.n < 12):
+        _got += 1
+    check("🔴 إطار مفقود متقطّع لا يُنهي البثّ (يتخطّى ويكمل)",
+          _got >= 4, f"{_got} إطاراً رغم فقد نصفها")
+
+    # ⏸ التوقّف المؤقت لمرحلة التوثيق: **لا يلمس الكاميرا ولا يقطع الاتصال**
+    class _CountCam:
+        def __init__(self): self.calls = 0
+        def snapshot_jpeg(self, *a, **k):
+            self.calls += 1
+            return b"\xff\xd8" + b"x" * 64
+
+    _cc = _CountCam()
+    _ticks = {"n": 0}
+
+    def _paused():
+        _ticks["n"] += 1
+        return True                       # التوثيق جارٍ طوال الاختبار
+
+    _pf = 0
+    for _chunk in mjpeg_frames(_cc, "320x240",
+                               is_active=lambda: _ticks["n"] < 5,
+                               pause_fn=_paused):
+        _pf += 1
+    check("🔴 وأثناء التوثيق: **لا لقطة ولا إطار** — الكاميرا للتوثيق وحده",
+          _cc.calls == 0 and _pf == 0,
+          f"طلبات الكاميرا={_cc.calls} · إطارات={_pf}")
 
     class FakeCam:
         def __init__(self):

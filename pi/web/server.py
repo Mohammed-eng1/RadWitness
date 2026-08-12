@@ -347,6 +347,10 @@ async def lifespan(_app: FastAPI):
     yield
     t1.cancel(); t2.cancel()
     recorder.shutdown()        # 🎥 جلسة جارية تُحفظ لا تُهدر عند الإغلاق
+    try:
+        camera.close()         # تحرير الجهاز هنا لا عند كل تبديل نمط
+    except Exception:          # noqa: BLE001
+        pass
     lora.stop()                # ⚠ يوقف المحركات إن كان الراديو آمرها
     manual.set_enabled(False)  # ولا تُترك عجلة تدور عند إغلاق السيرفر
     geiger.close(); gps.close(); camera.close()
@@ -949,22 +953,27 @@ def snapshot() -> Response:
 @app.get("/stream.mjpg")
 def stream(res: str = None) -> Response:
     """
-    بثّ MJPEG **عند الطلب فقط**: يعمل في نمط القيادة اليدوية وحده ويتوقف
-    فور مغادرته (`is_active`) — لا ينتظر انقطاع المتصفح.
+    بثّ MJPEG **في كل الأنماط** — ويتوقف مؤقتاً في مرحلة التوثيق وحدها.
 
-    ⚠ سبب الرفض **مقروء** لا 503 صامتة: «الكاميرا غير متاحة» و«لست في
-    نمط القيادة اليدوية» عطلان مختلفان تماماً وعلاجهما مختلف.
+    🔴 كان مقصوراً على نمط القيادة اليدوية، فكان يُرفض بـ409 بعد انتهاء أي
+    مهمة ذاتية (مقاس 2026-08-11: «الكاميرا ما تشتغل» عند شرح الروبوت بعد
+    المهمة). والقيد لم يكن له مبرّر أمني: الخطر الحقيقي هو مزاحمة
+    **الصور التوثيقية** — و`snapshot_jpeg` يرفض لقطة ثانية أثناء لقطة
+    جارية، فبثّ أثناء التوثيق كان سيُفقد صور التقرير.
+
+    ⇒ المنع صار **على المرحلة لا على النمط**، وهو **توقّف مؤقت لا قطع**:
+      الاتصال يبقى مفتوحاً والبثّ يستأنف فور انتهاء التوثيق — بدل قطعٍ
+      يتبعه سيل إعادة اتصال من المتصفح.
+
+    ⚠ وسبب التعذّر **مقروء** لا 503 صامتة.
     """
-    if modes.mode != MODE_MANUAL:
-        return Response(status_code=409,
-                        content="البثّ يعمل في نمط «القيادة اليدوية» فقط",
-                        media_type="text/plain; charset=utf-8")
     if not camera.state()["available"]:
         return Response(status_code=503,
                         content=f"الكاميرا غير متاحة: {camera.error or 'سبب غير معروف'}",
                         media_type="text/plain; charset=utf-8")
     return StreamingResponse(
-        mjpeg_frames(camera, res, is_active=lambda: modes.camera_streaming),
+        mjpeg_frames(camera, res,
+                     pause_fn=lambda: getattr(mission, "phase", "") == "document"),
         media_type="multipart/x-mixed-replace; boundary=frame")
 
 
