@@ -2700,6 +2700,39 @@ def main() -> int:
           cam4.snapshot_jpeg(timeout_s=2.0) == b"JPEG-OK"
           and cam4.timeouts == 0)
 
+    # 🔴 الإطار **المشترك**: عدد نداءات الجهاز ثابت مهما كثر المشاهدون.
+    #    عطل مقاس 2026-08-11: صفحتا التحكم و/sim مفتوحتان ⇒ أربعة بثوث ×
+    #    12 طلباً/ث على جهاز يخدم **واحداً** ⇒ يضيع أغلبها ويتأخر أول إطار.
+    cam6 = _CamR()
+    cam6.available = True
+    _hits = {"n": 0}
+
+    def _count_grab():
+        _hits["n"] += 1
+        return b"FRAME-" + str(_hits["n"]).encode()
+
+    cam6._snapshot_blocking = _count_grab
+    _first = cam6.latest_jpeg(max_age_s=5.0)
+    _rest = [cam6.latest_jpeg(max_age_s=5.0) for _ in range(20)]
+    check("🔴 عشرون مشاهداً ⇒ **نداء جهاز واحد** (إطار مشترك لا تزاحم)",
+          _hits["n"] == 1 and all(f == _first for f in _rest),
+          f"نداءات الجهاز={_hits['n']} لـ21 طلباً")
+    check("وانقضاء عمر الإطار يُجدّده (لا صورة متجمّدة)",
+          cam6.latest_jpeg(max_age_s=0.0) != _first and _hits["n"] == 2)
+    # وأثناء المزاحمة يُقدَّم آخر إطار بدل انقطاع
+    cam6._snapshot_blocking = lambda: None
+    cam6._worker = None
+    check("ومع تعذّر الالتقاط يُقدَّم آخر إطار حديث بدل لا شيء",
+          cam6.latest_jpeg(max_age_s=0.0) is not None and cam6.shared >= 1)
+    # 🔴 والتوثيق **لا يستعمل المخزَّن**: صورته تُلتقط بعد لفّة، والمخزَّن
+    #    قد يكون من الزاوية السابقة ⇒ صورة توثّق اتجاهاً خاطئاً.
+    import inspect as _insp
+    from pi.ai import approach_document as _adoc
+    check("🔴 والتوثيق يستدعي `snapshot_jpeg` الطازجة لا الإطار المخزَّن",
+          "snapshot_jpeg" in _insp.getsource(_adoc.capture_photo_set)
+          and "latest_jpeg" not in _insp.getsource(_adoc.capture_photo_set),
+          "إطار مخزَّن بعد لفّة = صورة من الزاوية السابقة")
+
     # 🔴 القفل **الحقيقي** لا محاكاته: الاختبارات أعلاه تستبدل
     #    `_snapshot_blocking` نفسه، فلا تمرّ بالقفل أصلاً — والانحدار الذي
     #    نحرسه هنا يقع **داخله**: العامل المهجور يبقى ممسكاً بالقفل بحكم

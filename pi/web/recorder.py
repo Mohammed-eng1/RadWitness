@@ -135,7 +135,10 @@ class MissionRecorder:
             self.skipped += 1
             return
         try:
-            data = cam.snapshot_jpeg()
+            # الإطار المشترك: التسجيل لا يزاحم البثّ على الجهاز — يأخذ
+            # نفس الإطار إن كان حديثاً. (والتوثيق على لقطة طازجة دائماً.)
+            grab = getattr(cam, "latest_jpeg", None) or cam.snapshot_jpeg
+            data = grab()
         except Exception:                         # noqa: BLE001
             data = None
         # ⚠ إطار فارغ/قزم ليس صورة: `snapshot_jpeg` يُعيد None حين تكون

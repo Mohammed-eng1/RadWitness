@@ -14,7 +14,8 @@ import threading
 import time
 
 from pi.config import (CAMERA_INDEX, CAMERA_W, CAMERA_H, CAMERA_STREAM_FPS,
-                       CAMERA_SNAPSHOT_TIMEOUT_S, CAMERA_CLOSE_LOCK_TIMEOUT_S)
+                       CAMERA_SNAPSHOT_TIMEOUT_S, CAMERA_CLOSE_LOCK_TIMEOUT_S,
+                       CAMERA_FRAME_CACHE_S, CAMERA_STALE_FRAME_MAX_S)
 
 try:
     import cv2
@@ -36,6 +37,10 @@ class CameraReader:
         self._gen = 0                 # جيل المقبض: يمنع عاملاً مهجوراً من
                                       # تحرير مقبض فُتح **بعده**
         self.abandoned = 0            # مقابض هُجرت بلا تحرير (خيط عالق يملكها)
+        # إطار مشترك بين المشاهدين (انظر `latest_jpeg`) — يمنع تزاحمهم
+        self._last_jpeg = None
+        self._last_jpeg_ts = 0.0
+        self.shared = 0               # مرات قُدّم فيها إطار مخزَّن (للتشخيص)
 
     def _ensure_open(self) -> bool:
         """
@@ -147,6 +152,40 @@ class CameraReader:
             self.error = box["err"]
             return None
         return box.get("data")
+
+    def latest_jpeg(self, max_age_s: float = CAMERA_FRAME_CACHE_S,
+                    timeout_s: float = CAMERA_SNAPSHOT_TIMEOUT_S):
+        """
+        🔴 إطار **مشترك** بين كل المشاهدين — لا تزاحم على جهاز واحد.
+
+        الكاميرا تخدم طلباً واحداً في كل لحظة (حارس تكديس الخيوط في
+        `snapshot_jpeg`)، وصفحتا التحكم و/sim مفتوحتان معاً تعنيان أربعة
+        بثوث × 12 طلباً/ث = 48 طلباً على جهاز يخدم واحداً. فيضيع أغلبها
+        ويتأخر أول إطار ثوانيَ (مقاس 2026-08-11: «الكاميرا تطول»).
+
+        فمن طلب إطاراً وعمرُ آخر إطار دون `max_age_s` يأخذه كما هو. ⇒ عدد
+        نداءات الجهاز يصير **ثابتاً مهما كثر المشاهدون**.
+
+        ⚠ وأثناء المزاحمة يُقدَّم آخر إطار حتى `CAMERA_STALE_FRAME_MAX_S`
+          بدل `None`: صورة عمرها جزء من ثانية خير من بثّ متقطّع.
+
+        🔴 **لا يُستعمل للتوثيق**: صور التقرير تُلتقط **بعد لفّة**، وإطار
+           مخزَّن قد يكون من الزاوية السابقة — أي صورة توثّق اتجاهاً خاطئاً.
+           التوثيق يستدعي `snapshot_jpeg` مباشرةً ويأخذ إطاراً طازجاً.
+        """
+        now = time.time()
+        data, ts = self._last_jpeg, self._last_jpeg_ts
+        if data is not None and (now - ts) <= max_age_s:
+            return data
+        fresh = self.snapshot_jpeg(timeout_s)
+        if fresh is not None:
+            self._last_jpeg, self._last_jpeg_ts = fresh, time.time()
+            return fresh
+        # مزاحمة (عامل آخر يلتقط الآن) ⇒ آخر إطار ما دام حديثاً بما يكفي
+        if data is not None and (now - ts) <= CAMERA_STALE_FRAME_MAX_S:
+            self.shared += 1
+            return data
+        return None
 
     def mjpeg_frames(self):
         """مولّد إطارات multipart للبث الحي (لا يُكتب شيء على القرص)."""

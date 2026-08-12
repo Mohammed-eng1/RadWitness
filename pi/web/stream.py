@@ -118,7 +118,11 @@ def mjpeg_frames(camera, res: str = None, is_active=None, pause_fn=None):
         if pause_fn is not None and pause_fn():
             time.sleep(interval)                     # توقّف مؤقت لا إنهاء
             continue
-        data = camera.snapshot_jpeg()
+        # ⚠ **الإطار المشترك** لا لقطة خاصة: كل مشاهد يطلب لقطته يزاحم
+        #   البقية على جهاز يخدم واحداً. `latest_jpeg` يجعل نداءات الجهاز
+        #   ثابتة مهما كثر المشاهدون. (والتوثيق يبقى على لقطة طازجة.)
+        grab = getattr(camera, "latest_jpeg", None) or camera.snapshot_jpeg
+        data = grab()
         if data is None:
             misses += 1
             if misses >= STREAM_MAX_MISSES:
