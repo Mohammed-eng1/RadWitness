@@ -34,7 +34,8 @@ import sys
 import time
 
 from pi.config import TURN_POWER, MAX_MOTOR_POWER
-from pi.sensors.mpu6050 import get_mpu, REG_WHO_AM_I, WHO_AM_I_VAL
+from pi.sensors.mpu6050 import (get_mpu, REG_WHO_AM_I,
+                                WHO_AM_I_NAMES, chip_name)
 
 REG_PWR_MGMT_1 = 0x6B          # بت 6 = SLEEP (يُضبط تلقائياً بعد إعادة تشغيل)
 
@@ -68,8 +69,9 @@ def show_health(m) -> bool:
     except Exception as e:         # noqa: BLE001
         print(f"  ⛔ الناقل لا يردّ: {e}")
         return False
-    print(f"  WHO_AM_I = {hex(who)}  "
-          + ("✅" if who == WHO_AM_I_VAL else "⛔ ليست MPU-6050"))
+    # ⚠ العائلة أربع شرائح بنفس السجلات — الاسم يُطبع لا يُفترض
+    print(f"  WHO_AM_I = {hex(who)} → **{chip_name(who)}**  "
+          + ("✅" if who in WHO_AM_I_NAMES else "⛔ خارج عائلة MPU المدعومة"))
     sb = sleep_bit(m)
     print(f"  بت السكون = {sb}  "
           + ("✅ مستيقظ" if sb is False else

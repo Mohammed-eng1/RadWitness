@@ -1,10 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-mpu6050.py — قارئ MPU-6050 (GY-521) — **مصدر الاتجاه بعد تلف BNO055**
+mpu6050.py — قارئ عائلة MPU (6050 / 6500 / 9250) — **مصدر الاتجاه**
 ======================================================================
 BNO055 تعرّضت لـ5.40V وحدّها المطلق 3.6V، فانهارت مشغّلات خرجها وصارت تشدّ
-SDA/SCL للأرضي وتشلّ الناقل بالكامل. البديل المركَّب: MPU-6050 على نفس
+SDA/SCL للأرضي وتشلّ الناقل بالكامل. البديل: وحدة من عائلة MPU على نفس
 الناقل `/dev/i2c-4` عند العنوان `0x68`.
+
+🔴 **الوحدة المركَّبة حالياً: MPU-6500** (‏WHO_AM_I = `0x70`، مقاس
+   2026-08-12). واسم الملف تاريخي — المنطق واحد للعائلة كلها.
+
+⚠ **العائلة تُقبل بمعرّفاتها لا بمعرّف واحد**: خريطة السجلات ومعاملات
+   التحويل متطابقة (÷131 جايرو · ÷16384 تسارع)، ويتغيّر `WHO_AM_I` وحده.
+   وقصرُ القبول على `0x68` كان يرفض وحدة **سليمة** ويُعلنها «ليست
+   MPU-6050» — عطل تشخيصي كامل من ثابت واحد.
+
+🔎 **وكيف يُميَّز المقلَّد من السليم** (الفحص الذي حسم استبدال الوحدة
+   السابقة): اكتب `0x07` في سجل `0x19` (SMPLRT_DIV) ثم اقرأه. السليمة
+   تُعيد `0x07`؛ والمقلَّدة تُعيد `0x00` — تردّ بهوية صحيحة ولا تحتفظ
+   بالكتابة. وهذه بالضبط بصمة «الإيقاظ كُتب ولم يثبت» التي عذّبتنا:
+   الشريحة كانت **مقلَّدة** لا التغذية منهارة.
 
 ⚠ **ما لم يتغيّر — والالتباس هنا مكلف**: المشروع **لم يكن يستعمل مرجعاً
    مطلقاً أصلاً**. BNO055 كانت تعمل في وضع IMUPLUS (بلا مغنيتومتر) والاتجاه
@@ -53,7 +67,24 @@ REG_ACCEL_X = 0x3B
 REG_TEMP = 0x41
 REG_GYRO_X = 0x43
 REG_WHO_AM_I = 0x75
-WHO_AM_I_VAL = 0x68
+
+#: 🔴 **عائلة كاملة لا شريحة واحدة**: نفس خريطة السجلات ونفس معاملات
+#  التحويل (÷131 جايرو · ÷16384 تسارع) — يتغيّر المعرّف وحده. قصرُ القبول
+#  على 0x68 كان يرفض وحدة **سليمة** ويُعلنها «ليست MPU-6050».
+#  ⚠ مقاس 2026-08-12: الوحدة المركّبة **MPU-6500** (0x70).
+WHO_AM_I_NAMES = {
+    0x68: "MPU-6050",
+    0x70: "MPU-6500",
+    0x71: "MPU-9250",
+    0x73: "MPU-9255",
+}
+WHO_AM_I_VAL = 0x68        # يبقى للتوافق مع أدوات التشخيص القديمة
+
+
+def chip_name(who) -> str:
+    """اسم الشريحة من معرّفها — أو المعرّف الخام إن كان مجهولاً."""
+    return WHO_AM_I_NAMES.get(who, f"غير معروف ({hex(who)})"
+                              if who is not None else "غير مقروء")
 
 
 class MPU6050Reader:
@@ -70,6 +101,7 @@ class MPU6050Reader:
         self.addr = int(addr)
         self.bus_num = int(bus_num)
         self.who_am_i = None
+        self.chip = "غير مقروءة"      # اسم الشريحة المكتشفة (للسجل والواجهة)
         self._bus = None
         self._lock = threading.Lock()
         self._gyro = (0.0, 0.0, 0.0)
@@ -83,18 +115,21 @@ class MPU6050Reader:
             self._bus = SMBus(self.bus_num)
             who = self._bus.read_byte_data(self.addr, REG_WHO_AM_I)
             self.who_am_i = who
-            if who != WHO_AM_I_VAL:
-                raise OSError(f"WHO_AM_I={hex(who)} ≠ {hex(WHO_AM_I_VAL)} — "
-                              f"ليست MPU-6050")
+            if who not in WHO_AM_I_NAMES:
+                raise OSError(
+                    f"WHO_AM_I={hex(who)} خارج عائلة MPU المدعومة "
+                    f"({'، '.join(f'{hex(k)}={v}' for k, v in WHO_AM_I_NAMES.items())})")
+            self.chip = chip_name(who)
             # ⚠ الإيقاظ إلزامي: الشريحة تُقلع في وضع السكون وتُرجع أصفاراً
             #    مضبوطة — وهي بالضبط بصمة «الحسّاس الميت» التي يكشفها حارس
             #    الصفر في مصدر الاتجاه، فتبدو المشكلة اتجاهاً وهي إيقاظ.
             self._bus.write_byte_data(self.addr, REG_PWR_MGMT_1, 0)
             self.ok = True
         except Exception as e:        # noqa: BLE001
-            self.error = (f"تعذّر فتح MPU-6050 على i2c-{self.bus_num} "
+            self.error = (f"تعذّر فتح وحدة MPU على i2c-{self.bus_num} "
                           f"@ {hex(self.addr)}: {e} — تحقّق بـ"
-                          f"`i2cdetect -y {self.bus_num}` (توقّع 0x68)")
+                          f"`i2cdetect -y {self.bus_num}` (توقّع "
+                          f"{hex(self.addr)})")
             self._close_bus()
 
     def recover(self) -> dict:
@@ -119,10 +154,10 @@ class MPU6050Reader:
                 who = self._bus.read_byte_data(self.addr, REG_WHO_AM_I)
                 pwr = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_1)
                 asleep = bool(pwr & 0x40)
-                if who != WHO_AM_I_VAL:
+                if who not in WHO_AM_I_NAMES:
                     return {"recovered": False,
-                            "detail": f"WHO_AM_I={hex(who)} ≠ "
-                                      f"{hex(WHO_AM_I_VAL)} — ليست MPU-6050"}
+                            "detail": f"WHO_AM_I={hex(who)} خارج عائلة MPU "
+                                      f"المدعومة — شريحة أخرى أو ناقل مضطرب"}
                 # 🔴 **الإيقاظ يُعاد لا يُجرَّب مرة**، ومهلته أطول من 50ms.
                 #    عطل مقاس 2026-08-11: المهمة أُجهضت بـ«الإيقاظ كُتب ولم
                 #    يثبت (PWR_MGMT_1=0x40) — تغذية 3.3V غير مستقرة»، ثم
@@ -250,7 +285,9 @@ class MPU6050Reader:
         gx, gy, gz = self._gyro
         return {
             "ok": self.ok, "error": self.error, "addr": self.addr,
-            "bus": self.bus_num, "driver": "smbus2", "chip": "MPU-6050",
+            "bus": self.bus_num, "driver": "smbus2",
+            # 🔴 الاسم **مكتشَف** لا مكتوب: العائلة أربع شرائح بنفس السجلات
+            "chip": self.chip,
             "who_am_i": (hex(self.who_am_i) if self.who_am_i is not None else None),
             "mode": "جيرو+تسارع خام (6 محاور، بلا دمج داخلي)",
             # 🔴 لا مغنيتومتر ولا مرجع مطلق — والمشروع لم يكن يستعملهما أصلاً

@@ -571,18 +571,20 @@ def main() -> int:
     # نبضات محركات مرّت بصفر أخطاء وσ=0.33°/ث. أي أن التغذية سليمة
     # والمحاولة الواحدة القصيرة هي التي فشلت — وحكمها **قاتل للمهمة**.
     from pi.sensors.mpu6050 import (MPU6050Reader, REG_PWR_MGMT_1,
-                                    REG_WHO_AM_I, REG_ACCEL_X, WHO_AM_I_VAL)
+                                    REG_WHO_AM_I, REG_ACCEL_X, WHO_AM_I_VAL,
+                                    WHO_AM_I_NAMES, chip_name)
 
     class SleepyBus:
         """
         شريحة وهمية نائمة تستيقظ بعد `wake_after` محاولات كتابة إيقاظ —
         تحاكي ما رآه العتاد: الكتابة الأولى لا تثبت والتالية تثبت.
         """
-        def __init__(self, wake_after=1, gravity=True):
+        def __init__(self, wake_after=1, gravity=True, who=WHO_AM_I_VAL):
             self.pwr, self.writes = 0x40, 0
             self.wake_after, self.gravity = wake_after, gravity
+            self.who = who
         def read_byte_data(self, addr, reg):
-            return WHO_AM_I_VAL if reg == REG_WHO_AM_I else self.pwr
+            return self.who if reg == REG_WHO_AM_I else self.pwr
         def write_byte_data(self, addr, reg, val):
             if reg != REG_PWR_MGMT_1:
                 return
@@ -626,6 +628,30 @@ def main() -> int:
     check("🔴 واستيقاظ بلا جاذبية يُرفض (بت السكون يرفع عن الشريحة لا البيانات)",
           res_flat["recovered"] is False and "جاذبية" in res_flat["detail"],
           res_flat["detail"][:56])
+
+    # ── 🔴 عائلة MPU لا شريحة واحدة ────────────────────────────────
+    # عطل مقاس 2026-08-12: وحدة **MPU-6500 سليمة** (WHO_AM_I=0x70) رُفضت
+    # وأُعلنت «ليست MPU-6050» لأن الكود يقبل 0x68 وحده — بينما خريطة
+    # السجلات ومعاملات التحويل متطابقة تماماً بين شرائح العائلة.
+    check("معرّفات العائلة الأربعة معرَّفة بأسمائها",
+          WHO_AM_I_NAMES == {0x68: "MPU-6050", 0x70: "MPU-6500",
+                             0x71: "MPU-9250", 0x73: "MPU-9255"},
+          " · ".join(f"{hex(k)}={v}" for k, v in WHO_AM_I_NAMES.items()))
+    for _who, _name in ((0x70, "MPU-6500"), (0x71, "MPU-9250"),
+                        (0x73, "MPU-9255"), (0x68, "MPU-6050")):
+        _r = reader_with_bus(SleepyBus(wake_after=0, who=_who))
+        _res = _r.recover()
+        check(f"و{_name} ({hex(_who)}) تُقبل ويُحيا منها الحسّاس",
+              _res["recovered"] is True and chip_name(_who) == _name)
+    # 🔴 وما خارج العائلة **يُرفض** (لا قبول متساهل يخفي شريحة أخرى)
+    _r_bad = reader_with_bus(SleepyBus(wake_after=0, who=0x12))
+    _res_bad = _r_bad.recover()
+    check("🔴 ومعرّف خارج العائلة يُرفض بسبب مقروء",
+          _res_bad["recovered"] is False
+          and "خارج عائلة MPU" in _res_bad["detail"],
+          _res_bad["detail"][:50])
+    check("واسم الشريحة يُستخرج للعرض ولا يُفترض",
+          chip_name(0x70) == "MPU-6500" and "غير معروف" in chip_name(0x12))
 
     # 🔴 لا مصدر ميت يُقبل بديلاً على العتاد الحقيقي
     class RealishBridge(WaveRoverBridge):
