@@ -68,6 +68,10 @@ REG_TEMP = 0x41
 REG_GYRO_X = 0x43
 REG_WHO_AM_I = 0x75
 
+#: إعادة محاولة قراءة الناقل — عثرة واحدة ليست عطل حسّاس (انظر `_block`).
+I2C_READ_RETRIES = 2          # محاولتان إضافيتان بعد الأولى
+I2C_RETRY_DELAY_S = 0.004     # 4ms — أطول من معاملة كاملة عند 100kHz
+
 #: 🔴 **عائلة كاملة لا شريحة واحدة**: نفس خريطة السجلات ونفس معاملات
 #  التحويل (÷131 جايرو · ÷16384 تسارع) — يتغيّر المعرّف وحده. قصرُ القبول
 #  على 0x68 كان يرفض وحدة **سليمة** ويُعلنها «ليست MPU-6050».
@@ -102,6 +106,10 @@ class MPU6050Reader:
         self.bus_num = int(bus_num)
         self.who_am_i = None
         self.chip = "غير مقروءة"      # اسم الشريحة المكتشفة (للسجل والواجهة)
+        # عدّادات صحّة الناقل — تصاعدها يكشف تدهوراً كهربائياً لا برمجياً
+        self.i2c_retries = 0          # قراءات نجحت **بعد** إعادة محاولة
+        self.i2c_errors = 0           # فشلت رغم كل المحاولات
+        self.last_i2c_error = None
         self._bus = None
         self._lock = threading.Lock()
         self._gyro = (0.0, 0.0, 0.0)
@@ -225,8 +233,42 @@ class MPU6050Reader:
         return struct.unpack(">h", bytes([hi, lo]))[0]
 
     def _block(self, reg: int, n: int = 6):
+        """
+        قراءة كتلة **بإعادة محاولة**: عثرة ناقل واحدة ليست عطل حسّاس.
+
+        عطل مقاس 2026-08-12: المهمة أُجهضت بـ«5 قراءات فاشلة متتابعة —
+        الناقل لا يردّ [Errno 121]»، بينما سكربت مباشر على نفس الناقل
+        واللحظة كان يقرأ **جاذبية سليمة 0.98g** وجايرو يتذبذب حول انحيازه
+        المقاس. أي أن الشريحة والتوصيل سليمان، والفاشل معاملة عابرة.
+
+        و`Errno 121` (Remote I/O) يعني أن الشريحة لم تُقرّ بمعاملة واحدة —
+        وهذا يحدث على ناقل عتادي مع ضجيج المحركات أو حِمل معالج عالٍ
+        (بثّ الكاميرا يفكّ ترميز الإطارات ويعيده). محاولة ثانية بعد
+        أربعة ملّي ثانية تعبرها.
+
+        🔴 وحدّ «5 قراءات فاشلة» **قاتل للمهمة**، فثمن عدم إعادة المحاولة
+           إجهاض جولة كاملة على عثرة ناقل. والحدّ يبقى كما هو: خمس
+           إخفاقات **بعد** إعادة المحاولة تعني عطلاً حقيقياً.
+
+        ⚠ وإعادة المحاولة **لا تُخفي ناقلاً متدهوراً**: `i2c_retries`
+          و`i2c_errors` في `state()` — تصاعدهما يعني مشكلة كهربائية
+          (أسلاك طويلة · شدّ مرتفع ضعيف · ضجيج محركات) تستحق إصلاحاً.
+        """
+        last = None
         with self._lock:
-            return self._bus.read_i2c_block_data(self.addr, reg, n)
+            for attempt in range(1 + I2C_READ_RETRIES):
+                try:
+                    d = self._bus.read_i2c_block_data(self.addr, reg, n)
+                    if attempt:
+                        self.i2c_retries += 1
+                    return d
+                except OSError as e:      # ENXIO/EREMOTEIO — عثرة ناقل
+                    last = e
+                    if attempt < I2C_READ_RETRIES:
+                        time.sleep(I2C_RETRY_DELAY_S)
+        self.i2c_errors += 1
+        self.last_i2c_error = f"{type(last).__name__}: {last}"
+        raise last
 
     # ── القراءات ─────────────────────────────────────────────────
     def gyro_dps(self):
@@ -289,6 +331,10 @@ class MPU6050Reader:
             # 🔴 الاسم **مكتشَف** لا مكتوب: العائلة أربع شرائح بنفس السجلات
             "chip": self.chip,
             "who_am_i": (hex(self.who_am_i) if self.who_am_i is not None else None),
+            # صحّة الناقل: `i2c_retries` يتصاعد ⇒ عثرات تُعبر بإعادة المحاولة
+            # (أسلاك/ضجيج محركات)، و`i2c_errors` ⇒ فشل رغمها.
+            "i2c_retries": self.i2c_retries, "i2c_errors": self.i2c_errors,
+            "last_i2c_error": self.last_i2c_error,
             "mode": "جيرو+تسارع خام (6 محاور، بلا دمج داخلي)",
             # 🔴 لا مغنيتومتر ولا مرجع مطلق — والمشروع لم يكن يستعملهما أصلاً
             "mag_used": False,

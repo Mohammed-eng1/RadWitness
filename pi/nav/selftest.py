@@ -605,7 +605,14 @@ def main() -> int:
         r.addr, r.bus_num = 0x68, 4
         r.ok, r.error = False, "نائمة"
         r._bus, r._lock = bus, __import__("threading").Lock()
-        r._gyro = (0.0, 0.0, 0.0)
+        r._gyro = r._accel = (0.0, 0.0, 0.0)
+        r._temp_c = 0.0
+        # عدّادات صحّة الناقل — يبنيها `__init__` الحقيقي، ويلزم القالب مثلها
+        r.i2c_retries = r.i2c_errors = 0
+        r.last_i2c_error = None
+        r.chip = "MPU-6050"
+        r.who_am_i = None
+        r.addr, r.bus_num = 0x68, 4
         return r
 
     r_late = reader_with_bus(SleepyBus(wake_after=1))
@@ -652,6 +659,47 @@ def main() -> int:
           _res_bad["detail"][:50])
     check("واسم الشريحة يُستخرج للعرض ولا يُفترض",
           chip_name(0x70) == "MPU-6500" and "غير معروف" in chip_name(0x12))
+
+    # ── 🔴 عثرة ناقل واحدة ليست عطل حسّاس ──────────────────────────
+    # عطل مقاس 2026-08-12: المهمة أُجهضت بـ«5 قراءات فاشلة متتابعة — الناقل
+    # لا يردّ [Errno 121]»، بينما سكربت مباشر على **نفس الناقل واللحظة**
+    # قرأ جاذبية سليمة 0.98g وجايرو يتذبذب حول انحيازه المقاس. أي أن
+    # الشريحة والتوصيل سليمان، والفاشل معاملة عابرة — و`_block` كان بلا
+    # أي إعادة محاولة، فثمن العثرة الواحدة إجهاض جولة كاملة.
+    from pi.sensors.mpu6050 import I2C_READ_RETRIES
+
+    class FlakyBus:
+        """يفشل `fail_first` مرة ثم ينجح — عثرة ناقل عابرة."""
+        def __init__(self, fail_first=1):
+            self.left, self.reads = fail_first, 0
+        def read_i2c_block_data(self, addr, reg, n):
+            self.reads += 1
+            if self.left > 0:
+                self.left -= 1
+                raise OSError(121, "Remote I/O error")
+            return [0x00, 0x64] * (n // 2)
+        def close(self):
+            pass
+
+    r_flaky = reader_with_bus(FlakyBus(fail_first=1))
+    r_flaky.ok = True
+    check("🔴 عثرة واحدة تُعبَر بإعادة المحاولة (لا قراءة فاشلة)",
+          r_flaky.gyro_dps() is not None and r_flaky.i2c_retries == 1
+          and r_flaky.i2c_errors == 0,
+          f"إعادات={r_flaky.i2c_retries} · أخطاء={r_flaky.i2c_errors}")
+    # 🔴 والعطل الحقيقي **لا يُبتلع**: فشل رغم كل المحاولات يبقى فشلاً
+    r_dead_bus = reader_with_bus(FlakyBus(fail_first=99))
+    r_dead_bus.ok = True
+    check("🔴 وفشل رغم كل المحاولات يبقى فاشلاً (لا تفاؤل كاذب)",
+          r_dead_bus.gyro_dps() is None and r_dead_bus.i2c_errors == 1
+          and "121" in (r_dead_bus.last_i2c_error or ""),
+          r_dead_bus.last_i2c_error)
+    check("وعدد المحاولات محدود لا لانهائي (لا تعليق على ناقل ميت)",
+          r_dead_bus._bus.reads == 1 + I2C_READ_RETRIES,
+          f"{r_dead_bus._bus.reads} محاولة")
+    check("وصحّة الناقل مكشوفة في الحالة (تدهور كهربائي يُرى لا يُخفى)",
+          {"i2c_retries", "i2c_errors", "last_i2c_error"} <= set(r_flaky.state()),
+          f"إعادات={r_flaky.state()['i2c_retries']}")
 
     # 🔴 لا مصدر ميت يُقبل بديلاً على العتاد الحقيقي
     class RealishBridge(WaveRoverBridge):
