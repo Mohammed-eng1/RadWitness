@@ -1759,9 +1759,15 @@ def main() -> int:
         """منفّذ وهمي يُسلّم حكم حركة محدَّداً — لاختبار استهلاك المهمة له."""
         def __init__(self, motion, covered=CELL_SIZE_M):
             self.motion, self.covered, self.calls = motion, covered, 0
+            self.settled = []
         def turn_to(self, a, b):  return {"ok": True, "turned_deg": 0.0}
-        def forward_cell(self, d, expected_wall_end_m=None):
+        def forward_cell(self, d, expected_wall_end_m=None,
+                         heading_error_deg=0.0, front_settled=False,
+                         on_stop=None):
             self.calls += 1
+            self.settled.append(bool(front_settled))
+            if on_stop is not None:
+                on_stop()            # المنفّذ الحقيقي ينادي عند قطع الطاقة
             return {"ok": True, "covered_m": self.covered, "aborted": None,
                     "reason": None, "motion": dict(self.motion)}
         def maybe_wall_correct(self, *a, **k): return None
@@ -1813,6 +1819,53 @@ def main() -> int:
     check("الخلية المكتملة من أشواط غير موثّقة تبقى بثقة منخفضة",
           m_9x.grid.get(1, 0).low_confidence and m_9x.state == DONE)
 
+    # ── ⑧ تسريع بلا خسارة إحصائية: زمن ميت يُحذف، ونافذة عدّ تُؤتمن ──
+    # 🔴 **اختبار تكامل** (البند 8): يُثبت أن المهمة تستدعي الآليتين فعلاً
+    #    وأن سلوكها يتغيّر بهما — لا أن الدالتين موجودتان.
+    from pi.config import COUNT_WINDOW_MAX_AGE_S as _CW_MAX
+
+    m_sp = mission_with({"verdict": VERIFIED, "moved": True, "confident": True,
+                         "measured_m": CELL_SIZE_M, "reason": "مقاس ≈ مأمور"})
+    check("🔴 شوط بلا لفّة يتخطّى انتظار الاستقرار (زمن ميت لا معلومة)",
+          bool(m_sp.executor.settled) and all(m_sp.executor.settled),
+          f"front_settled={m_sp.executor.settled}")
+
+    # وبعد لفّة حقيقية **لا** يتخطّاه: اللفّة تمرّ الحسّاس على الغرفة كلها
+    m_tn = mission_with({"verdict": VERIFIED, "moved": True, "confident": True,
+                         "measured_m": CELL_SIZE_M, "reason": "مقاس ≈ مأمور"},
+                        length=1.0, width=1.0)
+    m_tn.executor.settled.clear()
+    m_tn.executor.turn_to = lambda a, b: {"ok": True, "turned_deg": 90.0}
+    m_tn.state = RUNNING
+    m_tn._advance_one_cell((0, 1) if m_tn.grid.passable(0, 1) else (1, 0))
+    check("وبعد لفّة حقيقية يبقى الانتظار (الحسّاس مسح الغرفة كلها)",
+          m_tn.executor.settled == [False],
+          f"front_settled={m_tn.executor.settled}")
+
+    # ائتمان نافذة العدّ: **أقصر انتظاراً، بلا نافذة أقصر**
+    class _Tally:
+        ok = True
+        def __init__(self):  self.n = 0
+        def tally(self):     self.n += 7; return self.n
+    m_cw = mission_with({"verdict": VERIFIED, "moved": True, "confident": True,
+                         "measured_m": CELL_SIZE_M, "reason": "مقاس ≈ مأمور"})
+    m_cw.geiger = _Tally()
+    m_cw._mark_count_window()
+    time.sleep(0.30)                      # يحاكي استقرار المرشّح بعد التوقّف
+    _t0 = time.time()
+    _r = m_cw._measure(0.0, 0.0, 0.60)
+    _wall = time.time() - _t0
+    check("🔴 نافذة العدّ تبدأ عند **قطع الطاقة** لا بعد الاستقرار",
+          _wall < 0.45 and _r["duration_s"] >= 0.58 and _r["window"] == "exact",
+          f"انتظار {_wall:.2f}ث · نافذة {_r['duration_s']:.2f}ث "
+          f"(وُفّر {0.60 - _wall:.2f}ث بلا خسارة إحصائية)")
+    check("والنافذة تُستهلك مرة واحدة (لا تُقصّر قياساً تالياً)",
+          m_cw._count_window is None and m_cw._take_count_window() is None)
+    m_cw._count_window = (time.time() - (_CW_MAX + 5.0), 0)
+    check("ونافذة بائتة تُهمَل (خطوة أُجهضت بعائق فلم يعقبها قياس)",
+          m_cw._take_count_window() is None,
+          f"سقف العمر {_CW_MAX:.1f}ث")
+
     # ═══ (م) البنود 2-6: الدورة الكاملة ═══════════════════════════
     print("\nم) عقد القراءات والدورة الكاملة (البنود 2-6):")
     from pi.nav.mission import (
@@ -1836,8 +1889,12 @@ def main() -> int:
             return {"verdict": VERIFIED, "moved": True, "confident": True,
                     "measured_m": round(d, 3), "commanded_m": round(d, 3),
                     "direction": direction, "reason": "مقاس ≈ مأمور"}
-        def forward_cell(self, d, expected_wall_end_m=None):
+        def forward_cell(self, d, expected_wall_end_m=None,
+                         heading_error_deg=0.0, front_settled=False,
+                         on_stop=None):
             self.fwd += 1
+            if on_stop is not None:
+                on_stop()            # المنفّذ الحقيقي ينادي عند قطع الطاقة
             return {"ok": True, "covered_m": d, "aborted": None,
                     "reason": None, "motion": self._m(d)}
         def backward_step(self, d, power=None):

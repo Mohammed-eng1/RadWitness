@@ -27,6 +27,7 @@ from pi.config import (
     KNOWN_WALL_TOL_M, HARD_STOP_CM, IR_RANGE_CM,
     HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE, SPEED_RAMP_UP_PER_S,
     MOTION_VERIFY_ENABLED, MOTION_SETTLE_S, MOTION_BACKWARD_MAX_M,
+    MOTION_SETTLE_SKIP_IF_STILL,
     TURN_MIN_ACHIEVABLE_DEG, HEADING_STEER_PHASE_DEG,
 )
 from pi.nav.room import CELL_SIZE_M
@@ -92,7 +93,7 @@ class DriveExecutor:
                 "peak_rate_dps": res.get("peak_rate_dps")}
 
     # ── قراءتا التحقق من الحركة (البند 0) ────────────────────────
-    def _settled_front_cm(self):
+    def _settled_front_cm(self, settled: bool = False):
         """
         المسافة الأمامية **بعد استقرار المرشّح**. مرشّح الألترا سونيك وسيط 5
         ثم EMA، وكل قياس ~60ms ⇒ نافذته لا تتبدّل قبل ~0.3ث. القراءة الفورية
@@ -115,7 +116,10 @@ class DriveExecutor:
           بين الأمامي والتسارع إلى **ثقة منخفضة** لا إجهاض، و`reference_ok`
           يرفض القراءة الخرافية أصلاً.
         """
-        time.sleep(MOTION_SETTLE_S)
+        # `settled=True` يعني أن المستدعي **يضمن** سكون الروبوت في هذا
+        # الموضع وهذا الاتجاه مدةً تفوق نافذة المرشّح — فالانتظار زمن ميت.
+        if not (settled and MOTION_SETTLE_SKIP_IF_STILL):
+            time.sleep(MOTION_SETTLE_S)
         try:
             s = self.sensors()
         except Exception:                          # noqa: BLE001
@@ -135,7 +139,9 @@ class DriveExecutor:
     # ── التقدّم خلية واحدة تحت إشراف السلامة ─────────────────────
     def forward_cell(self, distance_m: float = CELL_SIZE_M,
                      expected_wall_end_m=None,
-                     heading_error_deg: float = 0.0) -> dict:
+                     heading_error_deg: float = 0.0,
+                     front_settled: bool = False,
+                     on_stop=None) -> dict:
         """
         يتقدّم `distance_m` بسرعة يقررها سلّم السلامة لحظياً.
 
@@ -160,7 +166,8 @@ class DriveExecutor:
         # تُؤخذ بعد استقرار المرشّح: اللفّة السابقة تُمرّر الحسّاس على الغرفة
         # كلها، فقراءة فورية بعدها خليط من أسطح لم نعد نواجهها.
         witness = AccelWitness() if self.verify_motion_enabled else None
-        d_start = self._settled_front_cm() if self.verify_motion_enabled else None
+        d_start = (self._settled_front_cm(settled=front_settled)
+                   if self.verify_motion_enabled else None)
 
         # ── تثبيت الاتجاه: الهدف = الاتجاه الحالي + الخطأ المتبقّي ─────
         # يُلتقط من الحسّاس لا من إطار الغرفة: مرجع مصدر الاتجاه يُصفَّر
@@ -260,6 +267,15 @@ class DriveExecutor:
                 covered += self.profile.speed_for_power(power) * REACTIVE_LOOP_S
         finally:
             self.rover.stop()                      # ⚠ إيقاف مضمون
+            # 🔴 لحظة السكون **هي** بداية نافذة عدّ هذه الخلية. المستدعي
+            #    يلتقطها هنا لا بعد الاستقرار، فالثواني التي تلي قطع
+            #    الطاقة عدّاتها عدّات هذا الموضع (COUNT_WINDOW_CREDIT).
+            # ⚠ داخل `finally`: استثناء منه يبتلع سبب الخروج الأصلي.
+            if on_stop is not None:
+                try:
+                    on_stop()
+                except Exception:                  # noqa: BLE001
+                    pass
         out = {"ok": aborted is None, "covered_m": round(covered, 3),
                "aborted": aborted,
                "reason": (last_decision or {}).get("reason"),

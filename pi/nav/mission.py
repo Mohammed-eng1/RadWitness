@@ -35,6 +35,7 @@ from pi.config import (
     BATT_SHUTDOWN_ENABLED, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
     MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S, IR_PRESENT,
     HEADING_SIGMA_PER_TURN_DEG,
+    COUNT_WINDOW_CREDIT_ENABLED, COUNT_WINDOW_MAX_AGE_S,
     CONFIRM_RADIUS_M, CONFIRM_DWELL_S, CONFIRM_POSITIONS,
     APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
     BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
@@ -226,6 +227,8 @@ class MissionSim:
         self.phase = PHASE_SURVEY
         self.cycle = None             # حصيلة الدورة الكاملة (للبثّ والتقرير)
         self._rolling_warned = False  # حُذّر من نافذة العدّاد المنزلقة مرة
+        # (زمن، عدّ) لحظة قطع الطاقة — بداية نافذة عدّ الخلية التالية
+        self._count_window = None
         self._gate_lost_logged = False  # أُعلن انهيار بوابة المحاذاة مرة
         self._wall_corrections = 0    # تصحيحات جدار ناجحة (لتقرير الانسحاب)
         self._ground_echo_logged = False  # أُعلن اشتباه صدى الأرض مرة
@@ -1079,8 +1082,15 @@ class MissionSim:
         # ⚠ **المتبقّي** لا الخلية كاملة: محاولة سابقة قطعت جزءاً من
         #    المسافة (تحقّق قاسها)، فالأمر بخلية كاملة يتجاوز الهدف.
         done = self._progress_toward(nxt)
+        # ⚠ `front_settled`: شوطٌ **لم تسبقه لفّة** يبدأ والروبوت واقف في
+        #   مكانه واتجاهه منذ توقّف القياس (3ث) — مرشّح الألترا سونيك مستقرّ
+        #   تماماً، فانتظار MOTION_SETTLE_S قبله زمن ميت. أمّا بعد لفّة فلا:
+        #   اللفّة تمرّ الحسّاس على الغرفة كلها.
+        just_turned = bool((self._last_turn or {}).get("turned_deg"))
         fwd = self.executor.forward_cell(CELL_SIZE_M - done,
-                                         expected_wall_end_m=exp_wall)
+                                         expected_wall_end_m=exp_wall,
+                                         front_settled=not just_turned,
+                                         on_stop=self._mark_count_window)
         covered = fwd.get("covered_m", 0.0)
         mv = fwd.get("motion") or {}
         if mv:
@@ -1829,6 +1839,41 @@ class MissionSim:
         return rem[0]
 
     # ══ عقد القراءات: قياس على نافذة زمنية **محدَّدة** (القسم 1) ══
+    def _mark_count_window(self) -> None:
+        """
+        يُستدعى من المنفّذ **لحظة قطع الطاقة** (لا بعد الاستقرار): من هنا
+        يبدأ الروبوت وقوفه عند موضع الخلية النهائي، فكل عدّة تتساقط بعدها
+        عدّةُ هذا الموضع. تسجيلها يجعل `_measure` يحتسبها ضمن نافذته بدل
+        إهدارها في انتظار استقرار المرشّح ثم العدّ من الصفر.
+
+        ⚠ لا يرمي ولا ينام — يُنفَّذ داخل `finally` في مسار الحركة (§6.3).
+        """
+        if not COUNT_WINDOW_CREDIT_ENABLED:
+            return
+        g = getattr(self, "geiger", None)
+        tally = None
+        if g is not None and getattr(g, "ok", False) and hasattr(g, "tally"):
+            try:
+                tally = g.tally()
+            except Exception:                      # noqa: BLE001 — GPIO عابر
+                tally = None
+        self._count_window = (time.time(), tally)
+
+    def _take_count_window(self):
+        """
+        يستهلك النافذة المسجَّلة (مرة واحدة) ويعيد `{t, tally, age_s}` أو
+        `None`. الاستهلاك إلزامي: خطوة أُجهضت بعائق لا يعقبها قياس، فبقاء
+        النافذة يُقصّر قياساً لاحقاً بزمن **لم يقف فيه الروبوت هنا**.
+        وسقف `COUNT_WINDOW_MAX_AGE_S` حارس ثانٍ على نفس الخطر.
+        """
+        cw, self._count_window = self._count_window, None
+        if not cw:
+            return None
+        age = time.time() - cw[0]
+        if age < 0.0 or age > COUNT_WINDOW_MAX_AGE_S:
+            return None
+        return {"t": cw[0], "tally": cw[1], "age_s": age}
+
     def _measure(self, x: float, y: float, duration_s: float) -> dict:
         """
         قياس واحد عند الموضع الحالي — يتوقّف ويعدّ **فعلاً**.
@@ -1844,13 +1889,19 @@ class MissionSim:
         في الانتظار حين تكون القيمة محسوبة.
         """
         dur = max(0.0, float(duration_s))
+        # ── ائتمان نافذة العدّ ────────────────────────────────────
+        # الزمن الساكن الذي سبق استدعاءنا (استقرار المرشّح بعد قطع الطاقة)
+        # وقتٌ عند **نفس الموضع** — فطرحه من الانتظار يقصّر المهمة بلا أن
+        # يقصّر النافذة: `dur` يبقى طولها الإحصائي، ويتغيّر متى بدأت فقط.
+        cw = self._take_count_window()
+        wait = max(0.0, dur - (cw["age_s"] if cw else 0.0))
         # 🎯 المصدر التدريبي يسبق العدّاد الحقيقي — القيادة والانتظار حقيقيان
         #    (الزمن جزء من البروفة على العتاد)، والعدّ وحده مصنّع بواسون من
         #    التربيع العكسي. الوسم `training` يصل كل قراءة ولا يُخفى.
         ts = self.training_source
         if ts is not None:
             if self.rover.mode == "real":
-                time.sleep(dur)
+                time.sleep(wait)
             bg = (self.locator.background_cpm if self.locator
                   else SOURCE_BG_CPM_DEFAULT)
             d2 = max((x - ts["x"]) ** 2 + (y - ts["y"]) ** 2,
@@ -1864,10 +1915,13 @@ class MissionSim:
                     "cpm_raw": cpm_raw, "window": "training"}
         g = getattr(self, "geiger", None)
         if g is not None and getattr(g, "ok", False):
-            t0 = g.tally() if hasattr(g, "tally") else None
-            if t0 is not None:
+            if cw is not None and cw["tally"] is not None:
+                t0, started = cw["tally"], cw["t"]   # النافذة بدأت عند التوقّف
+            else:
+                t0 = g.tally() if hasattr(g, "tally") else None
                 started = time.time()
-                time.sleep(dur)
+            if t0 is not None:
+                time.sleep(wait)
                 t1 = g.tally()
                 actual = max(time.time() - started, 1e-6)
                 if t1 is not None and t1 >= t0:
