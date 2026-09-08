@@ -119,14 +119,21 @@ imu = _boot("وحدة القصور الذاتي (القارئ المشترك)", 
 #    السجلات (0x68 MPU-6050 · 0x70 MPU-6500 · 0x71 MPU-9250 · 0x73 MPU-9255)
 #    وقد تُستبدل الوحدة دون علم أحد. طباعة المعرّف تُنهي دقائق من الحيرة
 #    (وقعت 2026-08-12: وحدة MPU-6500 سليمة رُفضت لأن الكود يقبل 0x68 وحده).
+# ⚠ الوحدة تُقرأ من **قارئ MPU نفسه** لا من غلاف BNO055 (`get_imu`):
+#    غلافه لا يحمل `chip`/`who_am_i` فكان السطر يطبع `None` مضلّلاً.
 try:
-    _imu_st = imu.state()
-    _say(f"[إقلاع] وحدة القصور الذاتي المكتشَفة: **{_imu_st.get('chip')}** "
-         f"(WHO_AM_I={_imu_st.get('who_am_i')}) على i2c-{_imu_st.get('bus')} "
-         f"@ {hex(_imu_st.get('addr')) if _imu_st.get('addr') is not None else '?'}"
-         + ("" if _imu_st.get("ok") else f" — ⚠ {_imu_st.get('error')}"))
-except Exception:                       # noqa: BLE001 — لا يُسقط الإقلاع
-    pass
+    from pi.sensors.mpu6050 import get_mpu as _get_mpu
+    _m = _get_mpu()
+    _st = _m.state() if _m is not None else {}
+    if _st.get("who_am_i"):
+        _say(f"[إقلاع] وحدة القصور الذاتي: **{_st.get('chip')}** "
+             f"(WHO_AM_I={_st.get('who_am_i')}) على i2c-{_st.get('bus')} "
+             f"@ {hex(_st['addr'])}")
+    else:
+        _say(f"[إقلاع] ⚠ وحدة القصور الذاتي لم تُقرأ: "
+             f"{_st.get('error') or 'لا قارئ'}")
+except Exception as _e:                 # noqa: BLE001 — لا يُسقط الإقلاع
+    _say(f"[إقلاع] ⚠ تعذّر فحص وحدة القصور الذاتي: {_e}")
 camera = _boot("الكاميرا (فتحها كسول)", CameraReader)
 rover = RoverBridge(mode="sim")
 # حساسات القرب الحقيقية + مصدر الإشعاع → محرّك المهمة (المرحلة 2)
