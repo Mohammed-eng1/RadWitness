@@ -15,7 +15,7 @@ import time
 
 from pi.config import (
     REACTIVE_SAFETY_ENABLED, REACTIVE_LOOP_S, SPEED_NO_READING,
-    UNCERTAINTY_INITIAL,
+    UNCERTAINTY_INITIAL, LADDER_MIN_POWER,
 )
 from pi.nav.reactive import speed_for_distance, median, JumpFilter
 from pi.nav.room import Room, OccupancyGrid
@@ -145,10 +145,15 @@ def main() -> int:
     print("\nز) ترقية التفادي (البنود 1-5):")
 
     # (2) السرعة المتدرّجة — التنازل عبر درجات السلّم
-    ladder = [(200, 0.50), (100, 0.40), (60, 0.30), (35, 0.20), (20, 0.0)]
+    # ⚠ درجة الزحف (0.20) تُرفع إلى `LADDER_MIN_POWER`: أمرٌ لا يُحرّك
+    #   المنصّة ليس تباطؤاً بل توقّفٌ صامت (عطل الفرش 2026-09-08).
+    ladder = [(200, 0.50), (100, 0.40), (60, 0.30),
+              (35, max(0.20, LADDER_MIN_POWER)), (20, 0.0)]
     got = [speed_for_distance(cm)["speed"] for cm, _ in ladder]
     check("السرعة تتنازل مع الاقتراب (سلّم متدرّج)",
-          got == [s for _, s in ladder], " → ".join(str(s) for s in got))
+          got == [s for _, s in ladder]
+          and all(a > b for a, b in zip(got, got[1:])),
+          " → ".join(f"{s:.3f}" for s in got))
     check("فشل القراءة → احترس ولا تقف",
           speed_for_distance(None)["speed"] == SPEED_NO_READING
           and speed_for_distance(None)["rung"] == "no_reading")
@@ -350,6 +355,7 @@ def main() -> int:
         HEADING_SPIKE_DPS_DRIVE, HEADING_SPIKE_DPS_TURN, MOTOR_TRIM_L,
         BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S, MISSION_HARD_LIMIT_S,
         MISSION_TIME_WARN_S, MIN_MOTOR_POWER,
+        DRIVE_STICTION_POWER,
     )
 
     # حسّاسات وهمية تنفّذ عقد IMUReader المستخدَم من مصادر الاتجاه
@@ -504,10 +510,41 @@ def main() -> int:
           abs(available_headroom(0.35, 0.028, -0.028)
               - (MAX_MOTOR_POWER - 0.35 - 0.028)) < 1e-9)
     # الفراغ مقيَّد **من طرفين**: أساس منخفض يُنزل محركاً تحت حدّ الزحف
+    _b = MIN_MOTOR_POWER + 0.15          # أساس يترك فراغاً سفلياً موجباً
     check("الفراغ يحترم الحدّ الأدنى للمحرك (لا عجلة واقفة)",
-          abs(available_headroom(0.20, 0.028, -0.028)
-              - (0.20 - 0.028 - MIN_MOTOR_POWER)) < 1e-9,
-          f"عند أساس 0.20 → {available_headroom(0.20, 0.028, -0.028):.3f}")
+          abs(available_headroom(_b, 0.028, -0.028)
+              - (_b - 0.028 - MIN_MOTOR_POWER)) < 1e-9,
+          f"عند أساس {_b:.2f} → {available_headroom(_b, 0.028, -0.028):.3f}")
+    # 🔴 وأساسٌ لا يتّسع للأرضية يعطي فراغاً **صفراً** لا سالباً: سيرٌ مفتوح
+    #    الحلقة أصدق من تصحيح يُجوّع عجلة حتى الوقوف (عطل الفرش 2026-09-08).
+    check("🔴 أساس دون الأرضية ⇒ لا تصحيح أصلاً (لا عجلة مجوَّعة)",
+          available_headroom(MIN_MOTOR_POWER, 0.028, -0.028) == 0.0)
+    # ولا درجة في سلّم السلامة تأمر بقوة لا تُحرّك المنصّة (توقّف صامت)
+    _rungs = [speed_for_distance(d) for d in (None, 35.0, 50.0, 90.0, 200.0)]
+    check("🔴 لا درجة سلّم تأمر بقوة دون أرضية الحركة (وإلا توقّفٌ صامت)",
+          all(r["speed"] >= MIN_MOTOR_POWER - 1e-9
+              for r in _rungs if r["rung"] != "stop"),
+          " · ".join(f"{r['rung']}={r['speed']:.2f}" for r in _rungs))
+    check("وأمرُ التوقف يبقى صفراً (الأرضية لا ترفع «قف»)",
+          speed_for_distance(10.0)["speed"] == 0.0)
+    # ⇒ والمحصّلة المقاسة **بالمتحكّم نفسه** (لا بحساب موازٍ يوماً ما ينحرف):
+    #   العجلة البطيئة لا تنزل تحت أرضية الأرضية عند أي درجة سلّم — وهذا
+    #   بالضبط ما انكسر على الفرش (0.100 = 20% من كامل القدرة).
+    _slow = []
+    for r in _rungs:
+        if r["rung"] == "stop":
+            continue
+        _hc = HeadingController(min_power=DRIVE_STICTION_POWER)
+        _w = _hc.wheels(90.0, 0.1, base_power=r["speed"])   # خطأ مشبِع
+        _slow.append(min(_w["left"], _w["right"]))
+    check("🔴 العجلة البطيئة لا تنزل تحت أرضية الأرضية عند أي درجة سلّم",
+          all(v >= DRIVE_STICTION_POWER - 1e-9 for v in _slow),
+          f"أدنى عجلة بطيئة = {min(_slow):.3f} "
+          f"(الأرضية {DRIVE_STICTION_POWER}) — وكانت 0.100 قبل الإصلاح")
+    # ⚠ وأرضية المحرّك تبقى هي الافتراض: الثوابت المعايرة مشتقّة عليها
+    check("وأرضية المتحكّم الافتراضية تبقى حدّ المحرّك (لا يتغيّر المعاير)",
+          HeadingController().min_power == MIN_MOTOR_POWER
+          and config_sanity()["ok"])
 
     # ⚠ **فحص انغلاق الحلقة** — الحارس الذي كان غائباً: كل الفحوص أعلاه
     # تختبر المتحكّم مفتوح الحلقة (قيمة تصحيح واحدة) فتمرّ حتى لو كانت
@@ -1753,7 +1790,7 @@ def main() -> int:
           f"حدّان مختلفان لغرضين: 30سم للعوائق · {MOTION_REF_MAX_CM:.0f}سم للتحقق")
 
     # ⑦ **اختبار تكامل** — المهمة تستهلك الحكم وتغيّر سلوكها به
-    from pi.nav.mission import RUNNING, ESTOP, DONE
+    from pi.nav.mission import RUNNING, ESTOP, DONE, IDLE
 
     class FakeExec:
         """منفّذ وهمي يُسلّم حكم حركة محدَّداً — لاختبار استهلاك المهمة له."""
@@ -1865,6 +1902,111 @@ def main() -> int:
     check("ونافذة بائتة تُهمَل (خطوة أُجهضت بعائق فلم يعقبها قياس)",
           m_cw._take_count_window() is None,
           f"سقف العمر {_CW_MAX:.1f}ث")
+
+    # ── ⑨ خيارا المشغّل: تجاهل حساسات العوائق · قوة المحركات ────────
+    # 🔴 **اختبار تكامل** (البند 8): المسار الحقيقي `DriveExecutor` لا وهمي —
+    #    الوهمي يمرّ وإن لم يقرأ أحدٌ العلم.
+    from pi.nav.executor import DriveExecutor as _DX
+    from pi.nav.reactive import ReactiveSafety as _RS
+    from pi.config import NAV_POWER_CHOICES as _NPC
+
+    class _Blocked:
+        """جسر يرى عائقاً في كل اتجاه — لو قُرئت الحساسات لأُجهضت الخطوة."""
+        mode = "sim"
+        def __init__(self):  self.reads = 0; self.pw = []
+        def motors(self, l, r):  self.pw.append((l, r))
+        def forward(self, p):    self.pw.append((p, p))
+        def stop(self):          pass
+    def _blocked_sensors(bridge):
+        def f():
+            bridge.reads += 1
+            return {"ultrasonic_cm": 5.0, "ultrasonic_raw_cm": 5.0,
+                    "ir_left": 0, "ir_right": 0, "ir_mid": 0}
+        return f
+
+    _br = _Blocked()
+    _ex = _DX(_br, _RS(), _blocked_sensors(_br), newp)
+    _base = _ex.forward_cell(0.2)
+    check("🔴 بلا الخيار: عائق أمامي يُجهض الخطوة (السلامة تعمل)",
+          _base["ok"] is False and _br.reads > 0,
+          f"أُجهضت بـ{_base.get('aborted')} · قراءات={_br.reads}")
+
+    _br2 = _Blocked()
+    _ex2 = _DX(_br2, _RS(), _blocked_sensors(_br2), newp)
+    _ex2.ignore_obstacles = True
+    _ex2.drive_power = 0.40
+    _ig = _ex2.forward_cell(0.2)
+    _mx = max((max(a, b) for a, b in _br2.pw), default=0.0)
+    check("🔴 ومع الخيار: تُتجاهَل الحساسات فلا إجهاض — **ولا تُقرأ أصلاً**",
+          _ig["ok"] is True and _br2.reads == 0 and _br2.pw,
+          f"قراءات حساسات={_br2.reads} · أوامر محركات={len(_br2.pw)}")
+    check("والقوة هي المختارة لا درجة سلّم (لا سلّم يقرّر أصلاً)",
+          _mx <= 0.40 + 1e-9 and _mx > 0.30,
+          f"أقصى قوة مطبَّقة {_mx:.3f} مقابل المختارة 0.40")
+
+    # القوة **سقف** حين تعمل الحساسات: السلّم يظلّ حرّاً في الإبطاء
+    class _Clear(_Blocked):
+        pass
+    def _clear_sensors(bridge):
+        def f():
+            bridge.reads += 1
+            return {"ultrasonic_cm": 300.0, "ultrasonic_raw_cm": 300.0,
+                    "ir_left": 1, "ir_right": 1, "ir_mid": 1}
+        return f
+    _br3 = _Clear()
+    _ex3 = _DX(_br3, _RS(), _clear_sensors(_br3), newp)
+    _ex3.drive_power = 0.30                 # السلّم يريد 0.50 (طريق مفتوح)
+    _ex3.forward_cell(0.3)
+    _mx3 = max((max(a, b) for a, b in _br3.pw), default=0.0)
+    check("🔴 والحساسات تعمل ⇒ القوة **سقف**: السلّم لا يتجاوزه",
+          _mx3 <= 0.30 + 1e-9,
+          f"السلّم يطلب {speed_for_distance(300.0)['speed']:.2f} "
+          f"والمطبَّق {_mx3:.3f}")
+
+    # الضابط نفسه: يُرفض أثناء الجريان، ويصل إلى المنفّذ عبر start()
+    _mo = mission_with({"verdict": VERIFIED, "moved": True, "confident": True,
+                        "measured_m": CELL_SIZE_M, "reason": "مقاس ≈ مأمور"})
+    _mo.state = RUNNING
+    check("🔴 لا يُبدَّل عقد السلامة والمهمة جارية",
+          _mo.set_nav_override(ignore_obstacles=True)["ok"] is False
+          and _mo.nav_ignore_obstacles is False)
+    _mo.state = IDLE
+    check("ويُقبل وهي متوقفة، والقوة خارج المدى تُرفض بسبب مقروء",
+          _mo.set_nav_override(ignore_obstacles=True, power=0.40)["ok"] is True
+          and _mo.set_nav_override(power=max(_NPC) + 0.1)["ok"] is False
+          and _mo.nav_power == 0.40)
+
+    # ⚠ الوصول الفعلي إلى المنفّذ — الدرس السابع في البند 8: الاستدعاء
+    #    وحده لا يكفي، والمنفّذ يُعاد بناؤه مع الغرفة فتضيع القيم بصمت.
+    _mr = MissionSim()
+    _mr.configure_room(1.0, 0.5)
+    _mr.set_calibration(newp)
+    _mr.drive_motors = True                 # المنفّذ لا يُبنى بدونها
+    _mr.set_nav_override(ignore_obstacles=True, power=0.50)
+    _mr.configure_room(1.5, 0.5)            # إعادة بناء بعد ضبط الخيار
+    _mr.start()
+    check("🔴 والخياران يصلان المنفّذ فعلاً بعد إعادة بناء الغرفة",
+          _mr.executor.ignore_obstacles is True
+          and _mr.executor.drive_power == 0.50
+          and _mr.executor.turn_power == 0.50,
+          f"ignore={_mr.executor.ignore_obstacles} · "
+          f"drive={_mr.executor.drive_power} · turn={_mr.executor.turn_power}")
+    _mr.estop()
+
+    # الجاهزية: الحاجب يسقط **بخيار معلَن** ويبقى التحذير صارخاً
+    _rd0 = MissionSim(); _rd0.configure_room(1.0, 0.5); _rd0.set_calibration(newp)
+    _rd0.ultrasonic = None
+    _rd0.sensors = lambda: {"ultrasonic_cm": None, "ultrasonic_raw_cm": None,
+                            "ir_left": None, "ir_right": None, "ir_mid": None,
+                            "quality": 0}
+    _b0 = _rd0.mission_readiness()["blockers"]
+    _rd0.set_nav_override(ignore_obstacles=True)
+    _r1 = _rd0.mission_readiness()
+    check("🔴 بلا استشعار أمامي: حاجب — ومع الخيار تحذير صارخ لا صمت",
+          any("لا استشعار أمامي" in b for b in _b0)
+          and not any("لا استشعار أمامي" in b for b in _r1["blockers"])
+          and any("متجاهَلة بخيار المشغّل" in w for w in _r1["warnings"]),
+          f"حواجب قبل={len(_b0)} · بعد={len(_r1['blockers'])}")
 
     # ═══ (م) البنود 2-6: الدورة الكاملة ═══════════════════════════
     print("\nم) عقد القراءات والدورة الكاملة (البنود 2-6):")

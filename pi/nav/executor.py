@@ -28,6 +28,8 @@ from pi.config import (
     HEADING_HOLD_IN_MISSION, HEADING_HOLD_MAX_BASE, SPEED_RAMP_UP_PER_S,
     MOTION_VERIFY_ENABLED, MOTION_SETTLE_S, MOTION_BACKWARD_MAX_M,
     MOTION_SETTLE_SKIP_IF_STILL,
+    NAV_IGNORE_OBSTACLES_DEFAULT, NAV_POWER_DEFAULT, TURN_MIN_POWER,
+    DRIVE_POWER_DEFAULT, DRIVE_STICTION_POWER,
     TURN_MIN_ACHIEVABLE_DEG, HEADING_STEER_PHASE_DEG,
 )
 from pi.nav.room import CELL_SIZE_M
@@ -58,7 +60,9 @@ class DriveExecutor:
         self.profile = profile
         self.log = []
         # **نفس المتحكّم لا نسخة ثانية** — ثوابته معايرة على العتاد.
-        self.heading_ctl = HeadingController()
+        # ⚠ بأرضية **الأرضية** لا أرضية المحرّك: هنا قيادة فعلية على سطح
+        #   فعلي، وتجويع عجلة تحت عتبة احتكاكه يوقف الروبوت بلا إنذار.
+        self.heading_ctl = HeadingController(min_power=DRIVE_STICTION_POWER)
         # مقياس التسارع للشاهد الثنائي (البند 0). يُؤخذ من مصدر الاتجاه —
         # **نفس نسخة IMUReader** لا ثانية: فتحُ I2C مرتين يتسابق على الناقل.
         self.imu = imu if imu is not None else getattr(
@@ -68,6 +72,14 @@ class DriveExecutor:
         #    تُثبت شيئاً وتُنتج «لا حركة» كاذبة توقف المهمة.
         self.verify_motion_enabled = (MOTION_VERIFY_ENABLED
                                       and getattr(rover, "mode", "sim") == "real")
+        # ── خياران يدويان يضبطهما المشغّل قبل المهمة (لا يُستنتجان) ──
+        # `ignore_obstacles`: تتجاهل حلقةُ السير حساسات العوائق كلها
+        #   (ألترا سونيك + IR). ⚠ يُلغي الفرملة والتفادي و`HARD_STOP_CM`.
+        # `drive_power`: **سقف** حين تعمل الحساسات، و**ثابت** عند تجاهلها.
+        # `turn_power` : قوة اللفّ بالمكان (None = TURN_POWER من config).
+        self.ignore_obstacles = bool(NAV_IGNORE_OBSTACLES_DEFAULT)
+        self.drive_power = NAV_POWER_DEFAULT
+        self.turn_power = NAV_POWER_DEFAULT
 
     # ── اللفّ نحو اتجاه مطلوب ────────────────────────────────────
     def turn_to(self, current_heading: float, target_heading: float) -> dict:
@@ -81,7 +93,12 @@ class DriveExecutor:
         if abs(delta) < TURN_MIN_ACHIEVABLE_DEG:
             return {"ok": True, "turned_deg": 0.0, "skipped": True,
                     "residual_deg": delta}
-        res = self.rover.turn_by_angle(delta, timeout=ROVER_TURN_TIMEOUT_S)
+        # ⚠ أرضية `TURN_MIN_POWER`: اختيار قوة سير منخفضة لا يجوز أن يهبط
+        #   باللفّ تحت أدنى قوة تكسر السكون — وإلا صار الخيار سبب انحشار.
+        kw = {}
+        if self.turn_power is not None:
+            kw["power"] = max(float(self.turn_power), TURN_MIN_POWER)
+        res = self.rover.turn_by_angle(delta, timeout=ROVER_TURN_TIMEOUT_S, **kw)
         # `aborted` يعني عطلاً في مصدر الاتجاه أو إشارة محور مقلوبة — فشل
         # صريح لا يجوز اعتباره لفّة ناجحة (وإلا تقدّم الروبوت باتجاه خاطئ).
         return {"ok": not res["timed_out"] and not res.get("aborted"),
@@ -192,6 +209,8 @@ class DriveExecutor:
         hold_lost = None
         base_capped = None       # (المطلوب من السلّم، المطبَّق) عند تقييد السقف
         applied = 0.0            # آخر قوة **مطبَّقة** — أساس تدرّج التسارع
+        front_cm = None          # ⚠ مُهيَّأة صراحةً: مع تجاهل الحساسات لا
+                                 #   تُقرأ أصلاً، وفرع الجدار المعروف يقرأها.
         ramped = 0               # عدد الدورات التي قُيّد فيها الرفع
         last_ts = time.time()
         try:
@@ -199,13 +218,28 @@ class DriveExecutor:
                 if (time.time() - started) > MAX_CELL_TRAVEL_S:
                     aborted = "timeout"
                     break
-                s = self.sensors()
-                front_cm = s.get("ultrasonic_cm")
                 if witness is not None:
                     witness.add(self._read_accel())
-                d = self.reactive.decide(front_cm, s.get("ir_left", 1),
-                                         s.get("ir_right", 1), s.get("ir_mid"))
-                last_decision = d
+                # ── 🔴 تجاهل حساسات العوائق (خيار مشغّل صريح) ──────────
+                # لا استشعار ولا قرار ولا إجهاض: القوة هي المختارة، والحدّ
+                # الوحيد الباقي هو المسافة المأمورة و`MAX_CELL_TRAVEL_S`.
+                # ⚠ ولا تُقرأ الحساسات أصلاً — قراءة تُتجاهَل تكلف نبضة
+                #   ألترا سونيك (~60ms) في كل دورة بلا أن تغيّر قراراً.
+                if self.ignore_obstacles:
+                    power = min(float(self.drive_power
+                                      if self.drive_power is not None
+                                      else DRIVE_POWER_DEFAULT),
+                                MAX_MOTOR_POWER)
+                    last_decision = d = {
+                        "action": "go", "speed": power, "rung": "override",
+                        "priority": "operator", "unknown": [],
+                        "reason": "⚠ حساسات العوائق متجاهَلة بخيار المشغّل"}
+                else:
+                    s = self.sensors()
+                    front_cm = s.get("ultrasonic_cm")
+                    d = self.reactive.decide(front_cm, s.get("ir_left", 1),
+                                             s.get("ir_right", 1), s.get("ir_mid"))
+                    last_decision = d
                 if d["action"] != "go":
                     # هل يفسّره جدار معروف من الخريطة؟
                     known_wall = False
@@ -225,6 +259,11 @@ class DriveExecutor:
                         break
                 else:
                     power = min(d["speed"], MAX_MOTOR_POWER)
+                # ⚠ **سقف** لا هدف: السلّم يظلّ حرّاً في الإبطاء والتوقيف،
+                #   والخيار يقصّ من فوق فقط. (مع التجاهل لا سلّم أصلاً وقد
+                #   ضُبطت القوة أعلاه، والقصّ هنا لا يغيّرها.)
+                if self.drive_power is not None:
+                    power = min(power, float(self.drive_power))
 
                 # ⚠ سقف تثبيت الاتجاه إلزامي: عند 0.50 (أعلى درجة السلّم)
                 #    الفراغ صفر فلا توجيه ممكن — انظر HEADING_HOLD_MAX_BASE.

@@ -36,6 +36,7 @@ from pi.config import (
     MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S, IR_PRESENT,
     HEADING_SIGMA_PER_TURN_DEG,
     COUNT_WINDOW_CREDIT_ENABLED, COUNT_WINDOW_MAX_AGE_S,
+    NAV_IGNORE_OBSTACLES_DEFAULT, NAV_POWER_DEFAULT, NAV_POWER_CHOICES,
     CONFIRM_RADIUS_M, CONFIRM_DWELL_S, CONFIRM_POSITIONS,
     APPROACH_STEP_M, APPROACH_MAX_STEPS, APPROACH_DWELL_S,
     BREADCRUMB_MAX, RETRACE_MAX_CELLS, RETRACE_SAFE_CPM_FACTOR,
@@ -206,6 +207,9 @@ class MissionSim:
         self._rth_triggered = False
         # تجاوز يدوي للعودة الإجبارية بسبب الجهد — **لا يعبر الأرضية**
         self.batt_rth_override = False
+        # خياران يدويان قبل القيادة الذاتية (لا يُستنتجان — انظر config)
+        self.nav_ignore_obstacles = bool(NAV_IGNORE_OBSTACLES_DEFAULT)
+        self.nav_power = NAV_POWER_DEFAULT
         self._batt_override_log_ts = 0.0   # تقييد سطر «العودة مكتومة»
         # الحدّ الزمني (بديل حماية الجهد المعطّلة — القسم 9)
         self._started_ts = None
@@ -400,12 +404,23 @@ class MissionSim:
             for w in rd["warnings"]:
                 self._log("readiness_warn", w)
             # ⚠ لا تبدأ قيادة محركات بحسّاس قرب معطوب — يُجهض كل خطوة ويلوّث الخريطة
+            # 🔴 ومع تجاهل حساسات العوائق يهبط الرفض إلى **تسجيل**: حسّاس IR
+            #    عالق هو بالضبط السبب الذي رُفع الخيار لأجله، فإبقاؤه حاجباً
+            #    يجعل الخيار عديم الأثر في الحالة الوحيدة التي وُجد لها.
             pf = self.preflight_check()
             if not pf["ok"]:
                 for p in pf["problems"]:
                     self._log("preflight", "⚠ " + p)
-                return {"ok": False, "error": " · ".join(pf["problems"]),
-                        "preflight": pf}
+                if not self.nav_ignore_obstacles:
+                    return {"ok": False, "error": " · ".join(pf["problems"]),
+                            "preflight": pf}
+                self._log("preflight",
+                          "⚠ تُوبع البدء رغم ما سبق — حساسات العوائق "
+                          "متجاهَلة بخيار المشغّل أصلاً")
+        # ⚠ التطبيق نفسه في `_build_executor` (نقطة البناء الوحيدة) — وهنا
+        #   الإعلان وحده: عقد السلامة يُكتب في سجل كل مهمة لا في الواجهة فقط.
+        if self.nav_ignore_obstacles or self.nav_power is not None:
+            self._log("nav_override", self._nav_override_text())
         self.current = self.grid.start_cell()
         cx, cy = self.grid.cell_center(*self.current)
         self.dr = DeadReckoning(self.room, self.profile, cx, cy, 0.0)
@@ -450,11 +465,25 @@ class MissionSim:
                   + ("" if v0 is not None else
                      " — ⚠ **وهو الحارس الوحيد الآن** (لا قراءة جهد)"))
         if self.drive_motors:
-            self.executor = DriveExecutor(self.rover, self.reactive,
-                                          self.sensors, self.profile)
+            self._build_executor()
             self._worker = threading.Thread(target=self._motor_worker, daemon=True)
             self._worker.start()
         return {"ok": True}
+
+    def _build_executor(self):
+        """
+        🔴 **نقطة البناء الوحيدة** للمنفّذ — وتُطبّق خيارات المشغّل فوراً.
+
+        الدرس (البند 8، وقد وقع فعلاً في هذا التغيير وأمسكه الاختبار): كان
+        `_apply_nav_override()` يُستدعى في `start()` **قبل** إنشاء المنفّذ،
+        فيراه `None` ويصمت — والواجهة تعرض «حساسات متجاهَلة» بينما المنفّذ
+        يقود بالعقد الافتراضي. والمنفّذ يُبنى في موضعين (البدء وإحياء الخيط)،
+        فأي بناء لا يمرّ من هنا يُعيد العطل نفسه.
+        """
+        self.executor = DriveExecutor(self.rover, self.reactive,
+                                      self.sensors, self.profile)
+        self._apply_nav_override()
+        return self.executor
 
     def _ensure_worker(self) -> bool:
         """
@@ -481,8 +510,7 @@ class MissionSim:
         if self.profile is None:
             self._log("worker", "⚠ تعذّر إحياء خيط المحركات: لا ملف معايرة")
             return False
-        self.executor = DriveExecutor(self.rover, self.reactive,
-                                      self.sensors, self.profile)
+        self._build_executor()
         self._worker = threading.Thread(target=self._motor_worker, daemon=True)
         self._worker.start()
         self._log("worker",
@@ -817,6 +845,82 @@ class MissionSim:
         self._log("drive_mode",
                   "قيادة المحركات مفعّلة ⚠" if enabled else "مسح منطقي (بلا محركات)")
         return {"ok": True, "drive_motors": self.drive_motors}
+
+    def set_nav_override(self, ignore_obstacles=None, power=None) -> dict:
+        """
+        خيارا القيادة الذاتية اليدويان — **قبل البدء لا أثناءه**.
+
+        `ignore_obstacles`: تتجاهل حلقةُ السير الألترا سونيك الثلاثة وحساسات
+          IR كلها. أُضيف لأن عطلنا الشائع **حسّاس كاذب** لا عائق حقيقي (IR
+          عالق على «عائق»، وألترا سونيك على منفذ مشغول يُرجع None أبداً).
+          🔴 وثمنه صريح: لا فرملة ولا تفادٍ ولا `HARD_STOP_CM` — لا يبقى بين
+          الروبوت والجدار إلا الخريطة والتقدير الأعمى.
+          ⚠ ولا يمسّ **التحقق من الحركة** (§2.2): ذاك فرقُ قراءتين لا بوابة
+            عوائق، وحارسه الخاص `reference_ok` باقٍ. تجاهلٌ للقرار لا للقياس.
+
+        `power`: قوة المحركات. **سقف** حين تعمل الحساسات (السلّم يظلّ يبطئ
+          ويوقف)، و**ثابت** عند تجاهلها (لا سلّم يقرّر أصلاً). وتُطبَّق على
+          اللفّ كذلك بأرضية `TURN_MIN_POWER`. `None` يعيد سلّم السلامة وحده.
+
+        🔴 **يُرفض أثناء الجريان**: هذان يغيّران عقد السلامة نفسه، وتبديلهما
+        والروبوت يقود يجعل نصف المهمة بعقد ونصفها بآخر — فيستحيل تفسير أي
+        اصطدام أو انحراف بعدها. أوقف المهمة، بدّل، ثم ابدأ.
+        """
+        if self.state == RUNNING:
+            return {"ok": False, "error": "لا يُبدَّل عقد السلامة والمهمة "
+                                          "جارية — أوقف المهمة أولاً"}
+        changed = []
+        if ignore_obstacles is not None:
+            self.nav_ignore_obstacles = bool(ignore_obstacles)
+            changed.append("ignore_obstacles")
+        if power is not None:
+            if power is False or power == "" or str(power).lower() == "auto":
+                self.nav_power = None
+            else:
+                try:
+                    p = float(power)
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": f"قوة غير صالحة: {power!r}"}
+                lo, hi = min(NAV_POWER_CHOICES), max(NAV_POWER_CHOICES)
+                if not (lo <= p <= hi):
+                    return {"ok": False,
+                            "error": f"القوة خارج المدى المسموح {lo}–{hi}"}
+                self.nav_power = p
+            changed.append("power")
+        self._apply_nav_override()
+        if changed:
+            self._log("nav_override", self._nav_override_text())
+        return {"ok": True, "ignore_obstacles": self.nav_ignore_obstacles,
+                "power": self.nav_power, "choices": list(NAV_POWER_CHOICES),
+                "changed": changed, "text": self._nav_override_text()}
+
+    def _apply_nav_override(self) -> None:
+        """
+        يدفع الخيارين إلى المنفّذ. **المسار الوحيد** — والاستدعاء من `start()`
+        أيضاً لأن المنفّذ قد يُعاد بناؤه مع الغرفة أو تبديل وضع الروفر، فتُفقد
+        القيم بصمت ويقود الروبوت بعقد غير الذي يعرضه المشغّل.
+        """
+        ex = getattr(self, "executor", None)
+        if ex is None:
+            return
+        ex.ignore_obstacles = bool(self.nav_ignore_obstacles)
+        ex.drive_power = self.nav_power
+        ex.turn_power = self.nav_power
+
+    def _nav_override_text(self) -> str:
+        """نصّ واحد يُقرأ في السجل والواجهة والتقرير — لا صياغتان تتباعدان."""
+        if not self.nav_ignore_obstacles and self.nav_power is None:
+            return "✅ القيادة الذاتية بالإعدادات الافتراضية (سلّم السلامة يقرّر)"
+        parts = []
+        if self.nav_ignore_obstacles:
+            parts.append("⚠ **حساسات العوائق متجاهَلة** (ألترا سونيك + IR) — "
+                         "لا فرملة ولا تفادٍ؛ الجدران من الخريطة وحدها")
+        if self.nav_power is not None:
+            parts.append(f"قوة المحركات {self.nav_power:.2f} "
+                         + ("(ثابتة — لا سلّم)" if self.nav_ignore_obstacles
+                            else "(سقف — السلّم يظلّ يبطئ ويوقف)")
+                         + f" ≈ {self.nav_power * 1.5:.2f} م/ث")
+        return " · ".join(parts)
 
     def set_batt_rth_override(self, enabled: bool) -> dict:
         """
@@ -2056,7 +2160,14 @@ class MissionSim:
         us_live = bool(getattr(self.ultrasonic, "ok", False)) if self.ultrasonic else False
         front_ir = [s.get("ir_left"), s.get("ir_right"), s.get("ir_mid")]
         ir_live = any(v is not None for v in front_ir)
-        if not (us_live or ir_live):
+        if self.nav_ignore_obstacles:
+            # 🔴 الحاجب يسقط **لأن المشغّل رفعه صراحةً**، لا لأن الخطر زال.
+            #    ويبقى صارخاً في كل مهمة: خيارٌ خطر يُنسى هو الخطر الحقيقي.
+            warnings.append(
+                "⚠⚠ حساسات العوائق متجاهَلة بخيار المشغّل — لا فرملة ولا "
+                "تفادٍ ولا توقف اضطراري. الجدران من الخريطة والتقدير الأعمى "
+                "وحدهما. لا تشغّلها إلا في غرفة معروفة الأبعاد وتحت العين.")
+        elif not (us_live or ir_live):
             blockers.append("لا استشعار أمامي (لا ألترا سونيك ولا IR أمامي) — "
                             "المسح الذاتي مرفوض كلياً، لا بسرعة زحف")
         elif not us_live:
@@ -2065,7 +2176,8 @@ class MissionSim:
         elif not ir_live:
             warnings.append("⚠ بلا IR أمامي: الألترا سونيك يعمى عن الأسطح "
                             "المائلة والمواد الماصّة والأجسام المنخفضة")
-        if us_live and us is None and s.get("ultrasonic_raw_cm") is None:
+        if (not self.nav_ignore_obstacles and us_live and us is None
+                and s.get("ultrasonic_raw_cm") is None):
             # ⚠ الشرط على **الخام**: بعد عتبة ثقة الأمامي (30سم) تكون القيمة
             #   المقصوصة None في الفضاء المفتوح دائماً — وليست عطل حسّاس.
             warnings.append("⚠ الألترا سونيك لا يُرجع قراءة الآن (جودة "
@@ -2085,6 +2197,10 @@ class MissionSim:
         san = heading_config_sanity()
         if not san["ok"]:
             blockers.append("ثوابت الاتجاه غير متماسكة: " + san["reason"])
+
+        if self.nav_power is not None:
+            warnings.append("⚠ قوة المحركات مضبوطة يدوياً: "
+                            + self._nav_override_text())
 
         missing_ir = [n for n, p in IR_PRESENT.items() if not p]
         if missing_ir:
@@ -2704,6 +2820,10 @@ class MissionSim:
             # حالة التجاوز + أرضيته: الواجهة تعرض الأرضية لا رقماً مكتوباً
             # فيها — رقم مكرّر في مكانين ينحرف أحدهما يوماً بلا أن يُلاحَظ.
             "batt_rth_override": self.batt_rth_override,
+            "nav_ignore_obstacles": self.nav_ignore_obstacles,
+            "nav_power": self.nav_power,
+            "nav_power_choices": list(NAV_POWER_CHOICES),
+            "nav_override_text": self._nav_override_text(),
             "batt_rth_floor_v": BATT_RTH_OVERRIDE_FLOOR_V,
             "training_source": self.training_source,
             "rover": {"mode": self.rover.mode, "error": self.rover.error,

@@ -381,6 +381,22 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <input type="checkbox" id="battRthOverride" style="width:17px;height:17px;accent-color:var(--acc)">
       </label>
       <div id="battRthMsg"></div>
+      <!-- 🧭 خيارا القيادة الذاتية — الثمن مكتوب في الواجهة لا في الوثائق:
+           خيارٌ لا يُظهر ما يُلغيه ليس خياراً بل فخّ -->
+      <label class="row" style="cursor:pointer;margin-bottom:6px"
+             title="يتجاهل الألترا سونيك الثلاثة وحساسات IR كلها في القيادة الذاتية. لا فرملة ولا تفادٍ ولا توقف اضطراري.">
+        <span>🚫 تجاهل حساسات العوائق (ذاتي)</span>
+        <input type="checkbox" id="navIgnoreObs" style="width:17px;height:17px;accent-color:var(--acc)">
+      </label>
+      <label class="row" style="margin-bottom:6px"
+             title="سقف حين تعمل الحساسات (السلّم يظلّ يبطئ ويوقف)، وثابت عند تجاهلها. وتُطبَّق على اللفّ أيضاً.">
+        <span>⚡ قوة المحركات (ذاتي)</span>
+        <select id="navPower" style="background:var(--bg2);color:var(--fg);
+                border:1px solid var(--line);border-radius:6px;padding:3px 6px">
+          <option value="auto">تلقائي (سلّم السلامة)</option>
+        </select>
+      </label>
+      <div id="navOverrideMsg"></div>
       <!-- 🎥 تسجيل المهمة كاملةً على الراسبري — بطلب صريح لا افتراضاً
            (كتابة مستمرة على بطاقة SD تستهلك عمرها) -->
       <label class="row" style="cursor:pointer;margin-bottom:6px"
@@ -587,6 +603,28 @@ $("#recOn").onchange = async e => {
     ? "🎥 التسجيل مفعّل — تُفتح جلسة تلقائياً مع بدء كل مهمة"
     : "التسجيل مطفأ" + (r.last_saved ? " · آخر جلسة: " + r.last_saved : ""),
     Date.now()/1000);
+};
+
+/* ═══ 🧭 خيارا القيادة الذاتية — يُرفضان أثناء الجريان ═══ */
+async function sendNavOverride(patch, revert){
+  const r = await api("/api/mission/nav_override", patch);
+  if (!r || r.ok === false){
+    if (revert) revert();
+    showMsg("#navOverrideMsg", "⛔ " + ((r && r.error) || "رُفض التبديل"), "err");
+    return null;
+  }
+  showMsg("#navOverrideMsg", r.text || "", r.ignore_obstacles ? "err" : "ok");
+  addEvent("sys", r.text || "", Date.now()/1000);
+  return r;
+}
+$("#navIgnoreObs").onchange = e => {
+  const want = e.target.checked;
+  sendNavOverride({ignore_obstacles: want}, () => { e.target.checked = !want; });
+};
+$("#navPower").onchange = e => {
+  const want = e.target.value, prev = e.target.dataset.prev || "auto";
+  sendNavOverride({power: want}, () => { e.target.value = prev; })
+    .then(r => { if (r) e.target.dataset.prev = want; });
 };
 
 /* ═══ رفع العودة الإجبارية بسبب الجهد — الثمن معروض لا مخفيّ ═══ */
@@ -1526,6 +1564,27 @@ function apply(st){
   if (document.activeElement !== dm && dm.checked !== !!st.drive_motors)
     dm.checked = !!st.drive_motors;
   // مزامنة مفتاح رفع العودة + إبقاء ثمنه معروضاً ما دام مرفوعاً
+  // 🧭 خيارا القيادة الذاتية — والخيارات تُبنى من السيرفر لا تُكتب هنا
+  //    (قائمة مكرّرة في مكانين ينحرف أحدهما يوماً بلا أن يُلاحَظ)
+  const nio = $("#navIgnoreObs"), npw = $("#navPower");
+  if (document.activeElement !== nio && nio.checked !== !!st.nav_ignore_obstacles)
+    nio.checked = !!st.nav_ignore_obstacles;
+  if (Array.isArray(st.nav_power_choices) && npw.options.length < 2){
+    st.nav_power_choices.forEach(v => {
+      const o = document.createElement("option");
+      o.value = String(v);
+      o.textContent = v.toFixed(2) + "  ≈ " + (v * 1.5).toFixed(2) + " م/ث";
+      npw.appendChild(o);
+    });
+  }
+  if (document.activeElement !== npw){
+    const want = (st.nav_power == null) ? "auto" : String(st.nav_power);
+    if (npw.value !== want){ npw.value = want; npw.dataset.prev = want; }
+  }
+  if (st.nav_ignore_obstacles || st.nav_power != null)
+    showMsg("#navOverrideMsg", st.nav_override_text || "",
+            st.nav_ignore_obstacles ? "err" : "ok");
+
   const bro = $("#battRthOverride");
   if (document.activeElement !== bro && bro.checked !== !!st.batt_rth_override)
     bro.checked = !!st.batt_rth_override;

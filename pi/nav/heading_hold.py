@@ -70,12 +70,21 @@ class HeadingController:
 
     def __init__(self, kp: float = HEADING_KP, kd: float = HEADING_KD,
                  max_corr: float = HEADING_MAX_CORR,
-                 trim_l: float = MOTOR_TRIM_L, trim_r: float = MOTOR_TRIM_R):
+                 trim_l: float = MOTOR_TRIM_L, trim_r: float = MOTOR_TRIM_R,
+                 min_power: float = MIN_MOTOR_POWER):
         self.kp = float(kp)
         self.kd = float(kd)
         self.max_corr = float(max_corr)
         self.trim_l = float(trim_l)
         self.trim_r = float(trim_r)
+        # 🔴 أرضية العجلة **البطيئة** — تخصّ الأرضية لا المحرّك، ولذلك صارت
+        #    وسيطاً لا ثابتاً مستورداً: الافتراضي `MIN_MOTOR_POWER` (الحدّ
+        #    الكهربائي، وعليه اشتُقّت الثوابت المعايرة وفحص `config_sanity`)،
+        #    والمنفّذ يمرّر `DRIVE_STICTION_POWER` لأنه يقود على أرضية فعلية.
+        # ⚠ رفعُها يضيّق سلطة التصحيح وقد يُصفّرها عند الأساس المنخفض. وهذا
+        #    **مقصود**: سيرٌ مفتوح الحلقة أصدق من تصحيحٍ بعجلة واقفة — عطل
+        #    الفرش 2026-09-08 كان تصحيحاً «يعمل» بينما جانب كامل ميت.
+        self.min_power = float(min_power)
         self.reset()
 
     def reset(self) -> None:
@@ -125,7 +134,8 @@ class HeadingController:
         يُعيد {"left","right","correction","headroom"} — كلها ≤ MAX_MOTOR_POWER
         بحكم قصّ التصحيح على الفراغ المتاح (لا اعتماد على قصّ الجسر).
         """
-        head = available_headroom(base_power, self.trim_l, self.trim_r)
+        head = available_headroom(base_power, self.trim_l, self.trim_r,
+                                  min_power=self.min_power)
         if head < self.max_corr:
             self.headroom_clipped += 1
         corr = self.correction(error_deg, dt, limit=head)
@@ -135,7 +145,10 @@ class HeadingController:
         left = base_power + self.trim_l + corr
         right = base_power + self.trim_r - corr
         return {"left": round(left, 4), "right": round(right, 4),
-                "correction": round(corr, 4), "headroom": round(head, 4)}
+                "correction": round(corr, 4), "headroom": round(head, 4),
+                # المتوسط = الأساس بالضبط (الوزنيتان متعاكستان و±corr كذلك)
+                # — يُبثّ صراحةً لأن تكامل المسافة يقوم عليه.
+                "mean": round((left + right) / 2.0, 4)}
 
     # ── ملخّص شوط واحد (يقيس السكربت عليه جودة KP) ───────────────
     def summary(self) -> dict:
@@ -151,7 +164,8 @@ class HeadingController:
                 "saturated": self.saturated,
                 "saturated_pct": round(100.0 * self.saturated / n, 1),
                 "headroom_clipped": self.headroom_clipped,
-                "kp": self.kp, "kd": self.kd, "max_corr": self.max_corr}
+                "kp": self.kp, "kd": self.kd, "max_corr": self.max_corr,
+                "min_power": self.min_power}
 
 
 def config_sanity() -> dict:

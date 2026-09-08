@@ -34,6 +34,7 @@ from pi.config import (
     DISTANCE_SAMPLES, MAX_JUMP_CM, SMART_AVOID_ENABLED, SCAN_ANGLE_DEG,
     BACK_TIME_S, BLOCKED_BOTH_CM, AVOID_TURN_DEG, IR_OBSTACLE_LEVEL,
     IR_RANGE_CM,
+    LADDER_MIN_POWER,
 )
 
 
@@ -77,19 +78,28 @@ class JumpFilter:
 
 # ═══ البند 2: السرعة المتدرّجة ═══════════════════════════════════
 def speed_for_distance(front_cm) -> dict:
-    """يحوّل المسافة الأمامية إلى سرعة + درجة السلّم وسببها (للبثّ والسجل)."""
+    """
+    يحوّل المسافة الأمامية إلى سرعة + درجة السلّم وسببها (للبثّ والسجل).
+
+    🔴 **درجة لا تُحرّك الروبوت ليست تباطؤاً بل توقّفٌ صامت.** كل درجة غير
+    متوقِّفة تُرفع إلى `LADDER_MIN_POWER` (= أرضية الاحتكاك + الوزنية) — أدنى
+    أساس يبقى معه **الجانبان** فوق أدنى قوة تحرّك المنصّة على هذه الأرضية. الفرق ليس تجميلياً: أمرٌ بقوة 0.20 على فرش يُنتج روبوتاً ساكناً
+    بينما `deadreckoning` يحسب مسافة على 0.25 م/ث ⇒ انحراف بلا إنذار (§2.2).
+    ⚠ ولا يمسّ هذا درجة `stop` — الصفر يعني قف، ويبقى صفراً.
+    """
     if front_cm is None:
-        return {"speed": SPEED_NO_READING, "rung": "no_reading",
+        return {"speed": max(SPEED_NO_READING, LADDER_MIN_POWER),
+                "rung": "no_reading",
                 "reason": "لا قراءة ألترا سونيك — احترس ولا تقف"}
     if front_cm < STOP_CM:
         return {"speed": 0.0, "rung": "stop",
                 "reason": f"عائق أمامي {front_cm:.0f}سم < {STOP_CM:.0f}سم"}
     for threshold, spd in SPEED_LADDER:     # مرتبة تنازلياً
         if front_cm >= threshold:
-            return {"speed": spd, "rung": f"≥{threshold:.0f}سم",
+            return {"speed": max(spd, LADDER_MIN_POWER), "rung": f"≥{threshold:.0f}سم",
                     "reason": f"مسافة {front_cm:.0f}سم"}
     slowest = SPEED_LADDER[-1][1]
-    return {"speed": slowest, "rung": "زحف",
+    return {"speed": max(slowest, LADDER_MIN_POWER), "rung": "زحف",
             "reason": f"مسافة {front_cm:.0f}سم"}
 
 

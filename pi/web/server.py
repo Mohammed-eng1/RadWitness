@@ -706,6 +706,20 @@ async def api_batt_rth_override(req: Request):
     return mission.set_batt_rth_override(bool(d.get("enabled", False)))
 
 
+@app.post("/api/mission/nav_override")
+async def api_nav_override(req: Request):
+    """
+    خيارا القيادة الذاتية اليدويان: تجاهل حساسات العوائق · قوة المحركات.
+
+    🔴 خيار خطر بثمن معلَن — الشرح الكامل في `MissionSim.set_nav_override`،
+    ويُرفض أثناء جريان المهمة (تبديل عقد السلامة في المنتصف).
+    ⚠ مُسجَّل قبل مسار `/api/mission/{action}` العام عمداً — وإلا ابتلعه.
+    """
+    d = await req.json()
+    return mission.set_nav_override(
+        ignore_obstacles=d.get("ignore_obstacles"), power=d.get("power"))
+
+
 @app.post("/api/mission/training_source")
 async def api_training_source(req: Request):
     """
