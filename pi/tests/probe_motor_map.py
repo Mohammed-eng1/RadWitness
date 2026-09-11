@@ -1,0 +1,168 @@
+# -*- coding: utf-8 -*-
+"""
+probe_motor_map.py — مسبار المعالم الفيزيائية: اشتقاق خريطة المحركات
+=====================================================================
+**أداة خارجية** (سكربت تشخيص — البند 8).
+
+يشتقّ `MOTOR_SWAP_LR` و`MOTOR_INVERT` بالمشاهدة، **مستقلاً عن الهيكل**:
+يمرّ بناقل الجسر (`transport.py`) فيعمل على Wave Rover وFreenove معاً.
+بديل `test_rover_link --map` الذي يفتح المنفذ التسلسلي مباشرة فلا يصلح
+لهيكل بلا UART.
+
+🔴 **لماذا مسبار لا شهادة عين** (سيرة ثابت انقلب مرتين في يومين):
+  - **حقل واحد لكل نبضة** (L وحده ثم R وحده) — نبضة مركّبة تخلط الأثرين.
+  - **الجهة تُسمّى بمعلم فيزيائي** (أنبوب الجيجر / الجهة المقابلة) لا
+    يمين/يسار: «يمين» تنعكس بموقع الواقف، والنظر من أمام الروبوت يقلبها.
+  - **الروبوت مرفوع والعجلات حرة**: اختلال جانبين تحت الحمل ببطارية
+    منخفضة أنتج مرة انحرافاً فُسّر خطأً انعكاسَ ثوابت (جدول الأرض انحاز
+    يساراً حتى في الأوامر المتماثلة، واختفى الانحياز والعجلات مرفوعة).
+  - **لا 180°**: تنتهي مواجهة نفس الجهة يميناً ويساراً فلا تكشف الانعكاس.
+
+⚠ **لا يقيس إشارة الجايرو ولا يلمسها**: `MPU6050_GYRO_Z_SIGN` تُقاس
+  **باليد بلا محركات** فهي مستقلة عن قطبية المحركات ولا تتغيّر معها. قياسها
+  بالمحركات يعطي **حاصل ضرب الخطأين** فتبدو سليمة وهي معكوسة — وهو الخطأ
+  الذي عاش شهراً (البند 2). استعمل `calibrate_mpu6050` لتلك.
+
+الاستعمال (على العتاد، الروبوت **مرفوع**):
+    python3 -m pi.tests.probe_motor_map
+    python3 -m pi.tests.probe_motor_map --kind freenove --power 0.3
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from pi.config import ROVER_KIND, MAX_MOTOR_POWER, MIN_MOTOR_POWER
+
+PULSE_S = 2.0
+CMD_GAP_S = 0.1
+
+
+def _ask(question: str, options: tuple) -> str:
+    """سؤال بحرف واحد — يعيد السؤال حتى يأتي حرف من القائمة."""
+    while True:
+        print(question)
+        try:
+            v = input(f"[{'/'.join(options)}] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n⛔ أُلغي.")
+            raise SystemExit(1)
+        if v in options:
+            return v
+        print(f"  حرف من: {' · '.join(options)}")
+
+
+def _pulse(bridge, lp: float, rp: float, seconds: float) -> None:
+    """
+    نبضة على **إطار الأسلاك مباشرة** — تتجاوز `motors()` عمداً.
+
+    🔴 السبب: `motors()` يطبّق `MOTOR_SWAP_LR` ثم `MOTOR_INVERT`، وهما ما
+       نحاول اشتقاقه. المرور بهما يجعل المسبار يقيس نفسه فيؤكّد أي قيمة
+       موجودة مهما كانت خاطئة. القصّ عند `MAX_MOTOR_POWER` مطبَّق يدوياً
+       هنا لأننا تجاوزنا الحاجز الذي يطبّقه `motors()`.
+    """
+    lc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, lp))
+    rc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, rp))
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        bridge._tp.send_motors(lc, rc)
+        time.sleep(CMD_GAP_S)
+    bridge._tp.send_motors(0.0, 0.0)
+    bridge._tp.send_motors(0.0, 0.0)      # تأكيد الإيقاف
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="مسبار المعالم: اشتقاق MOTOR_SWAP_LR و MOTOR_INVERT")
+    ap.add_argument("--kind", default=ROVER_KIND,
+                    help="نوع الهيكل (waverover | freenove)")
+    ap.add_argument("--power", type=float, default=0.3,
+                    help=f"قوة النبضة ({MIN_MOTOR_POWER}–{MAX_MOTOR_POWER})")
+    ap.add_argument("--seconds", type=float, default=PULSE_S)
+    ap.add_argument("--allow-sim", action="store_true",
+                    help="متابعة رغم فشل فتح العتاد (لتجربة نص المسبار)")
+    a = ap.parse_args()
+
+    from pi.rover.bridge import RoverControlBridge
+    bridge = RoverControlBridge(mode="real", kind=a.kind)
+    print(f"الهيكل: {bridge._tp.name}  ·  الوضع: {bridge.mode}")
+    if bridge.mode != "real":
+        print(f"⛔ لم يُفتح العتاد: {bridge.error}")
+        if not a.allow_sim:
+            # 🔴 لا سقوط صامت إلى المحاكاة: مسبار في المحاكاة يُخرج وصفة
+            #    مُختلَقة تُكتب في config وتقود محركات حقيقية (البند 6.1).
+            return 2
+        print("⚠ متابعة في المحاكاة — **الوصفة الناتجة بلا معنى**.")
+
+    p = max(MIN_MOTOR_POWER, min(MAX_MOTOR_POWER, abs(a.power)))
+    print(f"\n🧭 مسبار المعالم — قوة {p:.2f} لمدة {a.seconds:.1f}ث لكل نبضة.")
+    print("⚠ الروبوت **مرفوع** والعجلات حرة (اختلال الجانبين تحت الحمل "
+          "أفسد قياساً سابقاً).")
+    print("  المعلم: **أنبوب الجيجر** على أحد جانبي الروبوت — "
+          "لا نستعمل يمين/يسار أبداً.")
+
+    results = {}
+    try:
+        for field, lp, rp in (("L", p, 0.0), ("R", 0.0, p)):
+            try:
+                input(f"\n  ▶ نبضة الحقل {field} وحده (+{p:.2f}) — Enter…")
+            except (EOFError, KeyboardInterrupt):
+                print("\n⛔ أُلغي."); return 1
+            _pulse(bridge, lp, rp, a.seconds)
+            side = _ask("  أي جهة دارت عجلاتها؟  g = جهة أنبوب الجيجر · "
+                        "o = الجهة المقابلة · n = لا شيء دار", ("g", "o", "n"))
+            direction = "n"
+            if side != "n":
+                direction = _ask("  ودارت نحو:  f = مقدمة الروبوت "
+                                 "(جهة الكاميرا) · b = مؤخرته", ("f", "b"))
+            results[field] = (side, direction)
+    finally:
+        # الإيقاف مضمون مهما حدث — بما فيه Ctrl-C وسط نبضة
+        try:
+            bridge.stop(); bridge.close()
+        except Exception:                     # noqa: BLE001
+            pass
+
+    ar_side = {"g": "جهة الجيجر", "o": "الجهة المقابلة", "n": "لا دوران"}
+    ar_dir = {"f": "أمام", "b": "خلف", "n": "—"}
+    print("\n  ── المرصود ──")
+    for field in ("L", "R"):
+        sd, dr = results[field]
+        print(f"    الحقل {field}=+{p:.2f} ⇒ {ar_side[sd]} · {ar_dir[dr]}")
+
+    ls, ld = results["L"]
+    rs, rd = results["R"]
+    print("\n  ── الاشتقاق ──")
+    if "n" in (ls, rs):
+        print("  🔴 حقل بلا استجابة — جانب ميت أو قناة غير مقودة.")
+        print("     على Freenove: راجع خريطة القنوات FREENOVE_WHEEL_CHANNELS "
+              "وتغذية لوح المحركات. لا يصلحه أي ثابت اتجاه.")
+        return 3
+    if ls == rs:
+        print("  🔴 الحقلان يحرّكان الجهة نفسها — قناتا الخرج على جانب واحد.")
+        print("     خطأ خريطة قنوات لا خطأ قطبية. لا يصلحه أي ثابت اتجاه.")
+        return 3
+    if ld != rd:
+        print("  🔴 قطبية الجانبين مختلفة — انعكاس محرّك جانب واحد (أسلاك).")
+        print("     العرَض المميّز: أمر التقدّم يجعله **يدور بالمكان** بدل أن "
+              "يتقدّم. 🔴 لا يصلحه أي ثابت في config — أصلح الأسلاك.")
+        return 3
+
+    # الجيجر على **يسار** الروبوت (تثبيت هذا المشروع)
+    left_is_L = (ls == "g")
+    swap = not left_is_L               # True ⇒ الحقل L يقود الجانب الأيمن
+    invert = -1 if ld == "b" else +1   # ‎+p يجب أن يدفع العجلة للأمام
+
+    print(f"  ✅ الوصفة في pi/config.py:")
+    print(f"     MOTOR_SWAP_LR = {swap}")
+    print(f"     MOTOR_INVERT  = {invert}")
+    print(f"\n  ⚠ ثم **تحقّق** بلفّة 90° (لا 180°: تنتهي مواجهة نفس الجهة في")
+    print(f"     الاتجاهين فلا تكشف الانعكاس)، وشاهدها **من خلف الروبوت**.")
+    print(f"  ⚠ ولا تلمس MPU6050_GYRO_Z_SIGN — تُقاس باليد بلا محركات:")
+    print(f"     python3 -m pi.tests.calibrate_mpu6050")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

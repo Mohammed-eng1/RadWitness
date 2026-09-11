@@ -2,30 +2,28 @@
 """
 bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / `real`
 ==========================================================
-- `RoverBridge`      : محاكاة قيادة خارجية بإحداثيات lat/lng (تخدم واجهة M1).
-- `WaveRoverBridge`  : **جسر Wave Rover الحقيقي** ببروتوكول Waveshare المكتشف
-                       تجريبياً، مع بديل محاكاة كامل ليعمل على ويندوز بلا عتاد.
+- `RoverBridge`        : محاكاة قيادة خارجية بإحداثيات lat/lng (تخدم واجهة M1).
+- `RoverControlBridge` : **جسر الروبوت الحقيقي** — منطق اللفّ والقصور الذاتي
+                         والإنهاك والبطارية، مع بديل محاكاة كامل ليعمل على
+                         ويندوز بلا عتاد. (`WaveRoverBridge` اسم قديم مُبقى.)
 
-بروتوكول Waveshare (JSON سطري + \\n على ROVER_PORT @115200 — uart3
-`/dev/ttyAMA3` منذ 2026-08-08 بعد موت TXD0، انظر config):
-    إرسال:  {"T":1,"L":<-1..1>,"R":<-1..1>}   حركة (تُضرب في MOTOR_INVERT)
-            {"T":126}                          طلب IMU كامل
-            {"T":130}                          طلب حالة مختصرة
-    استقبال: {"T":1002, r,p,y, ax..az, gx..gz, mx..mz, temp}   ردّ 126
-            {"T":1001, L,R, r,p,y, temp, v}                    ردّ 130
+🔴 **الجسر لا يعرف أي هيكل تحته** (2026-09-11): بروتوكول الهيكل انتقل خلف
+واجهة واحدة `pi/rover/transport.py` — سابقة مقصودة تكرّر ما فُعل بمصدر
+الاتجاه في `pi/sensors/heading.py`. السبب: هيكل Wave Rover تعطّل ويُستبدل
+بـFreenove 4WD (`docs/BRIEF_FREENOVE_PORT.md`)، والاقتران بالهيكل كان
+**سطراً واحداً** — `_send({"T":1,...})` داخل `motors()` — لأن قاعدة «كل أمر
+حركة يمرّ بـ`bridge.motors()`» حصرته هناك.
 
-⚠ ملاحظات مثبتة على العتاد:
-  - الفيرموير كان **يردّد الأمر المُرسل صدىً** قبل الرد الفعلي. أُطفئ الصدى
-    نهائياً (2026-08-07) بخطوة {"T":143,"cmd":0} في boot.mission على ESP32،
-    ومنطق تجاهله في `_read_until` **باقٍ دفاعياً**: لوحة بديلة أو مسح
-    boot.mission يعيدان الصدى (افتراضيه في الفيرموير مفعّل).
-  - `y` (yaw) **للعرض فقط لا للملاحة** — الملاحة من `gz` (انظر CLAUDE.md).
-  - `T=131`, `T=4`, `T=71` بلا رد — لا تعتمد عليها.
-  - **الأمر المرتد لا يعني التنفيذ** — تحقق من الحركة عبر gz/التسارع.
+⚠ ما بقي في هذا الملف **مستقل عن الهيكل بالكامل**: تجزئة اللفّات، تهدئة
+  الاقتراب، قياس القصور الذاتي وتعلّم `τ`، حارس إنهاك البطارية، تصفية
+  الإشارة، كشف الشحن، تصنيف الجهد. لا يتغيّر منه حرف بتبديل الهيكل.
+
+⚠ `read_imu`/`read_status` قد يعيدان `None` على هيكل لا يوفّرهما (Freenove:
+  الاتجاه من MPU على i2c-4 والجهد من INA219 على i2c-1، فلا حاجة للهيكل).
+  🔴 `None` = **مجهول لا صفر** (البند 6.1).
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
 import random
@@ -39,29 +37,22 @@ from pi.config import (
     MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
     TURN_STALL_DPS, TURN_STALL_AFTER_S, TURN_STALL_BOOST,
     TURN_STALL_FLOOR_FRAC,
-    TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED,
+    TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED, ROVER_KIND,
     TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
     TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
     TURN_COAST_TAU_S, TURN_COAST_TAU_ALPHA, TURN_COAST_TAU_MAX_S,
-    TURN_MAX_LEAD_DEG, TURN_MIN_ACHIEVABLE_DEG, ROVER_LINK_REOPEN_S,
+    TURN_MAX_LEAD_DEG, TURN_MIN_ACHIEVABLE_DEG,
     TURN_RATE_FADE_WARN,
-    ESP32_BOOT_WAIT_S, ESP32_STUCK_ZERO_BYTES, ESP32_STUCK_RETRY_S,
-    ESP32_STUCK_RETRIES,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
 from pi.sensors.heading import make_heading_source, robust_bias  # noqa: F401
+# وناقل أوامر المحركات خلف واجهة واحدة كذلك — الجسر لا يعرف أي هيكل تحته.
+from pi.rover.transport import make_transport
 
 logger = logging.getLogger(__name__)
 
 from pi.rover import battery as batt
-
-# استيراد العتاد محميّ — غيابه (ويندوز) لا يكسر شيئاً
-try:
-    import serial
-    _SERIAL_OK = True
-except Exception:                     # noqa: BLE001
-    _SERIAL_OK = False
 
 _M_PER_DEG = 111320.0
 
@@ -132,20 +123,21 @@ class RoverBridge:
 # ═══════════════════════════════════════════════════════════════
 #  2) جسر Wave Rover الحقيقي (+ محاكاة كاملة)
 # ═══════════════════════════════════════════════════════════════
-class WaveRoverBridge:
+class RoverControlBridge:
     """
-    وضعان: `real` (سيريال حقيقي) و`sim` (محاكاة كاملة تعمل على ويندوز).
-    التبديل بعلم واحد؛ عند طلب `real` وغياب pyserial/المنفذ يسقط تلقائياً
-    إلى `sim` مع تسجيل السبب (لا فشل صامت).
+    وضعان: `real` (عتاد حقيقي) و`sim` (محاكاة كاملة تعمل على ويندوز).
+    التبديل بعلم واحد؛ عند تعذّر فتح الناقل يسقط تلقائياً إلى `sim` مع
+    تسجيل السبب (لا فشل صامت — البند 7).
+
+    الهيكل يُختار بـ`kind` (افتراضه `ROVER_KIND` من config).
     """
 
     def __init__(self, mode: str = "sim", port: str = ROVER_PORT, baud: int = ROVER_BAUD,
-                 heading_source=None):
+                 heading_source=None, kind: str = None):
         self.requested_mode = mode
         self.mode = "sim"
         self.error = None
         self.port, self.baud = port, baud
-        self._ser = None
         self._last_cmd_ts = 0.0
         self._moving = False
         self._cmd_lr = (0.0, 0.0)
@@ -169,18 +161,8 @@ class WaveRoverBridge:
         self.battery_amps_raw = None
         self.charge_detector = batt.ChargeDetector()
         self._sim_v_override = False
-        # صحّة وصلة السيريال — **حالة معلنة لا استثناء منتشر** (انظر `_send`)
-        self.link_ok = True
-        self.link_error = None
-        self._last_reopen_ts = 0.0
-        # كاشف «ESP32 عالق في الإقلاع» (تدفق أصفار — انظر config §ESP32)
-        # ⚠ حالة مستقلة عن link_ok عمداً: المنفذ سليم والكتابة تنجح، لكن
-        #   الطرف الآخر يبثّ أصفاراً — عرَض مختلف عن «لا رد» وعلاجه مختلف.
-        self.esp32_stuck = False
-        self._zero_run = 0
-        self._stuck_attempts = 0
-        self._stuck_cooldown_until = 0.0
-        self._port_ready_ts = 0.0
+        # صحّة الوصلة وكاشف علق الإقلاع **يملكهما الناقل** — والجسر يقرأهما
+        # خاصيّتين. تبقى «حالة معلنة لا استثناء منتشر» (البند 6.3).
         # ذروة معدل الدوران لأول لفّة — مرجع كشف إنهاك البطارية سلوكياً
         # ⚠ يبقى **طبقة ثانية** بعد عودة INA219: يكشف الإنهاك سلوكياً بلا
         #   فولتميتر (الدوران بالمكان أول ما يسقط)، والحارسان لا يتعارضان.
@@ -192,21 +174,28 @@ class WaveRoverBridge:
         self._sim_bias = -0.28
         self._last_sim_ts = time.time()
 
-        if mode == "real":
-            if not _SERIAL_OK:
-                self.error = "pyserial غير مثبّت — وضع المحاكاة"
-            else:
-                try:
-                    self._ser = serial.Serial(port, baud, timeout=0.3)
-                    self.mode = "real"
-                    # ⚠ لا أمر قبل اكتمال إقلاع ESP32 (~3ث): الإرسال أثناءه
-                    #   قد يعلّقه في وضع الإقلاع (يبثّ أصفاراً، علاجه Reset
-                    #   يدوي). الانتظار كسول في `_wait_esp32_boot` — عند أول
-                    #   أمر فعلي لا هنا، وغالباً تكون المدة انقضت أصلاً في
-                    #   تهيئة بقية الأنظمة.
-                    self._port_ready_ts = time.time() + ESP32_BOOT_WAIT_S
-                except Exception as e:      # noqa: BLE001
-                    self.error = f"تعذّر فتح {port}: {e} — وضع المحاكاة"
+        # ── الناقل: الهيكل خلف واجهة واحدة ─────────────────────
+        self.kind = (kind or ROVER_KIND)
+        self._tp = make_transport(self.kind, mode, port=port, baud=baud) \
+            if self.kind == "waverover" else make_transport(self.kind, mode)
+        self._tp.emit = self._event
+        self.mode = self._tp.mode
+        self.error = self._tp.error
+        if self.error:
+            logger.warning(self.error)
+            self._event("rover_transport", self.error)
+        else:
+            self._event("rover_transport",
+                        f"ناقل الروبوت: {self._tp.name} ({self.mode})")
+        # 🔴 خريطة المحركات غير مشتقّة على هيكل جديد ⇒ **تُعلَن بصوت عالٍ**
+        #    (البند 6.1: المجهول يُعلَن ولا يُفترض سليماً). القيم الموروثة
+        #    من Wave Rover كانت تعويضاً عن فيرموير مرآتي لم يعد موجوداً.
+        if self.mode == "real" and not self._tp.motor_map_calibrated:
+            self._event("motor_map_uncalibrated",
+                        f"🔴 خريطة المحركات غير مشتقّة على {self._tp.name} — "
+                        f"MOTOR_INVERT/MOTOR_SWAP_LR موروثان من هيكل آخر. "
+                        f"اشتقّهما بمسبار المعالم قبل أي مهمة: "
+                        f"python3 -m pi.tests.probe_motor_map")
 
         # ⚠ **بعد** تثبيت self.mode: المصنع يحتاج معرفة الوضع الفعلي ليختار
         # مصدراً صالحاً (لا BNO055 وهمي في المحاكاة ولا العكس).
@@ -259,178 +248,25 @@ class WaveRoverBridge:
         evs, self.events = self.events, []
         return evs
 
-    # ── إقلاع ESP32 وكاشف العلق ─────────────────────────────────
-    def _wait_esp32_boot(self) -> None:
-        """
-        ينتظر اكتمال إقلاع ESP32 قبل **أول** أمر بعد فتح المنفذ.
+    # ── صحّة الوصلة: يملكها الناقل، والجسر يقرأها ───────────────
+    # ⚠ **قابلة للكتابة** عمداً: اختبارات `pi/comms/selftest.py` تحاكي انقطاع
+    #   الوصلة بضبطها، والحارس في `_turn_segment` يقرأها.
+    @property
+    def link_ok(self) -> bool:
+        return self._tp.link_ok
 
-        عطل مشخَّص (2026-08-07): الإرسال على TX أثناء الإقلاع (~3ث مقاسة) قد
-        يعبث بأطراف وضع الإقلاع (GPIO0 ونحوها) فيعلق ESP32 يبثّ أصفاراً
-        متدفقة ولا يخرج منه إلا زرّ Reset. الانتظار مرة واحدة، ويُقتطع منه
-        ما انقضى منذ فتح المنفذ (تهيئة بقية الأنظمة تستهلك المدة غالباً).
-        """
-        if not self._port_ready_ts:
-            return
-        wait = self._port_ready_ts - time.time()
-        self._port_ready_ts = 0.0
-        if wait > 0:
-            self._event("esp32_boot_wait",
-                        f"انتظار اكتمال إقلاع ESP32 ({wait:.1f}ث) قبل أول أمر")
-            time.sleep(wait)
+    @link_ok.setter
+    def link_ok(self, value: bool) -> None:
+        self._tp.link_ok = bool(value)
 
-    def _mark_esp32_alive(self) -> None:
-        """أي JSON صالح من الفيرموير يصفّر الكاشف ويرفع إعلان العلق إن وُجد."""
-        self._zero_run = 0
-        self._stuck_attempts = 0
-        if self.esp32_stuck:
-            self.esp32_stuck = False
-            self._event("esp32_recovered",
-                        "✅ عاد ESP32 يستجيب (يبدو أن زرّ Reset ضُغط) — "
-                        "الوصلة سليمة")
+    @property
+    def link_error(self):
+        return self._tp.link_error
 
-    def _note_zero_bytes(self, n: int) -> None:
-        """
-        كاشف «ESP32 عالق في الإقلاع» — العرَض المقاس: **تدفق أصفار** مستمر
-        على UART (لا صمت ولا بيانات)، والعلاج زرّ Reset على اللوحة.
-
-        ⚠ **ليس** «لا رد»: الصمت عرَض وصلة/heartbeat وعلاجه مختلف — خلط
-           التشخيصين يضيّعهما معاً، لذلك حالة مستقلة (`esp32_stuck`) لا
-           `link_ok`.
-        ⚠ إعادة الفحص **موزَّعة على الاستدعاءات** لا حلقة نوم واحدة: القراءة
-           الدورية (poll_battery كل 200ms) هي المحاولة التالية أصلاً، وحلقة
-           نوم 3×2ث داخل مسار القراءة كانت ستجمّد حلقة السيرفر كلها.
-        """
-        if self.esp32_stuck:
-            return                  # مُعلَن — بانتظار Reset يدوي، لا تكرار
-        now = time.time()
-        if now < self._stuck_cooldown_until:
-            return                  # مهلة بين المحاولات — أصفارها لا تُحسب
-        self._zero_run += n
-        if self._zero_run < ESP32_STUCK_ZERO_BYTES:
-            return
-        self._zero_run = 0
-        self._stuck_attempts += 1
-        if self._stuck_attempts < ESP32_STUCK_RETRIES:
-            self._stuck_cooldown_until = now + ESP32_STUCK_RETRY_S
-            self._event("esp32_stuck_suspect",
-                        f"⚠ ESP32 يبثّ أصفاراً (عالق في الإقلاع؟) — إعادة "
-                        f"الفحص بعد {ESP32_STUCK_RETRY_S:.0f}ث "
-                        f"(محاولة {self._stuck_attempts}/{ESP32_STUCK_RETRIES})")
-            # تفريغ المتراكم حتى لا تُحسب أصفار قديمة على المحاولة التالية
-            try:
-                self._ser.reset_input_buffer()
-            except Exception:        # noqa: BLE001
-                pass
-            return
-        self.esp32_stuck = True
-        # ⚠ مؤشر «شبكة UGV تظهر عند الإقلاع السليم» بطل منذ تعطيل راديو
-        #   WiFi في الفيرموير (DISABLE_WIFI_RADIO — الهوائي محترق): الشبكة
-        #   لا تظهر أبداً الآن، وظهورها يعني فيرموير قديماً على اللوحة.
-        self._event("esp32_stuck",
-                    "🔴 ESP32 عالق في الإقلاع — اضغط زر Reset على لوحة "
-                    "الروبوت. (الوقاية: شغّل الروبوت أولاً وانتظر 5 ثوانٍ "
-                    "قبل الراسبري/الأوامر. ومؤشر شبكة UGV لم يعد صالحاً "
-                    "بعد تعطيل راديو WiFi في الفيرموير)")
-
-    # ── الإرسال/الاستقبال ────────────────────────────────────────
-    def _reopen(self) -> bool:
-        """
-        محاولة إحياء واحدة للمنفذ، **بتهدئة**: الحلقة تُرسل كل 20ms، وفتح
-        منفذ فاشل في كل دورة يحوّل العطل إلى شلل.
-        """
-        now = time.time()
-        if not _SERIAL_OK or now - self._last_reopen_ts < ROVER_LINK_REOPEN_S:
-            return False
-        self._last_reopen_ts = now
-        try:
-            if self._ser is not None:
-                try:
-                    self._ser.close()
-                except Exception:            # noqa: BLE001
-                    pass
-            self._ser = serial.Serial(self.port, self.baud, timeout=0.3)
-            return True
-        except Exception:                    # noqa: BLE001
-            return False
-
-    def _send(self, obj: dict) -> None:
-        """
-        ⚠⚠ **لا يرفع استثناءً أبداً** ⚠⚠
-        عطل مقاس (2026-08-01): عند موت المنفذ (أُغلق تحت الخيط، أو فُصل
-        الكيبل) كان `write` يرمي SerialException فينتشر من `motors()` إلى
-        `_turn_segment` — **ثم يرمي `finally: self.stop()` نفسه** لأنه يسلك
-        نفس المسار بالضبط. فتضيع «الإيقاف المضمون» في اللحظة الوحيدة التي
-        وُجدت لأجلها، ويطبع بايثون شلال استثناءات متداخلة يدفن السبب الأول.
-        الخطأ يُلتقط هنا ويصير **حالة معلنة** (`link_ok`) تقرأها طبقة أعلى.
-        """
-        if self.mode != "real" or self._ser is None:
-            return
-        self._wait_esp32_boot()
-        payload = (json.dumps(obj) + "\n").encode("ascii")
-        try:
-            self._ser.write(payload)
-            if not self.link_ok:
-                self.link_ok, self.link_error = True, None
-                self._event("rover_link", "✅ عاد اتصال الروفر")
-            return
-        except Exception as e:               # noqa: BLE001
-            why = str(e)
-        # إحياء واحد ثم إعادة المحاولة — المنفذ قد يكون أُغلق ويُعاد فتحه
-        if self._reopen():
-            try:
-                self._ser.write(payload)
-                self.link_ok, self.link_error = True, None
-                self._event("rover_link", "✅ أُعيد فتح منفذ الروفر")
-                return
-            except Exception as e:           # noqa: BLE001
-                why = str(e)
-        if self.link_ok:
-            self._event("rover_link_fault",
-                        f"⛔ انقطع اتصال الروفر ({self.port}): {why} — "
-                        f"لا أمر حركة يصل. ⚠ آخر أمر قد يبقى منفَّذاً في "
-                        f"الفيرموير حتى مهلته: افصل الطاقة يدوياً إن تحرّك.")
-        self.link_ok = False
-        self.link_error = why
-
-    def _read_until(self, expect_t: int, request_t: int, timeout: float = 1.0):
-        """
-        يقرأ أسطراً حتى يجد T == expect_t. **يتجاهل صدى الأمر المُرسل**
-        (أي سطر T == request_t) وأي سطر غير صالح.
-        """
-        if self.mode != "real":
-            return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                raw = self._ser.readline()
-            except Exception:               # noqa: BLE001
-                break
-            if not raw:
-                continue
-            # كاشف العلق: عدّ الأصفار من البايتات **الخام** قبل فكّ الترميز —
-            # ESP32 العالق في الإقلاع يبثّ b'\x00...' متدفقة لا JSON ولا صمتاً.
-            zeros = raw.count(b"\x00")
-            if zeros:
-                self._note_zero_bytes(zeros)
-            line = raw.decode("ascii", errors="replace").strip("\x00 \t\r\n")
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue                    # سطر غير JSON — تجاهل
-            # ⚠ الفيرموير يرسل أحياناً JSON صالحاً لكنه **ليس كائناً** (رقم
-            # مجرّد مثل 0) → json.loads يعطي int، ومناداة .get عليه تنفجر
-            # بـ'int' object has no attribute 'get' وتُسقط المهمة كلها.
-            if not isinstance(d, dict):
-                continue
-            self._mark_esp32_alive()
-            t = d.get("T")
-            if t == request_t:
-                continue                    # صدى الأمر — تجاهل
-            if t == expect_t:
-                return d
-        return None
+    @property
+    def esp32_stuck(self) -> bool:
+        """علق إقلاع ESP32 — خاصّ بـWave Rover، و`False` على أي هيكل آخر."""
+        return bool(self._tp.state().get("esp32_stuck", False))
 
     # ── الحركة (⚠ MOTOR_INVERT) ─────────────────────────────────
     def motors(self, l: float, r: float) -> dict:
@@ -438,18 +274,23 @@ class WaveRoverBridge:
         **المسار الوحيد لإرسال أي أمر حركة** (تقدّم/رجوع/لفّ/أوامر الواجهة).
         يطبّق MOTOR_INVERT ثم **حاجزاً صارماً** عند ±MAX_MOTOR_POWER.
 
-        ⚠ الحاجز إلزامي: الفيرموير يضرب المدخل في 512 على PWM بدقة 8 بت
-        (256 عدّة)، فما فوق 0.5 يلتفّ (يُطرح 0.5): إرسال 0.8 يُنتج قوة فعّالة
-        0.3 — زحف صامت يفسد حساب المسافة في deadreckoning بلا أي إنذار.
-        القصّ يحفظ الإشارة ويُسجَّل تحذيراً.
-        🔴 والحدّ ليس تقييداً: 0.5×512 = 256 = duty كامل 100% — أي كامل قدرة
-        الروبوت أصلاً، فلا شيء فوق 0.5 يُخسر (CLAUDE.md §2.1).
+        ⚠ الحاجز إلزامي على Wave Rover: الفيرموير يضرب المدخل في 512 على
+        PWM بدقة 8 بت (256 عدّة)، فما فوق 0.5 يلتفّ (يُطرح 0.5): إرسال 0.8
+        يُنتج قوة فعّالة 0.3 — زحف صامت يفسد حساب المسافة في deadreckoning
+        بلا أي إنذار. القصّ يحفظ الإشارة ويُسجَّل تحذيراً.
+        🔴 والحدّ ليس تقييداً هناك: 0.5×512 = 256 = duty كامل 100% — أي كامل
+        قدرة الروبوت أصلاً، فلا شيء فوق 0.5 يُخسر (CLAUDE.md §2.1).
+        ⚠ وعلى Freenove **السبب يبطل** (PCA9685 دقّته 12 بت، لا التفاف) لكن
+        الحاجز يبقى **حدّ أمان**: كل الثوابت المعايرة مشتقّة على هذا السقف،
+        ورفعه بلا إعادة قياس سلّم القوة كاملاً يكسرها بصمت (م3).
         """
         li = max(-1.0, min(1.0, float(l)))
         ri = max(-1.0, min(1.0, float(r)))
-        # 🔴 تعويض تخطيط الفيرموير المرآتي (مقاس 2026-08-07): الفيرموير
-        #    المفلوش بدّل القناتين وعكس القطبية معاً — التقدّم كان يرجع
-        #    للخلف والدوران يميناً يبقى يميناً. التعويض: تبديل ثم نفي.
+        # 🔴 تعويض تخطيط الفيرموير المرآتي (مقاس 2026-08-07 على Wave Rover):
+        #    الفيرموير المفلوش بدّل القناتين وعكس القطبية معاً — التقدّم كان
+        #    يرجع للخلف والدوران يميناً يبقى يميناً. التعويض: تبديل ثم نفي.
+        # ⚠ على هيكل آخر هذان الثابتان **غير مشتقّين** ويُعلَن ذلك عند
+        #    الإقلاع — يُشتقّان بمسبار المعالم لا بشهادة عين (البند 2).
         sw_l, sw_r = (ri, li) if MOTOR_SWAP_LR else (li, ri)
         lw, rw = sw_l * MOTOR_INVERT, sw_r * MOTOR_INVERT  # قيم السلك
 
@@ -461,14 +302,16 @@ class WaveRoverBridge:
             self.last_clamp_msg = (
                 f"⚠ قُصّت القوة إلى ±{MAX_MOTOR_POWER} "
                 f"(طُلب L={lw:.2f} R={rw:.2f} → L={lc:.2f} R={rc:.2f}) — "
-                f"التفاف فيرموير Wave Rover فوق 0.5")
+                f"{self._tp.clamp_reason}")
             logger.warning(self.last_clamp_msg)
             self._event("power_clamp", self.last_clamp_msg)
 
         self._cmd_lr = (lc, rc)
         self._moving = not (lc == 0.0 and rc == 0.0)
         self._last_cmd_ts = time.time()
-        self._send({"T": 1, "L": round(lc, 3), "R": round(rc, 3)})
+        # 🔴 **الاقتران الوحيد بالهيكل** — خلف واجهة الناقل (transport.py)
+        if self.mode == "real":
+            self._tp.send_motors(lc, rc)
         if self.mode == "sim":
             # معدل الدوران من القوة **الفعّالة بعد القصّ**، مُعاداً لإطار
             # النية بعكس التحويل كاملاً (النفي ثم التبديل)
@@ -502,11 +345,16 @@ class WaveRoverBridge:
 
     # ── القراءات ────────────────────────────────────────────────
     def read_imu(self) -> dict:
-        """T=126 → T:1002. في المحاكاة يولّد gz متسقاً مع أمر الدوران."""
+        """
+        قراءة IMU **من الهيكل** إن وفّرها. في المحاكاة يولّد gz متسقاً مع
+        أمر الدوران.
+
+        🔴 على هيكل بلا IMU (Freenove) يعيد `None` = **مجهول لا صفر**
+           (البند 6.1): مصدر الاتجاه يرى `None` فيرفض القراءة بدل أن يبني
+           تكاملاً على صفر مُختلَق. والاتجاه أصلاً من MPU على i2c-4.
+        """
         if self.mode == "real":
-            self._send({"T": 126})
-            d = self._read_until(1002, 126)
-            return d or {}
+            return self._tp.read_imu()
         now = time.time()
         self._last_sim_ts = now
         gz = self._sim_turn_rate + self._sim_bias + random.uniform(-0.4, 0.4)
@@ -516,10 +364,13 @@ class WaveRoverBridge:
                 "mx": 0.0, "my": 0.0, "mz": 0.0, "temp": 31.0}
 
     def read_status(self) -> dict:
-        """T=130 → T:1001 (يتضمّن جهد البطارية v)."""
+        """
+        حالة مختصرة **من الهيكل** إن وفّرها (وفيها جهد البطارية على
+        Wave Rover). على هيكل لا يوفّرها تعيد `None` ويبقى `last_status`
+        فارغاً — فيسقط `voltage()` إلى INA219 وحده ويُعلَن المصدر.
+        """
         if self.mode == "real":
-            self._send({"T": 130})
-            d = self._read_until(1001, 130) or {}
+            d = self._tp.read_status() or {}
         else:
             if self._moving:                # استهلاك وهمي بسيط
                 self._sim_v = max(9.5, self._sim_v - 0.0004)
@@ -1124,8 +975,15 @@ class WaveRoverBridge:
             "bias_calibrated": self.bias_calibrated,
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
             "link_ok": self.link_ok, "link_error": self.link_error,
-            # علق إقلاع ESP32 — حالة مستقلة عن link_ok (العلاج: زرّ Reset)
+            # علق إقلاع ESP32 — حالة مستقلة عن link_ok (العلاج: زرّ Reset).
+            # تبقى في أعلى الحالة للتوافق مع الواجهة؛ و`False` على أي هيكل
+            # آخر لأن الكاشف يخصّ ESP32 وحده.
             "esp32_stuck": self.esp32_stuck,
+            # الهيكل وحالة ناقله — 🔴 وخريطة المحركات: «مشتقّة أم لا»
+            # تُعرض صراحةً (البند 6.1: المجهول يُعلَن).
+            "kind": self.kind, "transport": self._tp.name,
+            "motor_map_calibrated": self._tp.motor_map_calibrated,
+            "transport_state": self._tp.state(),
             "battery": (self.battery_state() if BATTERY_MONITOR_ENABLED
                         else batt.classify(None)),
             "rth_requested": self.rth_requested, "battery_alarm": self.battery_alarm,
@@ -1142,7 +1000,13 @@ class WaveRoverBridge:
         except Exception:                    # noqa: BLE001
             pass
         try:
-            if self._ser:
-                self._ser.close()
+            self._tp.close()
         except Exception:                    # noqa: BLE001
             pass
+
+
+# ── الاسم القديم — مُبقى للتوافق ────────────────────────────────
+# 🔴 لا يُعاد تسميته في المستدعين (15 ملفاً): التسمية ليست الهدف، والهدف
+#    أن الجسر لم يعد يعرف هيكله. الاسم القديم أثرٌ تاريخي كـ`mpu6050.py`
+#    الذي صار يقرأ MPU-6500.
+WaveRoverBridge = RoverControlBridge

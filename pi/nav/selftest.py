@@ -2674,7 +2674,11 @@ def main() -> int:
         def close(self):      self.closed = True                        # noqa: E704
 
     dead = WaveRoverBridge(mode="sim")
-    dead.mode, dead._ser = "real", DeadPort()      # منفذ يرفض كل كتابة
+    # ⚠ الحقن صار على **الناقل** لا الجسر (2026-09-11): بروتوكول الهيكل
+    #   انتقل خلف `pi/rover/transport.py`. الفحص نفسه لم يتغيّر — منفذ يرفض
+    #   كل كتابة، والمطلوب أن الاستثناء لا يعبر مسار الحركة (البند 6.3).
+    dead.mode = "real"
+    dead._tp.mode, dead._tp._ser = "real", DeadPort()
     try:
         dead.motors(0.4, -0.4)
         dead.stop()
