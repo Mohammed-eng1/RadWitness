@@ -237,6 +237,21 @@ def main() -> int:
     check("إيقاف مضمون بعد كل مناورة (finally)", rv.stops > 0 and rv4.stops > 0)
 
     # ═══ باتش حدّ القوة (التفاف فيرموير Wave Rover فوق 0.5) ═══════
+    # ═══ نظافة الإعدادات — 🐞 بعد خلل `GYRO_SCALE` المُعرَّف مرتين ═══
+    # ⚠ الحارس **موصول هنا لا في سكربت منفصل** (البند 8): لو بقي أداة
+    #   تُشغَّل يدوياً لما شغّلها أحد، وعودة التكرار تمرّ صامتة تماماً كما
+    #   مرّت أول مرة.
+    print("\nح0) نظافة pi/config.py:")
+    from pi.tests.check_config_hygiene import run as _cfg_hygiene
+    _hyg = _cfg_hygiene()
+    check("لا ثابت مُعرَّف مرتين · لا إرث منصّة ميتة · لا مشتقّ مكتوب يدوياً",
+          not _hyg, "؛ ".join(_hyg)[:110] if _hyg else "نظيف")
+    # ويُثبَت أنه **يكشف** لا أنه يمرّ: حارس لا يفشل أبداً ليس حارساً.
+    check("والحارس يكشف التكرار فعلاً (لا يمرّ لأنه أعمى)",
+          len(_cfg_hygiene("A = 1\nGYRO_SCALE = 0.9\nGYRO_SCALE = 0.9\n")) == 1)
+    check("ويكشف ثابتاً مشتقّاً كُتب رقماً",
+          len(_cfg_hygiene("HEADING_SPIKE_DPS_STEER = 120.0\n")) == 1)
+
     print("\nح) حدّ القوة الصارم:")
     from pi.rover.bridge import WaveRoverBridge
     from pi.config import MAX_MOTOR_POWER, MOTOR_INVERT, SPEED_LADDER, DRIVE_POWER_DEFAULT
