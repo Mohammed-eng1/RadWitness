@@ -343,8 +343,8 @@ class ManualControl:
     @staticmethod
     def _clamp_power(power) -> float:
         """
-        🔴 القصّ إلى [MIN, MAX] — والسقف هو `MAX_MOTOR_POWER` نفسه: أي قيمة
-        فوقه يلتفّ عليها فيرموير Wave Rover **صامتاً** (0.6→0.1).
+        🔴 القصّ إلى [MIN, MAX] — والسقف هو `MAX_MOTOR_POWER` نفسه، وهو
+        **حدّ أمان مقاس على Freenove** لا حدّ عددي: انظر config.
         """
         try:
             p = float(MANUAL_POWER_DEFAULT if power is None else power)

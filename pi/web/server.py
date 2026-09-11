@@ -650,8 +650,9 @@ def api_rover_status():
     return {
         "raw": st, "mode": rv.mode,
         "link_ok": rv.link_ok, "link_error": rv.link_error,
-        # علق إقلاع ESP32 (تدفق أصفار) — العلاج زرّ Reset لا إعادة محاولة
-        "esp32_stuck": rv.esp32_stuck,
+        "platform": rv.kind, "transport": rv._tp.name,
+        # 🔴 خريطة المحركات: «مشتقّة أم لا» تُعرض صراحةً (البند 6.1)
+        "motor_map_calibrated": rv._tp.motor_map_calibrated,
         "voltage_source": rv.voltage_source,
         "battery_monitor_enabled": BATTERY_MONITOR_ENABLED,
         # الحماية البديلة الفعلية

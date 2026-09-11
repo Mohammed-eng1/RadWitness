@@ -4,10 +4,9 @@ probe_motor_map.py — مسبار المعالم الفيزيائية: اشتق�
 =====================================================================
 **أداة خارجية** (سكربت تشخيص — البند 8).
 
-يشتقّ `MOTOR_SWAP_LR` و`MOTOR_INVERT` بالمشاهدة، **مستقلاً عن الهيكل**:
-يمرّ بناقل الجسر (`transport.py`) فيعمل على Wave Rover وFreenove معاً.
-بديل `test_rover_link --map` الذي يفتح المنفذ التسلسلي مباشرة فلا يصلح
-لهيكل بلا UART.
+يشتقّ `MOTOR_SWAP_LR` و`MOTOR_INVERT` بالمشاهدة، **مستقلاً عن المنصّة**:
+يمرّ بناقل الجسر (`transport.py`) لا بمنفذ خام، فيصلح لمنصّة بلا UART
+(Freenove يُقاد I2C مباشرة).
 
 🔴 **لماذا مسبار لا شهادة عين** (سيرة ثابت انقلب مرتين في يومين):
   - **حقل واحد لكل نبضة** (L وحده ثم R وحده) — نبضة مركّبة تخلط الأثرين.
@@ -76,7 +75,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="مسبار المعالم: اشتقاق MOTOR_SWAP_LR و MOTOR_INVERT")
     ap.add_argument("--kind", default=ROVER_KIND,
-                    help="نوع الهيكل (waverover | freenove)")
+                    help="اسم المنصّة (freenove)")
     ap.add_argument("--power", type=float, default=0.3,
                     help=f"قوة النبضة ({MIN_MOTOR_POWER}–{MAX_MOTOR_POWER})")
     ap.add_argument("--seconds", type=float, default=PULSE_S)

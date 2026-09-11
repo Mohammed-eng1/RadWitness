@@ -1,1 +1,1 @@
-# جسر Wave Rover (واجهة تجريد real/sim)
+# جسر الروبوت (واجهة تجريد real/sim) — منصّة Freenove

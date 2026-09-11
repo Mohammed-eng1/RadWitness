@@ -2668,17 +2668,23 @@ def main() -> int:
     # ⚠ الحارس الحاسم: منفذ ميت كان يجعل `finally: self.stop()` **نفسه** يرمي
     #    استثناءً — فتضيع «الإيقاف المضمون» في اللحظة الوحيدة التي وُجدت لها،
     #    ويطبع بايثون شلال استثناءات متداخلة يدفن السبب الأول (شوهد على العتاد).
-    class DeadPort:
-        closed = False
-        def write(self, _b):  raise OSError(9, "Bad file descriptor")   # noqa: E704
-        def close(self):      self.closed = True                        # noqa: E704
+    class DeadPWM:
+        """PCA9685 يرفض كل كتابة — عطل ناقل I2C أثناء الحركة."""
+        ok, error, write_errors, freq_hz = True, None, 0, 50.0
+        def set_duty(self, _ch, _d):
+            self.write_errors += 1
+            self.ok, self.error = False, "[Errno 121] Remote I/O error"
+            return False
+        def all_off(self): pass                                          # noqa: E704
+        def close(self):   pass                                          # noqa: E704
 
     dead = WaveRoverBridge(mode="sim")
-    # ⚠ الحقن صار على **الناقل** لا الجسر (2026-09-11): بروتوكول الهيكل
-    #   انتقل خلف `pi/rover/transport.py`. الفحص نفسه لم يتغيّر — منفذ يرفض
-    #   كل كتابة، والمطلوب أن الاستثناء لا يعبر مسار الحركة (البند 6.3).
+    # ⚠ الحقن على **الناقل** لا الجسر: بروتوكول المنصّة خلف
+    #   `pi/rover/transport.py`. وصار العطل عطل **I2C** لا منفذ تسلسلي —
+    #   Freenove يقاد مباشرة بلا UART. الفحص نفسه لم يتغيّر: المطلوب أن
+    #   الاستثناء لا يعبر مسار الحركة (البند 6.3).
     dead.mode = "real"
-    dead._tp.mode, dead._tp._ser = "real", DeadPort()
+    dead._tp.mode, dead._tp._pwm = "real", DeadPWM()
     try:
         dead.motors(0.4, -0.4)
         dead.stop()

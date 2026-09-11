@@ -15,7 +15,7 @@ import os
 import threading
 import time
 
-from pi.config import GPS_PORT, GPS_BAUD, ROVER_PORT, ROVER_MODE
+from pi.config import GPS_PORT, GPS_BAUD
 
 try:
     import serial
@@ -50,16 +50,8 @@ class GPSReader:
         if not _GPS_LIBS_OK:
             self.error = "pyserial/pynmea2 غير مثبّت"
             return
-        # ⚠ التعارض يُفحص **قبل** الفتح: بعده يكون الضرر وقع (خيط يقرأ ويبتلع).
-        # يُقارَن المسار الحقيقي لا النصّي — /dev/serial0 وصلة رمزية إلى
-        # ttyAMA0/ttyS0، فمقارنة الأسماء وحدها تفوّت التعارض نفسه.
-        if ROVER_MODE == "real" and _same_device(port, ROVER_PORT):
-            self.error = (f"⛔ معطَّل: {port} هو منفذ الروفر نفسه (تعارض UART "
-                          f"موثّق في docs/wiring.md). قارئان على منفذ واحد "
-                          f"يتخاطفان ردود الروفر (T:1001/1002) فتضيع قراءة "
-                          f"الجهد. الحل: محوّل USB-Serial ثم "
-                          f"RMS_GPS_PORT=/dev/ttyUSB0")
-            return
+        # 🔴 سقط حارس «تعارض منفذ الروفر»: على Freenove التحكّم I2C مباشر
+        #    ولا منفذ تسلسلي للروبوت أصلاً، فلا منازع على serial0.
         try:
             self._ser = serial.Serial(port, baud, timeout=1.0)
             self.ok = True

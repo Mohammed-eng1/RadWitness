@@ -7,19 +7,17 @@ bridge.py — جسر الروفر: واجهة موحّدة بوضعَي `sim` / 
                          والإنهاك والبطارية، مع بديل محاكاة كامل ليعمل على
                          ويندوز بلا عتاد. (`WaveRoverBridge` اسم قديم مُبقى.)
 
-🔴 **الجسر لا يعرف أي هيكل تحته** (2026-09-11): بروتوكول الهيكل انتقل خلف
-واجهة واحدة `pi/rover/transport.py` — سابقة مقصودة تكرّر ما فُعل بمصدر
-الاتجاه في `pi/sensors/heading.py`. السبب: هيكل Wave Rover تعطّل ويُستبدل
-بـFreenove 4WD (`docs/BRIEF_FREENOVE_PORT.md`)، والاقتران بالهيكل كان
-**سطراً واحداً** — `_send({"T":1,...})` داخل `motors()` — لأن قاعدة «كل أمر
-حركة يمرّ بـ`bridge.motors()`» حصرته هناك.
+🔴 **الجسر لا يعرف أي منصّة تحته**: بروتوكول المنصّة خلف واجهة واحدة
+`pi/rover/transport.py` — سابقة مقصودة تكرّر ما فُعل بمصدر الاتجاه في
+`pi/sensors/heading.py`. وهذا الفرع **منصّة Freenove وحدها**
+(`docs/BRIEF_FREENOVE_PORT.md`).
 
 ⚠ ما بقي في هذا الملف **مستقل عن الهيكل بالكامل**: تجزئة اللفّات، تهدئة
   الاقتراب، قياس القصور الذاتي وتعلّم `τ`، حارس إنهاك البطارية، تصفية
   الإشارة، كشف الشحن، تصنيف الجهد. لا يتغيّر منه حرف بتبديل الهيكل.
 
-⚠ `read_imu`/`read_status` قد يعيدان `None` على هيكل لا يوفّرهما (Freenove:
-  الاتجاه من MPU على i2c-4 والجهد من INA219 على i2c-1، فلا حاجة للهيكل).
+⚠ `read_imu`/`read_status` تعيدان `None` على Freenove: المنصّة لا توفّر
+  IMU ولا جهداً — الاتجاه من MPU على i2c-4 والجهد من INA219 على i2c-1.
   🔴 `None` = **مجهول لا صفر** (البند 6.1).
 """
 from __future__ import annotations
@@ -32,7 +30,7 @@ import time
 from pi.config import (
     DRIVE_SPEED_MPS, TURN_RATE_DPS, ROVER_SAFETY_TIMEOUT_S,
     SIM_HOME_LAT, SIM_HOME_LNG,
-    ROVER_PORT, ROVER_BAUD, MOTOR_INVERT, MOTOR_SWAP_LR, TURN_POWER,
+    MOTOR_INVERT, MOTOR_SWAP_LR, TURN_POWER,
     DRIVE_POWER_DEFAULT, ROVER_TURN_TIMEOUT_S, GYRO_BIAS_CALIB_S,
     MAX_MOTOR_POWER, MAX_TURN_SEGMENT_DEG, TURN_SEGMENT_PAUSE_S,
     TURN_STALL_DPS, TURN_STALL_AFTER_S, TURN_STALL_BOOST,
@@ -121,7 +119,7 @@ class RoverBridge:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  2) جسر Wave Rover الحقيقي (+ محاكاة كاملة)
+#  2) جسر الروبوت الحقيقي (+ محاكاة كاملة)
 # ═══════════════════════════════════════════════════════════════
 class RoverControlBridge:
     """
@@ -132,12 +130,10 @@ class RoverControlBridge:
     الهيكل يُختار بـ`kind` (افتراضه `ROVER_KIND` من config).
     """
 
-    def __init__(self, mode: str = "sim", port: str = ROVER_PORT, baud: int = ROVER_BAUD,
-                 heading_source=None, kind: str = None):
+    def __init__(self, mode: str = "sim", heading_source=None, kind: str = None):
         self.requested_mode = mode
         self.mode = "sim"
         self.error = None
-        self.port, self.baud = port, baud
         self._last_cmd_ts = 0.0
         self._moving = False
         self._cmd_lr = (0.0, 0.0)
@@ -176,8 +172,7 @@ class RoverControlBridge:
 
         # ── الناقل: الهيكل خلف واجهة واحدة ─────────────────────
         self.kind = (kind or ROVER_KIND)
-        self._tp = make_transport(self.kind, mode, port=port, baud=baud) \
-            if self.kind == "waverover" else make_transport(self.kind, mode)
+        self._tp = make_transport(self.kind, mode)
         self._tp.emit = self._event
         self.mode = self._tp.mode
         self.error = self._tp.error
@@ -262,11 +257,6 @@ class RoverControlBridge:
     @property
     def link_error(self):
         return self._tp.link_error
-
-    @property
-    def esp32_stuck(self) -> bool:
-        """علق إقلاع ESP32 — خاصّ بـWave Rover، و`False` على أي هيكل آخر."""
-        return bool(self._tp.state().get("esp32_stuck", False))
 
     # ── الحركة (⚠ MOTOR_INVERT) ─────────────────────────────────
     def motors(self, l: float, r: float) -> dict:
@@ -975,11 +965,7 @@ class RoverControlBridge:
             "bias_calibrated": self.bias_calibrated,
             "moving": self._moving, "cmd": {"L": self._cmd_lr[0], "R": self._cmd_lr[1]},
             "link_ok": self.link_ok, "link_error": self.link_error,
-            # علق إقلاع ESP32 — حالة مستقلة عن link_ok (العلاج: زرّ Reset).
-            # تبقى في أعلى الحالة للتوافق مع الواجهة؛ و`False` على أي هيكل
-            # آخر لأن الكاشف يخصّ ESP32 وحده.
-            "esp32_stuck": self.esp32_stuck,
-            # الهيكل وحالة ناقله — 🔴 وخريطة المحركات: «مشتقّة أم لا»
+            # المنصّة وحالة ناقلها — 🔴 وخريطة المحركات: «مشتقّة أم لا»
             # تُعرض صراحةً (البند 6.1: المجهول يُعلَن).
             "kind": self.kind, "transport": self._tp.name,
             "motor_map_calibrated": self._tp.motor_map_calibrated,
