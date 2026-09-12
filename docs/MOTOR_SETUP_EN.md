@@ -99,6 +99,13 @@ The program pulses **one wheel at a time** and names it first:
 
 **You want `o` four times.**
 
+⌨ **Switch your keyboard to ENGLISH** before answering. An Arabic key
+sends bytes the prompt cannot read. (It used to crash the probe; now it
+just re-asks — but you still cannot answer in Arabic.)
+
+🔴 **Finish all four wheels.** If the probe stops early for any reason,
+run it again from the start. Step 4 assumes all four are confirmed.
+
 ### Why this step exists
 
 Step 4 pulses a **whole side** at once. If the two wheels on one side

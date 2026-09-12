@@ -322,6 +322,24 @@ def main() -> int:
         else:
             _sys.modules.pop("smbus2", None)
 
+    # 🐞 إدخال غير صالح لا يُسقط المسبار (عطل مقاس 2026-09-12: لوحة عربية
+    #    أرسلت 0xd8 فرفع input() ‏UnicodeDecodeError وأسقط الفحص وسطه).
+    from pi.tests.probe_motor_map import _ask as _probe_ask
+    import builtins as _bi
+    _seq = iter(["\u0633", "zz", "o"])       # عربي · حرف خارج القائمة · صحيح
+
+    def _fake_input(_prompt=""):
+        return next(_seq)
+
+    _real_input = _bi.input
+    _bi.input = _fake_input
+    try:
+        _got = _probe_ask("t", ("o", "x"))
+    finally:
+        _bi.input = _real_input
+    check("🐞 إدخال عربي/غير صالح يُعيد السؤال ولا يُسقط المسبار",
+          _got == "o", "تعافى بعد إدخالين غير صالحين")
+
     # ═══ خريطة قنوات العجلات — 🐞 بعد عطل «عجلتا اليسار تتعاكسان» ═══
     print("\nح0-ب) خريطة قنوات عجلات Freenove:")
     from pi.config import FREENOVE_WHEEL_CHANNELS as _WC, FREENOVE_WHEEL_NAMES as _WN

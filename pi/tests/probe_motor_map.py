@@ -78,16 +78,38 @@ def _safe_shutdown(bridge) -> None:
 
 
 def _ask(question: str, options: tuple) -> str:
-    """سؤال بحرف واحد — يعيد السؤال حتى يأتي حرف من القائمة."""
+    """
+    سؤال بحرف واحد — يعيد السؤال حتى يأتي حرف من القائمة.
+
+    🐞 **إدخال غير صالح لا يُسقط المسبار** (عطل مقاس 2026-09-12): لوحة
+       مفاتيح عربية أرسلت بايت `0xd8` (بادئة حرف عربي) فرفع `input()`
+       ‏`UnicodeDecodeError` **وأسقط البرنامج وسط الفحص**. والخطر ليس
+       الإزعاج: سقوط مفاجئ وسط نبضة هو بالضبط ما يترك عجلة تدور.
+       ⇒ يُلتقط الخطأ ويُعاد السؤال، ولا تُترك العملية للصدفة.
+    """
     while True:
         print(question)
         try:
-            v = input(f"[{'/'.join(options)}] ").strip().lower()
+            raw = input(f"[{'/'.join(options)}] ")
         except (EOFError, KeyboardInterrupt):
             print("\n⛔ Cancelled.")
             raise SystemExit(1)
+        except UnicodeDecodeError:
+            # بايت غير صالح (لوحة عربية / محارف غير ASCII) — أعد السؤال
+            print("  ⚠ Could not read that key. Switch your keyboard to "
+                  "ENGLISH and type one letter.")
+            continue
+        except Exception:                     # noqa: BLE001
+            print("  ⚠ Input error. Type one letter and press Enter.")
+            continue
+        v = raw.strip().lower()
         if v in options:
             return v
+        # ⚠ الحرف العربي لا يُطابق، فيُقال له صراحةً لا «حرف من القائمة» فقط
+        if v and not v.isascii():
+            print("  ⚠ That is not an English letter. Switch your keyboard "
+                  "layout to ENGLISH.")
+            continue
         print(f"  Please type one of: {' / '.join(options)}")
 
 
