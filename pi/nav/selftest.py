@@ -253,6 +253,75 @@ def main() -> int:
           len(_cfg_hygiene("HEADING_SPIKE_DPS_STEER = 120.0\n")) == 1)
 
     from pi.rover.bridge import WaveRoverBridge
+    # ═══ 🐞 «عجلة تدور بلا توقف» — إطفاء لا يُقاطَع ═══════════════
+    # عطل مقاس (2026-09-12): ضغطات Ctrl+C متتابعة أثناء المسبار. الأولى
+    # أنهت النبضة، والثانية وصلت **وسط مسار الإيقاف** فأجهضته — لأن
+    # `KeyboardInterrupt` من **`BaseException`** و`except Exception` لا
+    # يمسّه. فبقيت قناة PWM مكتوبة والعجلة تدور.
+    # 🔴 وإعادة إقلاع الراسبري لم تُصلحها: PCA9685 **شريحة مستقلة** لها
+    #    سجلاتها وتغذيتها، فتحتفظ بآخر قيمة كُتبت فيها.
+    print("\nح0-أ) إطفاء المحركات لا يُقاطَع:")
+    import sys as _sys, types as _types
+    _regs = {}
+
+    class _FakeBus:
+        def __init__(self, n): pass
+        def write_byte_data(self, a, r, v): _regs[r] = v
+        def read_byte_data(self, a, r): return _regs.get(r, 0)
+        def write_i2c_block_data(self, a, r, d):
+            for _i, _v in enumerate(d):
+                _regs[r + _i] = _v
+        def close(self): pass
+
+    _prev_smbus = _sys.modules.get("smbus2")
+    _sys.modules["smbus2"] = _types.SimpleNamespace(SMBus=_FakeBus)
+    try:
+        from pi.rover.transport import FreenoveTransport as _FT
+        from pi.config import FREENOVE_WHEEL_CHANNELS as _WCH
+
+        def _driving(ch):
+            _b = 0x06 + 4 * ch
+            _oh = _regs.get(_b + 3, 0)
+            if _oh & 0x10:
+                return False
+            return (_regs.get(_b + 2, 0) | ((_oh & 0x0F) << 8)) > 0
+
+        _tp = _FT(); _tp.emit = lambda k, m: None; _tp.open()
+        _tp.drive_one_wheel("left", 0, 0.4)
+        check("نبضة على عجلة واحدة تقود قناتها فعلاً",
+              any(_driving(c) for c in _WCH["left"][0]),
+              f"channels {_WCH['left'][0]}")
+        # الضغطة الثانية تقع **وسط** الإطفاء
+        _real_off, _cnt = _tp._pwm.all_off, {"n": 0}
+
+        def _flaky_off():
+            _cnt["n"] += 1
+            if _cnt["n"] == 1:
+                raise KeyboardInterrupt("Ctrl+C أثناء الإطفاء")
+            return _real_off()
+
+        _tp._pwm.all_off = _flaky_off
+        _tp.close()
+        _stuck = [c for _s in ("left", "right") for _pr in _WCH[_s]
+                  for c in _pr if _driving(c)]
+        check("🔴 Ctrl+C **وسط** الإطفاء لا يترك عجلة تدور",
+              not _stuck and _cnt["n"] >= 2,
+              f"محاولات={_cnt['n']} · عالقة={_stuck or 'لا شيء'}")
+        # وحالة عالقة من تشغيل سابق تُنظَّف عند التهيئة
+        _regs.clear()
+        for _i, _v in enumerate([0, 0, 0xFF, 0x0F]):
+            _regs[0x06 + 4 * 1 + _i] = _v
+        _stuck_before = _driving(1)
+        _tp2 = _FT(); _tp2.emit = lambda k, m: None; _tp2.open()
+        check("🔴 وقناة عالقة من تشغيل سابق تُنظَّف عند التهيئة",
+              _stuck_before and not _driving(1),
+              "الشريحة لا تُصفَّر بإعادة إقلاع الراسبري")
+    finally:
+        if _prev_smbus is not None:
+            _sys.modules["smbus2"] = _prev_smbus
+        else:
+            _sys.modules.pop("smbus2", None)
+
     # ═══ خريطة قنوات العجلات — 🐞 بعد عطل «عجلتا اليسار تتعاكسان» ═══
     print("\nح0-ب) خريطة قنوات عجلات Freenove:")
     from pi.config import FREENOVE_WHEEL_CHANNELS as _WC, FREENOVE_WHEEL_NAMES as _WN

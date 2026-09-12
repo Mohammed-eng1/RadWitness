@@ -187,11 +187,25 @@ class FreenoveTransport(Transport):
                                  if self._pwm is not None else None)}
 
     def close(self) -> None:
+        """
+        🔴 **يلتقط `BaseException` لا `Exception`** (عطل مقاس 2026-09-12):
+        `KeyboardInterrupt` و`SystemExit` من **`BaseException`**، فـ
+        `except Exception` لا يمسّهما. وضغطة Ctrl+C ثانية تصل **وسط
+        الإطفاء** فتُجهضه، وتبقى القناة مكتوبة والعجلة تدور بلا توقف —
+        ولا تُصلحها إعادة إقلاع الراسبري لأن PCA9685 شريحة مستقلة تحتفظ
+        بسجلاتها.
+        """
         try:
             if self._pwm is not None:
+                self._pwm.all_off()          # أوّلاً وبأبسط مسار ممكن
                 self._pwm.close()
-        except Exception:                    # noqa: BLE001
-            pass
+        except BaseException:                # noqa: BLE001 — مقصود
+            # وحتى لو قوطع: محاولة أخيرة بمسار مباشر بلا أي منطق
+            try:
+                if self._pwm is not None:
+                    self._pwm.all_off()
+            except BaseException:            # noqa: BLE001
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════

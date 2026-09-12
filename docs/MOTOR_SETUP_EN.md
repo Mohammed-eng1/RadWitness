@@ -5,6 +5,23 @@ What this does: teaches the software **which wheel is which**, and
 
 ---
 
+## 🛑 If a wheel will not stop
+
+```bash
+cd ~/RMS-Rover-v2 && source venv/bin/activate
+python3 -m pi.tests.motors_off
+```
+
+**Rebooting the Pi does NOT fix this.** The PCA9685 is a separate chip
+with its own memory. It keeps the last PWM value written to it. Restarting
+the Pi restarts the *program* — it does not touch the *chip*.
+
+If the wheel still spins after that command: **pull the battery
+connector** (not just the switch). At that point it is the driver board
+or the wiring, and no software can fix it.
+
+---
+
 ## Before you start
 
 ```bash

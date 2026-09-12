@@ -29,6 +29,7 @@ probe_motor_map.py — مسبار المعالم الفيزيائية: اشتق�
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import time
 
@@ -46,6 +47,34 @@ WHEEL_EN = {
 
 PULSE_S = 2.0
 CMD_GAP_S = 0.1
+
+
+def _safe_shutdown(bridge) -> None:
+    """
+    🔴 **إيقاف لا يُقاطَع** (عطل مقاس 2026-09-12).
+
+    Ctrl+C يرفع `KeyboardInterrupt` وهو من **`BaseException`** لا
+    `Exception` — فـ`except Exception` حول التنظيف لا يمسّه. وضغطة ثانية
+    تصل **وسط `stop()`** فتُجهضه، فتبقى قناة PWM مكتوبة و**العجلة تدور
+    بلا توقف**. ولا تُصلحها إعادة إقلاع الراسبري: PCA9685 شريحة مستقلة
+    لها سجلاتها وتغذيتها، فتحتفظ بآخر قيمة كُتبت فيها.
+
+    العلاج: **تُصمّ المقاطعات أولاً** ثم يُنفَّذ الإيقاف، ويُلتقط
+    `BaseException` لا `Exception`.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except Exception:                     # noqa: BLE001
+            pass
+    for attempt in (1, 2):                    # محاولتان — والثانية أبسط
+        try:
+            if attempt == 1:
+                bridge.stop()
+            bridge.close()
+            return
+        except BaseException:                 # noqa: BLE001 — مقصود
+            continue
 
 
 def _ask(question: str, options: tuple) -> str:
@@ -74,11 +103,17 @@ def _pulse(bridge, lp: float, rp: float, seconds: float) -> None:
     lc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, lp))
     rc = max(-MAX_MOTOR_POWER, min(MAX_MOTOR_POWER, rp))
     t0 = time.time()
-    while time.time() - t0 < seconds:
-        bridge._tp.send_motors(lc, rc)
-        time.sleep(CMD_GAP_S)
-    bridge._tp.send_motors(0.0, 0.0)
-    bridge._tp.send_motors(0.0, 0.0)      # تأكيد الإيقاف
+    try:
+        while time.time() - t0 < seconds:
+            bridge._tp.send_motors(lc, rc)
+            time.sleep(CMD_GAP_S)
+    finally:
+        # 🔴 الإيقاف قبل خروج أي استثناء (Ctrl+C وسط النبضة)
+        for _ in range(2):
+            try:
+                bridge._tp.send_motors(0.0, 0.0)
+            except BaseException:             # noqa: BLE001
+                pass
 
 
 def probe_wheels(bridge, power: float, seconds: float) -> int:
@@ -103,10 +138,17 @@ def probe_wheels(bridge, power: float, seconds: float) -> int:
             except (EOFError, KeyboardInterrupt):
                 print("\n⛔ Cancelled."); return 1
             t0 = time.time()
-            while time.time() - t0 < seconds:
-                bridge._tp.drive_one_wheel(side, i, power)
-                time.sleep(CMD_GAP_S)
-            bridge._tp.drive_one_wheel(side, i, 0.0)
+            try:
+                while time.time() - t0 < seconds:
+                    bridge._tp.drive_one_wheel(side, i, power)
+                    time.sleep(CMD_GAP_S)
+            finally:
+                # 🔴 إطفاء هذه العجلة **قبل** أن يخرج أي استثناء —
+                #    بما فيه Ctrl+C وسط النبضة.
+                try:
+                    bridge._tp.drive_one_wheel(side, i, 0.0)
+                except BaseException:         # noqa: BLE001
+                    pass
             ans = _ask("     What happened?\n"
                        "       o = ONLY this wheel turned  (good)\n"
                        "       x = a DIFFERENT wheel turned\n"
@@ -167,10 +209,7 @@ def main() -> int:
         try:
             return probe_wheels(bridge, p, a.seconds)
         finally:
-            try:
-                bridge.stop(); bridge.close()
-            except Exception:                 # noqa: BLE001
-                pass
+            _safe_shutdown(bridge)
 
     print(f"\n🧭 LANDMARK PROBE — power {p:.2f}, {a.seconds:.1f}s per pulse.")
     print("⚠ LIFT THE ROBOT UP, wheels free.")
@@ -200,11 +239,8 @@ def main() -> int:
                                  "       b = toward the BACK", ("f", "b"))
             results[field] = (side, direction)
     finally:
-        # الإيقاف مضمون مهما حدث — بما فيه Ctrl-C وسط نبضة
-        try:
-            bridge.stop(); bridge.close()
-        except Exception:                     # noqa: BLE001
-            pass
+        # 🔴 الإيقاف مضمون مهما حدث — بما فيه **Ctrl+C متكرر وسط نبضة**
+        _safe_shutdown(bridge)
 
     en_side = {"g": "geiger side", "o": "other side", "n": "nothing"}
     en_dir = {"f": "forward", "b": "backward", "n": "—"}
