@@ -33,11 +33,33 @@ import statistics
 import sys
 import time
 
-from pi.config import TURN_POWER, MAX_MOTOR_POWER
+from pi.config import TURN_POWER, MAX_MOTOR_POWER, HEADING_DEADBAND_DPS
 from pi.sensors.mpu6050 import (get_mpu, REG_WHO_AM_I, REG_PWR_MGMT_2,
                                 WHO_AM_I_NAMES, chip_name)
 
 REG_PWR_MGMT_1 = 0x6B          # بت 6 = SLEEP (يُضبط تلقائياً بعد إعادة تشغيل)
+REG_SMPLRT_DIV = 0x19          # سجل «هل تحتفظ الشريحة بالكتابة؟» (§0)
+
+
+def authenticity(m):
+    """
+    🔴 **فحص الشريحة المقلَّدة** — الاختبار الذي حسم استبدال الوحدة السابقة
+    (CLAUDE.md §0): اكتب `0x07` في `0x19` ثم اقرأه. السليمة تُعيد `0x07`،
+    **والمقلَّدة تُعيد `0x00`**: تردّ بهوية صحيحة ولا تحتفظ بأي كتابة.
+
+    ⚠ ولم يكن مؤتمتاً في أي سكربت — كان يُجرى يدوياً بـ`i2cset`، فيُنسى
+       بالضبط حين تُبدَّل وحدة. والقيمة تُعاد إلى `0x00` بعد الفحص:
+       ترك المقسّم على 7 يُنزل معدل العيّنات إلى الثُمن بلا أن يلاحظ أحد.
+    """
+    try:
+        before = m._bus.read_byte_data(m.addr, REG_SMPLRT_DIV)
+        m._bus.write_byte_data(m.addr, REG_SMPLRT_DIV, 0x07)
+        time.sleep(0.02)
+        back = m._bus.read_byte_data(m.addr, REG_SMPLRT_DIV)
+        m._bus.write_byte_data(m.addr, REG_SMPLRT_DIV, before)
+        return back == 0x07, back
+    except Exception:              # noqa: BLE001
+        return None, None
 
 
 def sleep_bit(m):
@@ -72,6 +94,12 @@ def show_health(m) -> bool:
     # ⚠ العائلة أربع شرائح بنفس السجلات — الاسم يُطبع لا يُفترض
     print(f"  WHO_AM_I = {hex(who)} → **{chip_name(who)}**  "
           + ("✅" if who in WHO_AM_I_NAMES else "⛔ خارج عائلة MPU المدعومة"))
+    genuine, back = authenticity(m)
+    print(f"  اختبار الاحتفاظ بالكتابة (0x19) = "
+          + ("✅ الشريحة تحتفظ بالكتابة (سليمة)" if genuine else
+             f"🔴 **كُتب 0x07 وقُرئ {hex(back)} ⇒ شريحة مقلَّدة** — "
+             f"تردّ بهوية صحيحة ولا تحتفظ بأي إعداد" if genuine is False else
+             "؟ تعذّر الفحص"))
     sb = sleep_bit(m)
     print(f"  بت السكون = {sb}  "
           + ("✅ مستيقظ" if sb is False else
@@ -170,6 +198,31 @@ def main() -> int:
     print(f"\n── أرضية مرجعية ({a.seconds:.0f}ث، محركات مطفأة، لا تلمس الروبوت) ──")
     base = watch(m, a.seconds, "ساكن")
     verdict_ok = base["sigma"] > 0.0 and base["errors"] == 0
+
+    # 🔴 **أرضية الضجيج المقاسة تُقارَن بالعتبة المضبوطة** — القاعدة §1:
+    #    الميت العريض يبتلع دوراناً حقيقياً بطيئاً، والضيّق يُدخل الضجيج في
+    #    التكامل فينجرف الاتجاه **والروبوت واقف** (3ث لكل خلية و10ث×8 في
+    #    التأكيد). والعتبة تتبع الوحدة المركَّبة، فتبديل وحدة يُبطلها بصمت.
+    if base["sigma"] > 0.0:
+        need = 3.0 * base["sigma"]
+        ratio = HEADING_DEADBAND_DPS / base["sigma"]
+        print(f"\n── الميت مقابل الضجيج المقاس ──")
+        print(f"  σ المقاسة = {base['sigma']:.4f}°/ث ⇒ 3σ = {need:.3f}"
+              f"   ·   HEADING_DEADBAND_DPS = {HEADING_DEADBAND_DPS}"
+              f"  ({ratio:.1f}σ)")
+        if HEADING_DEADBAND_DPS < need:
+            print(f"  🔴 **العتبة أضيق من 3σ** — الضجيج يعبرها ويدخل تكامل "
+                  f"الاتجاه، فينجرف والروبوت واقف. القيمة الحالية مقاسة على "
+                  f"وحدة **أخرى**.")
+            print(f"     ⇒ اضبط  HEADING_DEADBAND_DPS = {need:.2f}  في "
+                  f"pi/config.py، وثبّتها بـ:")
+            print(f"        python3 -m pi.tests.calibrate_mpu6050")
+            verdict_ok = False
+        elif HEADING_DEADBAND_DPS > 6.0 * base["sigma"]:
+            print(f"  ⚠ العتبة أوسع من 6σ — قد تبتلع دوراناً حقيقياً بطيئاً. "
+                  f"المقترح {need:.2f}.")
+        else:
+            print("  ✅ العتبة ضمن نطاق معقول من الضجيج المقاس")
 
     if a.motors:
         p = min(abs(a.power), MAX_MOTOR_POWER)
