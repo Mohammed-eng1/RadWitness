@@ -1745,6 +1745,52 @@ def main() -> int:
     check("ويتحرّك بلا مرجع ⇒ «ثقة منخفضة» لا نفي (تدهور آمن)",
           _v_move["verdict"] == UNVERIFIED and _v_move["moved"] is True,
           _v_move["reason"][:60])
+
+    # 🔴🔴 **الحسّاس الميت يقرأ صفراً — وتشتّته صفر — وهي بصمة «لم يتحرّك»**
+    #    مقاس على العتاد 2026-09-12: الجايرو سليم (تكامل 91.7°) بينما
+    #    `accel_mps2()` يُعيد 0.000 g ساكناً. ولولا حارس الجاذبية لأعلن
+    #    حسّاسٌ **ميت** أن الروبوت عالق **بثقة**، فتُجهض المهمة بعد ثلاث
+    #    خلايا وهو يسير سليماً — إيقاف كاذب صار قابلاً للحدوث بالضبط لأن
+    #    السلسلة أُحييت أعلاه. ومقياس تسارع حيّ يرى الجاذبية دائماً مهما
+    #    كان وضع تثبيته ⇒ الصفر «لا يقرأ» لا «ساكن» (القاعدة 6.1).
+    _dead = AccelWitness(threshold_std=0.05, min_samples=3)
+    for _ in range(12):
+        _dead.add((0.0, 0.0, 0.0))
+    check("🔴 حسّاس ميت (0 g): σ=0 مثل العالق تماماً — والفرق في الجاذبية",
+          _dead.std == 0.0 and _dead.gravity_mag < 0.1,
+          f"σ={_dead.std:.4f} · |a|={_dead.gravity_mag:.2f} م/ث²")
+    check("🔴 فلا يُعلن «لم يتحرّك»: الحكم **None** (مجهول لا شهادة)",
+          _dead.sensor_alive is False and _dead.verdict is None,
+          f"alive={_dead.sensor_alive} · حكم={_dead.verdict}")
+    _v_dead = verify_motion(0.5, None, None, accel=_dead)
+    check("⇒ الخلية بثقة منخفضة لا إجهاض مهمة (تدهور آمن)",
+          _v_dead["verdict"] == UNVERIFIED and _v_dead["moved"] is None,
+          _v_dead["reason"][-58:])
+    check("والحالة **تُعلن العطل** لا تكتفي بـ«لا حكم»",
+          _v_dead["accel"]["sensor_alive"] is False
+          and _v_dead["accel"]["sensor_note"] is not None
+          and _v_dead["accel"]["gravity_mps2"] == 0.0,
+          f"gravity={_v_dead['accel']['gravity_mps2']} م/ث²")
+    # ⚠ والحارس **لا يبتلع العالق الحقيقي**: حسّاس حيّ ساكن يبقى «لا حركة»
+    #   بثقة (فُحص أعلاه في _v_stuck) — التمييز بالجاذبية وحدها لا بالتشتّت.
+    check("⚠ ولا يُعمي الحارسُ كشفَ العلوق الحقيقي (حسّاس حيّ ساكن)",
+          _stuck.sensor_alive is True and _stuck.verdict is False,
+          f"|a|={_stuck.gravity_mag:.2f} ⇒ حكم={_stuck.verdict}")
+    # 🔴 **اختبار تكامل** (القاعدة 8): المهمة تُعلنه فعلاً في سجل الأحداث
+    class _MissionStub:
+        _accel_dead_logged = False
+        def __init__(self): self.events = []
+        def _log(self, kind, msg): self.events.append((kind, msg))
+    _ms = _MissionStub()
+    from pi.nav.mission import MissionSim as _MR
+    _MR._note_motion(_ms, _v_dead)
+    _MR._note_motion(_ms, _v_dead)        # مرتين: الإعلان لا يتكرر
+    check("🔴 والمهمة تُعلنه في السجل **مرة واحدة** (لا فيضان)",
+          len(_ms.events) == 1 and _ms.events[0][0] == "accel_dead",
+          f"أحداث={[e[0] for e in _ms.events]}")
+    _ms2 = _MissionStub()
+    _MR._note_motion(_ms2, _v_stuck)
+    check("ولا يُعلَن شيء مع حسّاس سليم", not _ms2.events)
     from pi.nav.room import CELL_SIZE_M
 
     # ① الشاهد الثنائي: التشتت لا المقدار

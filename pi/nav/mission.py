@@ -224,6 +224,7 @@ class MissionSim:
         self._cell_progress = 0.0     # ما قُطع منها فعلاً (متر)
         self._unverified_cells = 0    # خلايا عُلّمت بثقة منخفضة
         self._last_motion = None      # آخر حكم تحقّق (للبثّ في الواجهة)
+        self._accel_dead_logged = False   # إعلان الحسّاس الميت مرة واحدة
         # ── البنود 3-6: الأثر والمراحل ───────────────────────────
         self.breadcrumbs = []         # أثر المسار (البند 4)
         self._retracing = False       # داخل انسحاب (لا تُضاف نقاط أثر)
@@ -1199,6 +1200,7 @@ class MissionSim:
         mv = fwd.get("motion") or {}
         if mv:
             self._last_motion = dict(mv, model_m=round(covered, 3))
+            self._note_motion(mv)
         # 🔴 المسافة المقاسة تُقدَّم على المحسوبة (البند 0)
         step_m = self._motion_step_m(covered, mv)
         if self.dr and step_m:
@@ -1537,6 +1539,7 @@ class MissionSim:
         self._cell_progress = 0.0
         self._unverified_cells = 0
         self._last_motion = None
+        self._accel_dead_logged = False
         self.breadcrumbs = []
         self._retracing = False
         self._withdraw_req = None
@@ -1552,6 +1555,29 @@ class MissionSim:
         if self.wall_heading is not None:
             self.wall_heading.reset()
         self.perimeter = None
+
+    def _note_motion(self, motion: dict) -> None:
+        """
+        🔴 **يُعلن مقياس التسارع الميت مرة واحدة** — ولا يُسكت عنه.
+
+        مقاس على العتاد 2026-09-12: الجايرو يعمل (تكامل 91.7°) بينما
+        `accel_mps2()` يُعيد **0.000 g ساكناً**. ومقياس تسارع حيّ يرى
+        الجاذبية دائماً مهما كان وضع تثبيته ⇒ الصفر «لا يقرأ» لا «ساكن».
+        وأثره **حرفياً معكوس للحدس**: التشتت الصفري بصمة «لم يتحرّك»
+        **بثقة**، فحسّاسٌ ميت كان سيُجهض المهمة بعد ثلاث خلايا والروبوت
+        يسير سليماً. `AccelWitness.verdict` يردّ `None` الآن (القاعدة 6.1:
+        الغائب مجهول لا شهادة)، وهذا السطر يجعله **معلَناً** لا صامتاً.
+        """
+        acc = (motion or {}).get("accel") or {}
+        if acc.get("samples") and not acc.get("sensor_alive"):
+            if not self._accel_dead_logged:
+                self._accel_dead_logged = True
+                self._log("accel_dead",
+                          f"⚠ مقياس التسارع يقرأ {acc.get('gravity_mps2')} م/ث² "
+                          f"(المتوقَّع ~9.8 مهما كان وضع التثبيت) ⇒ **لا يقرأ**. "
+                          f"شاهد الحركة معطَّل: لا نفي ولا إثبات — الخلايا بلا "
+                          f"مرجع أمامي تُعلَّم بثقة منخفضة ولا تُجهَض المهمة. "
+                          f"افحص: python3 -m pi.tests.check_imu_health")
 
     def _motion_step_m(self, covered: float, motion: dict) -> float:
         """
@@ -1829,6 +1855,7 @@ class MissionSim:
         mv = fwd.get("motion") or {}
         if mv:
             self._last_motion = dict(mv, model_m=fwd.get("covered_m", 0.0))
+            self._note_motion(mv)
         step = self._motion_step_m(fwd.get("covered_m", 0.0), mv)
         if self.dr and step:
             self.dr.advance(step if direction >= 0 else -step,

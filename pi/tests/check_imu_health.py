@@ -34,7 +34,7 @@ import sys
 import time
 
 from pi.config import TURN_POWER, MAX_MOTOR_POWER
-from pi.sensors.mpu6050 import (get_mpu, REG_WHO_AM_I,
+from pi.sensors.mpu6050 import (get_mpu, REG_WHO_AM_I, REG_PWR_MGMT_2,
                                 WHO_AM_I_NAMES, chip_name)
 
 REG_PWR_MGMT_1 = 0x6B          # بت 6 = SLEEP (يُضبط تلقائياً بعد إعادة تشغيل)
@@ -88,6 +88,31 @@ def show_health(m) -> bool:
         time.sleep(0.05)
     print(f"  الجاذبية ساكناً = {g:.2f} م/ث²  "
           + ("✅" if 9.0 <= g <= 10.6 else "⚠ خارج [9.0, 10.6] — اهتزاز أو عطل"))
+    # 🔴 وجاذبية قرب الصفر **سببها الأول سجل منسيّ لا حسّاس ميت**: كل بت في
+    #    `PWR_MGMT_2` يُطفئ محوراً، فالجايرو يعمل ومقياس التسارع يقرأ أصفاراً
+    #    مضبوطة. ولأن شاهد الحركة يقيس **تشتّت** التسارع، فالصفر الثابت
+    #    بصمة «لم يتحرّك» بثقة ⇒ مهمة تُجهض والروبوت يسير سليماً.
+    if g < 1.0:
+        try:
+            p2 = m._bus.read_byte_data(m.addr, REG_PWR_MGMT_2)
+            axes = [n for i, n in enumerate(
+                ("XA", "YA", "ZA", "XG", "YG", "ZG")) if p2 & (0x20 >> i)]
+            print(f"  PWR_MGMT_2 = {hex(p2)}  "
+                  + ("✅ كل المحاور مفعّلة — المشكلة ليست هنا"
+                     if p2 == 0 else
+                     f"🔴 **محاور مطفأة: {'، '.join(axes)}** — "
+                     f"هذا سبب الأصفار مباشرةً"))
+            if p2:
+                m._bus.write_byte_data(m.addr, REG_PWR_MGMT_2, 0x00)
+                time.sleep(0.05)
+                back = m._bus.read_byte_data(m.addr, REG_PWR_MGMT_2)
+                print(f"  ↻ كُتب 0x00 → قراءة رجعية {hex(back)}  "
+                      + ("✅ ثبتت — أعد التشغيل وتحقّق من الجاذبية"
+                         if back == 0 else
+                         "⛔ لم تثبت ⇒ الشريحة لا تحتفظ بالكتابة (مقلَّدة؟ "
+                         "افحص 0x19 — انظر CLAUDE.md §0)"))
+        except Exception as e:     # noqa: BLE001
+            print(f"  ⚠ تعذّرت قراءة PWR_MGMT_2: {e}")
     t = m.temperature_c()
     if t is not None:
         print(f"  الحرارة = {t:.1f}°C")

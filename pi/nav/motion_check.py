@@ -28,6 +28,7 @@ import math
 from pi.config import (
     MOTION_REF_MAX_CM, MOTION_TOL_M, MOTION_TOL_FRAC, MOTION_NO_MOTION_M,
     MOTION_ACCEL_STD_MPS2, MOTION_ACCEL_MIN_SAMPLES,
+    MOTION_ACCEL_GRAVITY_MIN_MPS2,
 )
 
 # ── الأحكام ──────────────────────────────────────────────────────
@@ -75,19 +76,29 @@ class AccelWitness:
     """
 
     def __init__(self, threshold_std: float = MOTION_ACCEL_STD_MPS2,
-                 min_samples: int = MOTION_ACCEL_MIN_SAMPLES):
+                 min_samples: int = MOTION_ACCEL_MIN_SAMPLES,
+                 gravity_min: float = MOTION_ACCEL_GRAVITY_MIN_MPS2):
         self.threshold_std = float(threshold_std)
         self.min_samples = int(min_samples)
+        self.gravity_min = float(gravity_min)
         self.n = 0
         self._mean = 0.0
         self._m2 = 0.0          # Welford — تشتت بمرور واحد بلا تخزين
         self.lo = None
         self.hi = None
+        # 🔴 مقدار المتّجه **الثلاثي** — لكشف الحسّاس الميت وحده لا للحكم
+        self._g_sum = 0.0
+        self._g_n = 0
 
     def add(self, vec) -> None:
         """يضيف (ax, ay, az) م/ث². `None` (فشل قراءة) تُتجاهَل بلا ضجيج."""
         if vec is None or len(vec) < 2 or vec[0] is None or vec[1] is None:
             return
+        # الجاذبية على أي محور كان (يتبع وضع التثبيت) — لذا المقدار الثلاثي
+        if len(vec) >= 3 and vec[2] is not None:
+            self._g_sum += math.sqrt(float(vec[0]) ** 2 + float(vec[1]) ** 2
+                                     + float(vec[2]) ** 2)
+            self._g_n += 1
         mag = math.hypot(float(vec[0]), float(vec[1]))
         self.n += 1
         d = mag - self._mean
@@ -101,17 +112,57 @@ class AccelWitness:
         return math.sqrt(self._m2 / (self.n - 1)) if self.n > 1 else 0.0
 
     @property
+    def gravity_mag(self) -> float:
+        """متوسط مقدار المتّجه الثلاثي — يجب أن يقارب 9.8 م/ث² ساكناً."""
+        return (self._g_sum / self._g_n) if self._g_n else 0.0
+
+    @property
+    def sensor_alive(self) -> bool:
+        """
+        🔴 **هل يقرأ الحسّاس أصلاً؟** مقياس تسارع سليم يرى الجاذبية دائماً
+        مهما كان وضع تثبيته. فمقدار ثلاثي قرب الصفر = **لا يقرأ**، لا
+        «ساكن»: السكون يُعطي ~1g لا صفراً.
+        """
+        return self._g_n > 0 and self.gravity_mag >= self.gravity_min
+
+    @property
     def verdict(self):
-        """True تحرّك · False لم يتحرّك · None لا حكم (عيّنات غير كافية)."""
+        """
+        True تحرّك · False لم يتحرّك · **None لا حكم**.
+
+        🔴 و«لا حكم» تشمل **الحسّاس الميت**: قراءة صفرية دائمة تُعطي
+           تشتّتاً صفرياً، وهو حرفياً بصمة «لم يتحرّك» — فلولا هذا الشرط
+           لأعلن حسّاسٌ ميت أن الروبوت عالق **بثقة**، فتُجهَض المهمة بعد
+           ثلاث خلايا وهو يسير سليماً. (قُرئت 0.000g على العتاد فعلاً.)
+           والقاعدة 6.1: الغائب **مجهول** لا شهادة.
+        """
         if self.n < self.min_samples:
+            return None
+        if not self.sensor_alive:
             return None
         return self.std >= self.threshold_std
 
     def state(self) -> dict:
+        """
+        ⚠ حقول صحّة الحسّاس **جزء من الحالة لا تشخيص جانبي**: من يقرأ
+           `moved=None` يجب أن يرى **لماذا** — أعيّنة قليلة أم حسّاس ميت.
+           بلا `sensor_alive` يظهر الحسّاس الميت «لا حكم» مجهول السبب،
+           فيُطارَد في الملاحة وهو عطل عتاد.
+        """
+        alive = self.sensor_alive
         return {"samples": self.n, "std_mps2": round(self.std, 4),
                 "span_mps2": round((self.hi - self.lo), 3)
                 if self.lo is not None else None,
-                "threshold_std": self.threshold_std, "moved": self.verdict}
+                "threshold_std": self.threshold_std,
+                # مقدار المتّجه الثلاثي: ~9.8 سليم · ~0 لا يقرأ
+                "gravity_mps2": round(self.gravity_mag, 2),
+                "gravity_min_mps2": self.gravity_min,
+                "sensor_alive": alive,
+                "sensor_note": (None if alive else
+                                "⚠ accelerometer reads ~0 g — a live sensor "
+                                "always senses gravity ⇒ not reading, "
+                                "NOT stationary"),
+                "moved": self.verdict}
 
 
 def reference_ok(d_cm) -> bool:
@@ -196,10 +247,17 @@ def verify_motion(commanded_m: float, d_start_cm, d_end_cm,
     why = ("لا قراءة ألترا سونيك" if d_start_cm is None or d_end_cm is None
            else f"لا سطح مرجعي داخل {MOTION_REF_MAX_CM:.0f}سم")
     out.update(_by_accel(a_verdict, "no_reference"))
+    # ⚠ «لا حكم» سببان مختلفان تماماً — والخلط بينهما يُضيّع عطل عتاد:
+    #    عيّنات قليلة (عابر) · أو الحسّاس **لا يقرأ** (مقدار ثلاثي ~0).
+    dead = (accel is not None and accel.n > 0 and not accel.sensor_alive)
     out["reason"] = why + " — " + {
         NO_MOTION: "ومقياس التسارع لم يرَ حركة ⇒ عالق أو منزلق",
         UNVERIFIED: ("والتسارع يؤكّد الحركة، لكن المسافة غير مقيسة ⇒ ثقة منخفضة"
-                     if a_verdict else "ولا حكم من التسارع ⇒ ثقة منخفضة"),
+                     if a_verdict else
+                     (f"ومقياس التسارع لا يقرأ ({accel.gravity_mag:.2f} م/ث² "
+                      f"بدل ~9.8) ⇒ **لا شاهد على الحركة إطلاقاً** — "
+                      f"ثقة منخفضة، ولا إعلان علوق"
+                      if dead else "ولا حكم من التسارع ⇒ ثقة منخفضة")),
     }[out["verdict"]]
     return out
 

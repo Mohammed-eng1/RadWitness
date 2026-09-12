@@ -63,6 +63,13 @@ G_MPS2 = 9.80665                      # تحويل g → م/ث²
 
 # سجلات MPU-6050 (من ورقة البيانات)
 REG_PWR_MGMT_1 = 0x6B
+#: 🔴 **سجل يُنسى فيَقتل مقياس التسارع صامتاً**: كل بت فيه يُطفئ محوراً
+#  (‏DIS_XA..DIS_ZG). قيمته الافتراضية 0x00 نظرياً، لكن MPU-6500/9250 قد
+#  تُقلع بمحاور معطّلة بعد إعادة تشغيل ذاتية أو على وحدة مضروبة الإعدادات
+#  ⇒ الجايرو يعمل ومقياس التسارع يقرأ **أصفاراً مضبوطة**. وهي بالضبط بصمة
+#  «الحسّاس ميت» — وقياس 2026-09-12 على العتاد أظهرها: تكامل جايرو 91.7°
+#  سليم مع `التسارع ساكناً = 0.000 g`. فيُكتب صراحةً **ويُقرأ رجعياً**.
+REG_PWR_MGMT_2 = 0x6C
 REG_ACCEL_X = 0x3B
 REG_TEMP = 0x41
 REG_GYRO_X = 0x43
@@ -99,6 +106,12 @@ class MPU6050Reader:
     و**متسقة زمنياً** (المحاور الثلاثة من نفس اللحظة، لا ثلاث لحظات متفرقة).
     """
 
+    #: قيم افتراضية على مستوى الصنف — لا على النسخة وحدها: قوالب الاختبار
+    #  تتجاوز `__init__` بـ`__new__`، فحقلٌ يُعرَّف في `__init__` وحده يُسقط
+    #  `state()` بـ`AttributeError` بدل أن يقول «غير مفحوص».
+    accel_axes_ok = None          # None غير مفحوص · True كل المحاور · False مطفأة
+    pwr_mgmt_2 = None
+
     def __init__(self, addr: int = MPU6050_ADDR, bus_num: int = MPU6050_I2C_BUS):
         self.ok = False
         self.error = None
@@ -109,6 +122,9 @@ class MPU6050Reader:
         # عدّادات صحّة الناقل — تصاعدها يكشف تدهوراً كهربائياً لا برمجياً
         self.i2c_retries = 0          # قراءات نجحت **بعد** إعادة محاولة
         self.i2c_errors = 0           # فشلت رغم كل المحاولات
+        #: None = لم يُفحص · True = كل المحاور مفعّلة · False = بعضها مطفأ
+        self.accel_axes_ok = None
+        self.pwr_mgmt_2 = None
         self.last_i2c_error = None
         self._bus = None
         self._lock = threading.Lock()
@@ -132,6 +148,11 @@ class MPU6050Reader:
             #    مضبوطة — وهي بالضبط بصمة «الحسّاس الميت» التي يكشفها حارس
             #    الصفر في مصدر الاتجاه، فتبدو المشكلة اتجاهاً وهي إيقاظ.
             self._bus.write_byte_data(self.addr, REG_PWR_MGMT_1, 0)
+            # 🔴 وتفعيل **كل المحاور** صراحةً — لا اتّكال على الافتراضي.
+            #    نجاح الكتابة ليس دليلاً (درس الشريحة المقلَّدة §0):
+            #    يُقرأ رجعياً، والفشل **حالة معلَنة** لا استثناء يُسقط الإقلاع
+            #    — الجايرو وحده يكفي للاتجاه، والتسارع شاهد حركة مكمّل.
+            self.accel_axes_ok = self._enable_all_axes()
             self.ok = True
         except Exception as e:        # noqa: BLE001
             self.error = (f"تعذّر فتح وحدة MPU على i2c-{self.bus_num} "
@@ -139,6 +160,24 @@ class MPU6050Reader:
                           f"`i2cdetect -y {self.bus_num}` (توقّع "
                           f"{hex(self.addr)})")
             self._close_bus()
+
+    def _enable_all_axes(self) -> bool:
+        """
+        يكتب `PWR_MGMT_2 = 0x00` (كل المحاور عاملة) **ويقرأه رجعياً**.
+
+        ⚠ القراءة الرجعية ليست ترفاً: الوحدة المقلَّدة تقبل الكتابة ولا
+           تحتفظ بها (§0)، ونجاح `write` وحده كان سيُخفي الحالتين معاً —
+           محوراً مطفأً، وشريحةً لا تكتب أصلاً.
+        """
+        try:
+            self._bus.write_byte_data(self.addr, REG_PWR_MGMT_2, 0x00)
+            time.sleep(0.01)
+            back = self._bus.read_byte_data(self.addr, REG_PWR_MGMT_2)
+            self.pwr_mgmt_2 = back
+            return back == 0x00
+        except Exception:             # noqa: BLE001 — I2C عابر
+            self.pwr_mgmt_2 = None
+            return False
 
     def recover(self) -> dict:
         """
@@ -200,6 +239,10 @@ class MPU6050Reader:
                 #    عن الشريحة لا عن البيانات، ومقياس التسارع الحيّ يقرأ ~1g
                 #    دائماً — فأصفار مضبوطة فيه تعني «لا بيانات» مهما قال
                 #    السجل. (وهذا ما تفحصه أداة `check_imu_health` يدوياً.)
+                # ⚠ وإعادة التعيين (0x80) تمسح `PWR_MGMT_2` إلى افتراضه —
+                #    فيُعاد تفعيل المحاور قبل الحكم على الجاذبية، وإلا حكمنا
+                #    «لا بيانات» على سجلٍ نحن من أعاده.
+                self.accel_axes_ok = self._enable_all_axes()
                 live = None
                 try:
                     d = self._bus.read_i2c_block_data(self.addr, REG_ACCEL_X, 6)
@@ -208,8 +251,12 @@ class MPU6050Reader:
                     live = None           # تعذّرت القراءة: لا نفي ولا إثبات
                 if live is False:
                     return {"recovered": False,
-                            "detail": "استيقظت لكن مقياس التسارع يقرأ أصفاراً "
-                                      "مضبوطة — لا جاذبية ⇒ لا بيانات فعلاً"}
+                            "detail": ("استيقظت لكن مقياس التسارع يقرأ أصفاراً "
+                                       "مضبوطة — لا جاذبية ⇒ لا بيانات فعلاً"
+                                       + ("" if self.accel_axes_ok else
+                                          f" (و PWR_MGMT_2="
+                                          f"{self.pwr_mgmt_2 if self.pwr_mgmt_2 is None else hex(self.pwr_mgmt_2)}"
+                                          f" لم يثبت على 0x00 ⇒ محاور مطفأة)"))}
                 self.ok = True
                 self.error = None
                 return {"recovered": True,
@@ -344,6 +391,11 @@ class MPU6050Reader:
             "temp_c": round(self._temp_c, 1),
             # ⚠ لا مؤشّر معايرة ذاتية في MPU-6050 (خلاف BNO055) — الجاهزية
             #    تعني «استجاب» لا «معاير»، والمعايرة مسؤولية الطبقة الأعلى.
+            # 🔴 صحّة مقياس التسارع **معلَنة**: محور مطفأ يُنتج أصفاراً
+            #    مضبوطة، وهي بصمة «لم يتحرّك» بثقة في شاهد الحركة.
+            "accel_axes_ok": self.accel_axes_ok,
+            "pwr_mgmt_2": (hex(self.pwr_mgmt_2)
+                           if self.pwr_mgmt_2 is not None else None),
             "gyro_ready": self.ok,
             "self_calibration": False,
             "mag_warn": False,
