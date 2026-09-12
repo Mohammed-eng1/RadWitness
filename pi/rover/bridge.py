@@ -36,6 +36,8 @@ from pi.config import (
     TURN_STALL_DPS, TURN_STALL_AFTER_S, TURN_STALL_BOOST,
     TURN_STALL_FLOOR_FRAC,
     TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED, ROVER_KIND,
+    ADS7830_ENABLED, MOTOR_BATT_GOOD_V, MOTOR_BATT_LOW_V, MOTOR_BATT_CRIT_V,
+    MOTOR_BATT_CELLS,
     TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
     TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
     TURN_COAST_TAU_S, TURN_COAST_TAU_ALPHA, TURN_COAST_TAU_MAX_S,
@@ -148,6 +150,7 @@ class RoverControlBridge:
         self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
         # الجهد: المصدر يُعلَن دائماً (البند 5)
         self._ina_reader = None         # None=لم يُجرَّب · False=غير متاح
+        self._ads_reader = None         # قارئ جهد حزمة المحركات (ADS7830)
         self.voltage_source = self.VSRC_NONE
         self.voltage_reason = None
         self.battery_amps = None
@@ -461,6 +464,60 @@ class RoverControlBridge:
         ina = self._ina_reader if self._ina_reader not in (None, False) else None
         info["ina219"] = ina.state() if ina is not None else None
         return info
+
+    # ── جهد **حزمة المحركات** — نطاق مستقلّ تماماً ───────────────
+    def _ads(self):
+        """قارئ ADS7830 المشترك — كسول، ولا يُسقط الجسر إن غاب."""
+        if self._ads_reader is False or not ADS7830_ENABLED:
+            return None
+        if self._ads_reader is None:
+            try:
+                from pi.sensors.ads7830 import get_ads7830
+                r = get_ads7830()
+                self._ads_reader = r if r.ok else False
+                if not r.ok:
+                    self._event("motor_batt_source",
+                                f"⚠ ADS7830 غير متاح: {r.error}")
+                    return None
+            except Exception as e:              # noqa: BLE001
+                self._ads_reader = False
+                return None
+        return self._ads_reader or None
+
+    def motor_pack_state(self) -> dict:
+        """
+        حالة **حزمة المحركات** (2S) — مستقلّة عن حزمة الراسبري (3S).
+
+        🔴 **لا تُخلط الحزمتان**: عتبات 3S على قراءة 2S تُطلق إيقافاً طارئاً
+           كاذباً دائماً (ممتلئة 8.4V دون BATT_CRITICAL_V = 10.0). لهذا
+           تصنيف منفصل بعتباته، والمصدر يُعلَن باسمه (§6).
+        ⚠ والإجراء هنا أقصاه **عودة إجبارية** لا إطفاء منظَّم: الدقّة 8 بت
+          (~40mV/عدّة) لا تكفي قراراً بهذا الوزن.
+        """
+        ads = self._ads()
+        if ads is None:
+            return {"level": "unknown", "action": batt.ACTION_NONE, "v": None,
+                    "cell_v": None, "cells": MOTOR_BATT_CELLS,
+                    "source": "unavailable", "text": "جهد المحركات غير معروف"}
+        r = ads.read()
+        v = r["v"]
+        if v is None:
+            return {"level": "unknown", "action": batt.ACTION_NONE, "v": None,
+                    "cell_v": None, "cells": MOTOR_BATT_CELLS,
+                    "source": "ads7830", "source_reason": r["reason"],
+                    "text": "جهد المحركات غير معروف"}
+        if v >= MOTOR_BATT_GOOD_V:
+            lvl, act, txt = "good", batt.ACTION_NONE, "حزمة المحركات جيدة"
+        elif v >= MOTOR_BATT_LOW_V:
+            lvl, act, txt = "low", batt.ACTION_WARN, "حزمة المحركات منخفضة"
+        elif v >= MOTOR_BATT_CRIT_V:
+            lvl, act, txt = "critical", batt.ACTION_RTH, "حزمة المحركات حرجة — عودة"
+        else:
+            lvl, act, txt = "critical", batt.ACTION_RTH, "حزمة المحركات شبه فارغة"
+        return {"level": lvl, "action": act, "v": v,
+                "cell_v": round(v / MOTOR_BATT_CELLS, 2),
+                "cells": MOTOR_BATT_CELLS, "source": "ads7830",
+                "source_reason": None, "raw": r["raw"], "text": txt}
 
     # ── أدوات المحاكاة (لاختبار العتبات في الواجهة) ─────────────
     def sim_set_voltage(self, v: float) -> None:
@@ -955,6 +1012,17 @@ class RoverControlBridge:
             self.battery_alarm = True
         elif info["action"] == batt.ACTION_RTH:
             self.rth_requested = True
+        # 🔴 **وحزمة المحركات تُفحص في نفس النبضة** — وإلا بقي القارئ مبنيّاً
+        #    ولا يستدعيه أحد (البند 8: الاستدعاء يُثبَت لا يُفترض). وهي
+        #    الحزمة التي تُحرّك فعلاً: نفادها يوقف الروبوت حيث هو.
+        mp = self.motor_pack_state()
+        info["motor_pack"] = mp
+        if mp["action"] == batt.ACTION_RTH:
+            self.rth_requested = True
+            self._event("motor_batt",
+                        f"🔴 {mp['text']} ({mp['v']}V) — عودة إجبارية")
+        elif mp["action"] == batt.ACTION_WARN:
+            self._event("motor_batt", f"⚠ {mp['text']} ({mp['v']}V)")
         return info
 
     def state(self) -> dict:
@@ -968,6 +1036,8 @@ class RoverControlBridge:
             # المنصّة وحالة ناقلها — 🔴 وخريطة المحركات: «مشتقّة أم لا»
             # تُعرض صراحةً (البند 6.1: المجهول يُعلَن).
             "kind": self.kind, "transport": self._tp.name,
+            # 🔴 حزمة **المحركات** منفصلة عن حزمة الراسبري — نطاقان لا واحد
+            "motor_pack": self.motor_pack_state(),
             "motor_map_calibrated": self._tp.motor_map_calibrated,
             "transport_state": self._tp.state(),
             "battery": (self.battery_state() if BATTERY_MONITOR_ENABLED

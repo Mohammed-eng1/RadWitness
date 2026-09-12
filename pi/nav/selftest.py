@@ -252,6 +252,52 @@ def main() -> int:
     check("ويكشف ثابتاً مشتقّاً كُتب رقماً",
           len(_cfg_hygiene("HEADING_SPIKE_DPS_STEER = 120.0\n")) == 1)
 
+    from pi.rover.bridge import WaveRoverBridge
+    # ═══ حزمة المحركات (ADS7830) — نطاق مستقلّ عن حزمة الراسبري ═══
+    print("\nح1) حزمة المحركات 2S منفصلة عن حزمة الراسبري 3S:")
+    import pi.rover.battery as _batt
+    from pi.config import (MOTOR_BATT_GOOD_V, MOTOR_BATT_LOW_V,
+                           MOTOR_BATT_CRIT_V, BATT_CRITICAL_V)
+    check("عتبات 2S مرتّبة وكلها **دون** عتبة الإيقاف 3S",
+          MOTOR_BATT_CRIT_V < MOTOR_BATT_LOW_V < MOTOR_BATT_GOOD_V < BATT_CRITICAL_V,
+          f"حرج={MOTOR_BATT_CRIT_V} < منخفض={MOTOR_BATT_LOW_V} < "
+          f"جيد={MOTOR_BATT_GOOD_V} < إيقاف3S={BATT_CRITICAL_V}")
+    # 🔴 الخطر المحدَّد: حزمة 2S **ممتلئة** تحت كل عتبات 3S
+    _full_2s = 8.4
+    check("🔴 خلط الحزمتين كارثي: 2S ممتلئة بعتبات 3S ⇒ إطفاء/إيقاف كاذب",
+          _batt.classify(_full_2s)["action"] in (_batt.ACTION_STOP,
+                                                 _batt.ACTION_SHUTDOWN),
+          f"{_full_2s}V بعتبات 3S ⇒ {_batt.classify(_full_2s)['action']}")
+
+    class _FakeADS:
+        """قارئ حزمة محركات مزيّف — يُحقن في الجسر لإثبات **التوصيل**."""
+        ok, error = True, None
+        v = 8.2
+        def read(self):  return {"v": self.v, "raw": 200, "reason": None}
+        def state(self): return {"ok": True}
+
+    _mb = WaveRoverBridge(mode="sim")
+    _mb._ads_reader = _FakeADS()
+    check("حزمة محركات ممتلئة ⇒ لا إجراء", _mb.motor_pack_state()["action"]
+          == _batt.ACTION_NONE, f"{_mb.motor_pack_state()['v']}V")
+    _mb._ads_reader.v = 6.7
+    _mb.rth_requested = False; _mb.events = []
+    _st_mp = _mb.motor_pack_state()
+    check("وحرجة ⇒ عودة إجبارية بتصنيفها هي لا بتصنيف 3S",
+          _st_mp["action"] == _batt.ACTION_RTH and _st_mp["cells"] == 2,
+          f"{_st_mp['v']}V · خلية {_st_mp['cell_v']}V · {_st_mp['level']}")
+    # 🔴 التوصيل يُثبَت: check_battery يخدمها ويغيّر سلوك المهمة فعلاً
+    _info = _mb.check_battery()
+    check("🔴 check_battery يفحص حزمة المحركات ويرفع rth_requested فعلاً",
+          "motor_pack" in _info and _mb.rth_requested
+          and any(e["kind"] == "motor_batt" for e in _mb.events),
+          next((e["msg"][:48] for e in _mb.events
+                if e["kind"] == "motor_batt"), "لا حدث"))
+    _mb._ads_reader = False
+    check("وغياب القارئ ⇒ «مجهول» لا صفر ولا ادّعاء سلامة",
+          _mb.motor_pack_state()["level"] == "unknown"
+          and _mb.motor_pack_state()["v"] is None)
+
     print("\nح) حدّ القوة الصارم:")
     from pi.rover.bridge import WaveRoverBridge
     from pi.config import MAX_MOTOR_POWER, MOTOR_INVERT, SPEED_LADDER, DRIVE_POWER_DEFAULT
