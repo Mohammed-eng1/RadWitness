@@ -227,6 +227,40 @@ DRIVE_SPEED_MPS = 0.60
 
 ---
 
+## Step 7 — Battery reading (needs a multimeter)
+
+**What to measure:** the **motor battery** — the 2S pack that powers the
+Freenove board. NOT the Pi's battery.
+
+1. Multimeter to **DC volts**, 20 V range (the `V⎓` or `V---` setting).
+2. **Red probe** on the battery **+** terminal, **black** on **−**.
+   Easiest spot: the battery plug where it enters the Freenove board.
+3. **Robot switched ON** while you measure.
+4. A charged 2S pack reads **7.4 – 8.4 V**.
+
+Then:
+
+```bash
+python3 -m pi.tests.calibrate_adc
+```
+
+It shows the raw ADC byte, then asks for your multimeter number, then
+prints the exact factor for `pi/config.py`.
+
+⚠ **If you read ~11 V you measured the wrong pack.** That is the Pi's
+UPS (3S). The script rejects anything outside 5–9 V for this reason.
+
+### Why this is needed
+
+The conversion factor depends on which Freenove board revision you have,
+and **Freenove cannot detect it** — their own code just asks the user and
+saves the answer in a file. The two possible answers differ by ~5%, which
+is enough to hide a low battery or raise a false alarm.
+
+One multimeter reading removes the guess completely.
+
+---
+
 ## Order (short version)
 
 ```

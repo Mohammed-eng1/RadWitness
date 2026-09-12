@@ -45,7 +45,7 @@ import sys
 import time
 
 from pi.config import (
-    ROVER_MODE, HEADING_SOURCE, BNO055_GYRO_SCALE, GYRO_SCALE,
+    ROVER_MODE, HEADING_SOURCE, GYRO_SCALE,
     HEADING_DEADBAND_DPS, HEADING_KP, HEADING_KD, HEADING_MAX_CORR,
     STRAIGHT_BASE_POWER, MOTOR_TRIM_L, MOTOR_TRIM_R, MAX_MOTOR_POWER,
     HEADING_HOLD_LOOP_S, BNO055_READ_PERIOD_S, GYRO_BIAS_CALIB_S,
@@ -532,8 +532,8 @@ def _print_config_lines(payload: dict) -> None:
         print(f"  HEADING_DEADBAND_DPS = {s1['suggested_deadband_dps']}   "
               f"# 3σ مقاس ({s1['sigma_dps']}) على {src}")
     if s2.get("suggested_scale"):
-        name = "BNO055_GYRO_SCALE" if src.startswith("bno055") else "GYRO_SCALE"
-        print(f"  {name} = {s2['suggested_scale']}   "
+        # 🔴 المصدر الوحيد mpu6050 (BNO055 تالفة §0) — الثابت الحيّ واحد
+        print(f"  GYRO_SCALE = {s2['suggested_scale']}   "
               f"# وسيط {len(s2.get('trials', []))} لفّات × {s2.get('angle')}°")
     if s3.get("suggested_kp"):
         print(f"  HEADING_KP = {s3['suggested_kp']}       "
@@ -577,9 +577,11 @@ def main(argv=None) -> int:
         print(f"  ⚠ {rover.error}")
     if getattr(src, "fallback_reason", None):
         print(f"  {src.fallback_reason}")
-    print(f"  المعاملات الحالية: BNO055_GYRO_SCALE={BNO055_GYRO_SCALE} · "
-          f"GYRO_SCALE(روفر)={GYRO_SCALE} · KP={HEADING_KP} · KD={HEADING_KD} · "
+    # ⚠ BNO055 قطعة ميتة — تُعرض للتوثيق لا للتعديل (§0)
+    print(f"  المعامل الحيّ: GYRO_SCALE={GYRO_SCALE} (⚠ غير معاير على "
+          f"Freenove) · KP={HEADING_KP} · KD={HEADING_KD} · "
           f"MAX_CORR={HEADING_MAX_CORR}")
+
     if not BATTERY_MONITOR_ENABLED:
         print(f"  ⚠ مراقبة الجهد معطّلة — ابدأ ببطارية مشحونة (الحماية زمنية: "
               f"{MISSION_TIME_LIMIT_S:.0f}ث في المهمة).")
@@ -599,7 +601,7 @@ def main(argv=None) -> int:
                "source": src.name, "requested_source": HEADING_SOURCE,
                "rover_mode": rover.mode, "stages": stages,
                "config_before": {
-                   "BNO055_GYRO_SCALE": BNO055_GYRO_SCALE, "GYRO_SCALE": GYRO_SCALE,
+                   "GYRO_SCALE": GYRO_SCALE,
                    "HEADING_DEADBAND_DPS": HEADING_DEADBAND_DPS,
                    "HEADING_KP": HEADING_KP, "HEADING_KD": HEADING_KD,
                    "HEADING_MAX_CORR": HEADING_MAX_CORR,

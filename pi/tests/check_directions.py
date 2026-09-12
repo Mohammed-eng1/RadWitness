@@ -3,7 +3,7 @@
 """
 check_directions.py — تثبيت اتجاهات العتاد الثلاثة (قبل أي معايرة)
 ==================================================================
-يحدّد بالتجربة قيمتَي `MOTOR_INVERT` و`BNO055_GYRO_Z_SIGN`، ويكشف
+يحدّد بالتجربة قيمتَي `MOTOR_INVERT` و`MPU6050_GYRO_Z_SIGN`، ويكشف
 **انعكاس محرك واحد** (خطأ أسلاك) الذي لا يظهر في أي اختبار زاوية.
 
 ⚠ لماذا سكربت مستقل؟ لأن **لفّة 180° لا تفرّق بين اليمين واليسار** — الروبوت
@@ -33,7 +33,7 @@ import sys
 import time
 
 from pi.config import (
-    ROVER_MODE, MOTOR_INVERT, MOTOR_SWAP_LR, BNO055_GYRO_Z_SIGN,
+    ROVER_MODE, MOTOR_INVERT, MOTOR_SWAP_LR, MPU6050_GYRO_Z_SIGN,
     BNO055_READ_PERIOD_S,
 )
 from pi.rover.bridge import WaveRoverBridge
@@ -134,10 +134,10 @@ def stage_gyro_sign(rover) -> dict:
     # اصطلاح المشروع: **موجب = يميناً**. الإشارة الصحيحة تجعل لفّة اليد
     # اليمنى موجبة بعد ضربها في الثابت.
     needed = 1 if total_raw > 0 else -1
-    ok = (needed == BNO055_GYRO_Z_SIGN)
-    print(f"  → الإشارة الصحيحة: BNO055_GYRO_Z_SIGN = **{needed:+d}**  "
-          f"(الحالية {BNO055_GYRO_Z_SIGN:+d})" + ("  ✅" if ok else "  ⚠ تحتاج تغيير"))
-    return {"ok": True, "needed_sign": needed, "current_sign": BNO055_GYRO_Z_SIGN,
+    ok = (needed == MPU6050_GYRO_Z_SIGN)
+    print(f"  → الإشارة الصحيحة: MPU6050_GYRO_Z_SIGN = **{needed:+d}**  "
+          f"(الحالية {MPU6050_GYRO_Z_SIGN:+d})" + ("  ✅" if ok else "  ⚠ تحتاج تغيير"))
+    return {"ok": True, "needed_sign": needed, "current_sign": MPU6050_GYRO_Z_SIGN,
             "matches": ok, "total_raw_deg": round(total_raw, 1),
             "peak_dps": round(peak, 1)}
 
@@ -228,7 +228,7 @@ def _verdict(g: dict, f: dict, t: dict) -> None:
                      f"        # كان {f['current_invert']:+d}")
 
     if g.get("ok") and not g["matches"]:
-        lines.append(f"  BNO055_GYRO_Z_SIGN = {g['needed_sign']:+d}"
+        lines.append(f"  MPU6050_GYRO_Z_SIGN = {g['needed_sign']:+d}"
                      f"  # كان {g['current_sign']:+d}")
 
     if lines:
@@ -266,7 +266,7 @@ def main(argv=None) -> int:
     print(f"فحص الاتجاهات · جسر: {rover.mode} · مصدر: {rover.heading_source.name}")
     print(f"  الحالي: MOTOR_INVERT={MOTOR_INVERT:+d} · "
           f"MOTOR_SWAP_LR={MOTOR_SWAP_LR} · "
-          f"BNO055_GYRO_Z_SIGN={BNO055_GYRO_Z_SIGN:+d}")
+          f"MPU6050_GYRO_Z_SIGN={MPU6050_GYRO_Z_SIGN:+d}")
     if rover.error:
         print(f"  ⚠ {rover.error}")
     print("═" * 62)

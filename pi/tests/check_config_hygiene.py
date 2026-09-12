@@ -40,6 +40,16 @@ DEAD_PLATFORM_NAMES = (
 #: ثوابت **مشتقّة**: يجب ألّا تُسنَد قيمة حرفية
 DERIVED_NAMES = ("HEADING_SPIKE_DPS_STEER",)
 
+#: 🔴 ثوابت **قطعة ميتة** (BNO055 تلفت — §0). وجودها في `pi/config.py`
+#: مقبول للتوثيق، لكن **إرشاد المشغّل إليها في سكربت عتاد خطأ**: يوجّهه
+#: إلى تعديل رقم لا يقرأه أحد. وأخطرها `BNO055_GYRO_Z_SIGN`: كان
+#: `check_directions` يقارن الإشارة المقاسة به، و`bridge` يطلب مراجعته
+#: عند `sign_mismatch` — وهو بالضبط ما تمنعه القاعدة §2.
+DEAD_PART_NAMES = ("BNO055_GYRO_Z_SIGN", "BNO055_GYRO_SCALE")
+
+#: الملفات التي يُمنع فيها **الإرشاد** إلى ثابت قطعة ميتة
+_SCRIPT_DIRS = ("pi/tests", "pi/rover", "pi/nav")
+
 _ASSIGN = re.compile(r"^([A-Z_][A-Z0-9_]*)\s*=")
 _LITERAL = re.compile(r"^[A-Z_][A-Z0-9_]*\s*=\s*-?[\d.]+\s*(#.*)?$")
 
@@ -74,6 +84,45 @@ def hardcoded_derived(text: str) -> dict:
     return out
 
 
+def dead_part_guidance(root: str = None) -> dict:
+    """
+    🔴 يرصد **إرشاد المشغّل** إلى ثابت قطعة ميتة داخل نصّ يُطبع له.
+
+    ⚠ لا يرصد الاستيراد ولا المقارنة الداخلية — تلك قد تكون توثيقاً
+      مشروعاً. يرصد ما يظهر **داخل سلسلة نصية** في `print`/رسالة حدث،
+      لأن ذلك وحده ما يقرأه المشغّل ويتصرّف بناءً عليه.
+
+    يعيد {المسار: [(رقم السطر، الثابت)]}.
+    """
+    import glob
+    base = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = os.path.dirname(base)          # جذر المستودع
+    out = {}
+    for d in _SCRIPT_DIRS:
+        for path in glob.glob(os.path.join(base, d, "*.py")):
+            if os.path.basename(path) == os.path.basename(__file__):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().split("\n")
+            except Exception:             # noqa: BLE001
+                continue
+            hits = []
+            for i, line in enumerate(lines, 1):
+                st = line.strip()
+                if st.startswith("#"):
+                    continue              # تعليق = توثيق مشروع
+                for name in DEAD_PART_NAMES:
+                    if name in line and ('"' in line or "'" in line):
+                        # داخل سلسلة نصية ⇒ يُطبع للمشغّل
+                        before = line.split(name)[0]
+                        if before.count('"') % 2 == 1 or before.count("'") % 2 == 1:
+                            hits.append((i, name))
+            if hits:
+                out[os.path.relpath(path, base)] = hits
+    return out
+
+
 def run(text: str = None) -> list:
     """يعيد قائمة المشاكل (فارغة = نظيف). منطق خالص — يُستدعى من selftest."""
     if text is None:
@@ -91,6 +140,12 @@ def run(text: str = None) -> list:
         problems.append(
             f"⚠ `{name}` (س{ln}) **مشتقّ** وكُتب رقماً — سيتخلّف عن سقف "
             f"القوة حين يُعاد قياسه (البند 1.1.3)")
+    # 🔴 إرشاد المشغّل إلى ثابت قطعة ميتة — يوجّهه لتعديل رقم لا يُقرأ
+    for path, hits in sorted(dead_part_guidance().items()):
+        for ln, name in hits:
+            problems.append(
+                f"🔴 `{path}` س{ln} يُرشد المشغّل إلى `{name}` — ثابت "
+                f"**قطعة ميتة** (BNO055 تلفت، §0)")
     return problems
 
 

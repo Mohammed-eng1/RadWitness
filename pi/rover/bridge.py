@@ -730,9 +730,14 @@ class RoverControlBridge:
                     break
                 if turned * want < -TURN_SIGN_CHECK_DEG:
                     sign_mismatch = True
+                    # 🔴 **لا تُرشد إلى قلب إشارة الجايرو** (القاعدة §2):
+                    #    قيست باليد بلا محركات فهي مستقلة عن قطبية المحركات،
+                    #    وقلبها «لتصحيح» لفّة معكوسة يعيد فخّ الخطأين
+                    #    المتلازمين — يُلغيان بعضهما فيصمت هذا الحارس نفسه.
                     self._event("heading_sign",
                                 f"⚠ دار {turned:.0f}° عكس المطلوب ({degrees:.0f}°) — "
-                                f"إشارة محور z مقلوبة؟ راجع BNO055_GYRO_Z_SIGN")
+                                f"🔴 الخطأ في **خريطة المحركات** لا في إشارة "
+                                f"الجايرو: python3 -m pi.tests.probe_motor_map")
                     break
                 if not self.heading_source.ok:
                     self._event("heading_fault",
