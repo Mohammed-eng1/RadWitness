@@ -1590,6 +1590,74 @@ def main() -> int:
         MOTION_REF_MAX_CM, MOTION_STUCK_LIMIT, MOTION_UNVERIFIED_DRIFT,
         MOTION_CELL_ENTER_TOL_M, MOTION_VERIFY_ENABLED,
     )
+
+    # 🐞 **اختبار تكامل** لا وحدة: الشاهد الثنائي كان يُبنى ويُوصَل في
+    #    المنفّذ، لكن مقياس التسارع **لا يصله أبداً** — `MPU6050GyroHeading`
+    #    يسمّي المقبض `mpu` بينما المنفّذ يقرأ `heading_source.imu`، فعاد
+    #    `getattr` بـ`None` بلا خطأ ومات الشاهد صامتاً منذ استبدال الحسّاس.
+    #    واختبار الوحدة كان يمرّ لأنه يبني AccelWitness مباشرة.
+    #    ⇒ الفحص هنا يتبع **السلسلة كاملة**: مصدر الاتجاه → المنفّذ → الشاهد.
+    from pi.sensors.heading import HeadingSource as _HS
+    from pi.nav.executor import DriveExecutor as _DrvEx
+    check("🔴 عقد مصدر الاتجاه يشمل `imu` (مقبض مقياس التسارع)",
+          hasattr(_HS, "imu"), "الصنف القاعدة يُعلنه")
+
+    class _FakeIMU:
+        ok = True
+        def accel_mps2(self): return (0.4, 0.3, 9.8)
+
+    class _SrcWithIMU:
+        name, ok, error = "fake", True, None
+        imu = _FakeIMU()
+        def update(self): return {"delta": 0.0, "dps": 0.0}
+
+    _brg = WaveRoverBridge(mode="sim", heading_source=_SrcWithIMU())
+    _ex = _DrvEx(_brg, None, lambda: {}, default_sim_profile())
+    check("والمنفّذ يلتقطه من المصدر (لا حقن يدوي)", _ex.imu is not None,
+          f"imu={type(_ex.imu).__name__}")
+    _w = AccelWitness(min_samples=3)
+    for _ in range(8):
+        _w.add(_ex._read_accel())
+    check("🔴 والشاهد يجمع عيّنات فعلاً عبر السلسلة كاملة",
+          _w.n == 8, f"عيّنات={_w.n}")
+    # وغياب المقبض يبقى **معلَناً لا صامتاً**
+    class _SrcNoIMU:
+        name, ok, error, imu = "fake2", True, None, None
+        def update(self): return {"delta": 0.0, "dps": 0.0}
+    _ex2 = _DrvEx(WaveRoverBridge(mode="sim", heading_source=_SrcNoIMU()),
+                  None, lambda: {}, default_sim_profile())
+    _w2 = AccelWitness(min_samples=3)
+    _w2.add(_ex2._read_accel())
+    check("🔴 وبلا مقياس تسارع: الشاهد يمتنع ولا يدّعي حركة (مجهول لا نفي)",
+          _ex2.imu is None and _w2.n == 0 and _w2.verdict is None,
+          f"عيّنات={_w2.n} · حكم={_w2.verdict}")
+
+    # 🔴 **الأثر الحقيقي للعطل**: بلا مرجع أمامي (واقع هذا العتاد — لا
+    #    ألترا سونيك بعد) يكون مقياس التسارع **الشاهد الوحيد**. فموته
+    #    الصامت كان يُعطّل كاشف «الروبوت عالق» كلياً: الروبوت يقف مكانه
+    #    والنظام يواصل تعليم خلايا على مواضع مُختلَقة.
+    _stuck = AccelWitness(threshold_std=0.05, min_samples=3)
+    for _ in range(12):
+        _stuck.add((0.01, 0.01, 9.8))          # ساكن تماماً
+    _v_stuck = verify_motion(0.5, None, None, accel=_stuck)
+    check("🔴 عالق + شاهد حيّ ⇒ «لا حركة» **بثقة** (الحارس مسلَّح)",
+          _v_stuck["verdict"] == NO_MOTION and _v_stuck["confident"] is True,
+          f"{_v_stuck['verdict']} · confident={_v_stuck['confident']}")
+    _v_blind = verify_motion(0.5, None, None, accel=None)
+    check("وبلا شاهد (حال العطل) ⇒ العلوق **لا يُكتشف أبداً**",
+          _v_blind["verdict"] == UNVERIFIED and _v_blind["moved"] is None,
+          f"{_v_blind['verdict']} · moved={_v_blind['moved']} ⇒ مواضع مُختلَقة")
+    # ⚠ التشتّت يُقاس على **مقدار** المتّجه الأفقي √(ax²+ay²)، فتناوب
+    #    الإشارة وحده (±0.4) يُبقي المقدار ثابتاً ولا يُقرأ حركةً — وهي
+    #    العماوة الموثّقة في AccelWitness. المحاكاة الصحيحة **تغيّر المقدار**
+    #    (نتوء الانطلاق من السكون ثم اهتزاز)، لا إشارته.
+    _moving = AccelWitness(threshold_std=0.05, min_samples=3)
+    for _i in range(12):
+        _moving.add((0.05, 0.05, 9.8) if _i % 2 else (0.6, 0.4, 9.8))
+    _v_move = verify_motion(0.5, None, None, accel=_moving)
+    check("ويتحرّك بلا مرجع ⇒ «ثقة منخفضة» لا نفي (تدهور آمن)",
+          _v_move["verdict"] == UNVERIFIED and _v_move["moved"] is True,
+          _v_move["reason"][:60])
     from pi.nav.room import CELL_SIZE_M
 
     # ① الشاهد الثنائي: التشتت لا المقدار

@@ -161,6 +161,16 @@ class RateConditioner:
 
 # ═══ الواجهة الواحدة ═════════════════════════════════════════════
 class HeadingSource:
+    #: 🔴 **مقبض الحسّاس — جزء من العقد لا تفصيل داخلي.**
+    #: `DriveExecutor` يأخذ منه مقياس التسارع للشاهد الثنائي على الحركة
+    #: (`getattr(heading_source, "imu", None)`). كل مصدر يضبطه، وتركه
+    #: `None` يعني «لا مقياس تسارع» **معلَناً** لا صامتاً.
+    #: 🐞 وسببه عطل مقاس: `MPU6050GyroHeading` كان يسمّيه `mpu` وحده بينما
+    #:    مصادر BNO055 تسمّيه `imu`، فعاد `getattr` بـ`None` بلا أي خطأ —
+    #:    ومات الشاهد الثنائي **صامتاً** منذ استبدال الحسّاس. وهو الشاهد
+    #:    **الوحيد** حين يغيب المرجع الأمامي (§2.2).
+    imu = None
+
     """
     الأساس المشترك. المشتقات تنفّذ إحدى الطريقتين فقط:
       - `_read_rate_dps()`  → مصدر تكاملي (جايرو).
@@ -487,6 +497,10 @@ class MPU6050GyroHeading(HeadingSource):
                  sign: int = MPU6050_GYRO_Z_SIGN):
         super().__init__(scale=scale, max_bias_std=GYRO_BIAS_MAX_STD_BNO)
         self.mpu = mpu
+        # 🔴 **والاسم القياسي `imu` كذلك** — عقد الصنف القاعدة: المنفّذ
+        #    يقرأ `heading_source.imu` ليغذّي الشاهد الثنائي. الاسم `mpu`
+        #    مُبقى للتوافق، وهذا السطر هو ما يُحيي الشاهد.
+        self.imu = mpu
         self.sign = -1 if int(sign) < 0 else 1
         if mpu is None or not getattr(mpu, "ok", False):
             self.ok = False
