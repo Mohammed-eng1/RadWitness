@@ -53,10 +53,19 @@ sudo raspi-config nonint do_serial_cons 1 2>/dev/null || \
     sudo raspi-config nonint do_serial 1  2>/dev/null || \
     echo "    ⚠ عطّل كونسول السيريال يدوياً عبر raspi-config إن لزم"
 
-# ── 3) تفعيل I2C (BNO055 على GPIO2/3) ──────────────────────────────
-echo "[3/4] تفعيل I2C للـBNO055…"
+# ── 3) تفعيل I2C: الناقل 1 (المحركات والبطارية) + الناقل 4 (MPU) ───
+echo "[3/4] تفعيل I2C (ناقل 1 للمحركات/البطارية · ناقل 4 للـMPU)…"
+# الناقل 1 — عليه PCA9685 @0x40 (محركات Freenove) وINA219 @0x42 (البطارية)
 sudo raspi-config nonint do_i2c 0 2>/dev/null || \
     echo "    ⚠ فعّل I2C يدوياً عبر raspi-config إن لزم"
+# 🔴 الناقل 4 — وحدة MPU على GPIO6/7. **بلا هذا السطر لا يوجد /dev/i2c-4**
+#    فيسقط مصدر الاتجاه إلى المحاكاة، ويُرفض المسح الذاتي بسبب معلن.
+#    (كان ناقصاً من هذا السكربت فيُضبط يدوياً — أُضيف 2026-09-12.)
+if ! grep -q "^dtoverlay=i2c4" "$BOOT_CFG"; then
+    echo "dtoverlay=i2c4,pins_6_7,baudrate=100000" | sudo tee -a "$BOOT_CFG" >/dev/null
+    echo "    أُضيف dtoverlay=i2c4,pins_6_7 إلى $BOOT_CFG (⚠ يلزم إعادة إقلاع)"
+    NEED_REBOOT=1
+fi
 
 # ── 4) بيئة افتراضية + متطلبات بايثون ──────────────────────────────
 echo "[4/4] إنشاء بيئة افتراضية وتثبيت المتطلبات…"
@@ -80,3 +89,11 @@ echo "   3) فعّل البيئة واختبر الحساسات:"
 echo "        source venv/bin/activate"
 echo "        python3 pi/tests/test_geiger.py"
 echo "══════════════════════════════════════════════════════════"
+
+if [ "${NEED_REBOOT:-0}" = "1" ]; then
+    echo
+    echo "🔴 أُضيف dtoverlay جديد — **أعد الإقلاع** ثم تحقّق:"
+    echo "      sudo reboot"
+    echo "      ls /dev/i2c-*        # يجب أن يظهر i2c-1 و i2c-4"
+    echo "      i2cdetect -y 4       # توقّع 0x68 (وحدة MPU)"
+fi
