@@ -135,6 +135,21 @@ class FreenoveTransport(Transport):
             self._pwm.set_duty(ch_a, 0)
             self._pwm.set_duty(ch_b, 0)
 
+    def drive_one_wheel(self, side: str, index: int, power: float) -> None:
+        """
+        **أداة خارجية** (تشخيص): تُشغّل **عجلة واحدة** بعينها.
+
+        🔴 لماذا لزمت: مسبار المعالم ينبض جانباً كاملاً، فإن تعاكست عجلتا
+           الجانب شلّ نفسه وبدت النتيجة «عشوائية» — وهو ما حدث فعلاً
+           (خطأ ترتيب قنوات السفلية اليسرى). الجانب لا يكشف عطل عجلة.
+        """
+        if self.mode != "real" or self._pwm is None:
+            return
+        pairs = FREENOVE_WHEEL_CHANNELS[side]
+        ch_a, ch_b = pairs[index]
+        duty = int(round(max(-1.0, min(1.0, power)) * FREENOVE_DUTY_MAX))
+        self._wheel(ch_a, ch_b, duty)
+
     def send_motors(self, l: float, r: float) -> None:
         """⚠⚠ **لا يرفع استثناءً أبداً** — انظر عقد `Transport`."""
         if self.mode != "real" or self._pwm is None:

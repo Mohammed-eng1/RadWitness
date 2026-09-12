@@ -253,6 +253,30 @@ def main() -> int:
           len(_cfg_hygiene("HEADING_SPIKE_DPS_STEER = 120.0\n")) == 1)
 
     from pi.rover.bridge import WaveRoverBridge
+    # ═══ خريطة قنوات العجلات — 🐞 بعد عطل «عجلتا اليسار تتعاكسان» ═══
+    print("\nح0-ب) خريطة قنوات عجلات Freenove:")
+    from pi.config import FREENOVE_WHEEL_CHANNELS as _WC, FREENOVE_WHEEL_NAMES as _WN
+    # 🔴 المرجع **منسوخ من كود Freenove العتادي** لا مستنتج بالتماثل:
+    #    duty>0 ⇒ lu:ch1 · ll:ch2 · ru:ch7 · rl:ch5. ولاحظ أن السفلية
+    #    اليسرى **معكوسة الترتيب** عن جارتها — وهذا بالضبط ما فات أول مرة
+    #    فدارت عجلتا اليسار عكس بعضهما وشلّ الجانب نفسه.
+    _REF_DRIVEN = {("left", 0): 1, ("left", 1): 2,
+                   ("right", 0): 7, ("right", 1): 5}
+    _map_ok, _map_bad = True, []
+    for _side in ("left", "right"):
+        for _i, (_a, _b) in enumerate(_WC[_side]):
+            if _b != _REF_DRIVEN[(_side, _i)]:
+                _map_ok = False
+                _map_bad.append(f"{_WN[_side][_i]}: موجب يقود ch{_b} "
+                                f"لا ch{_REF_DRIVEN[(_side, _i)]}")
+    check("🔴 كل عجلة: القوة الموجبة تقود القناة التي يقودها كود Freenove",
+          _map_ok, "؛ ".join(_map_bad) if _map_bad else "الأربع مطابقة")
+    _lc = [_WC["left"][0][1], _WC["left"][1][1]]
+    _rc = [_WC["right"][0][1], _WC["right"][1][1]]
+    check("ولا قناة مشتركة بين عجلتين (تداخل يحرّك اثنتين بنبضة واحدة)",
+          len({c for pr in _WC["left"] + _WC["right"] for c in pr}) == 8,
+          f"قنوات القيادة: يسار={_lc} يمين={_rc}")
+
     # ═══ حزمة المحركات (ADS7830) — نطاق مستقلّ عن حزمة الراسبري ═══
     print("\nح1) حزمة المحركات 2S منفصلة عن حزمة الراسبري 3S:")
     import pi.rover.battery as _batt
