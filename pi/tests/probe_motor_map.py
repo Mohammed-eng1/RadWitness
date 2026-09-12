@@ -35,6 +35,15 @@ import time
 from pi.config import (ROVER_KIND, MAX_MOTOR_POWER, MIN_MOTOR_POWER,
                        FREENOVE_WHEEL_CHANNELS, FREENOVE_WHEEL_NAMES)
 
+#: أسماء العجلات **للطباعة بالإنجليزية** — `FREENOVE_WHEEL_NAMES` العربية
+#: تبقى للواجهة والسجل، وهذه لشاشة المسبار التي يقرأها المشغّل أثناء العمل.
+WHEEL_EN = {
+    ("left", 0):  "LEFT FRONT wheel",
+    ("left", 1):  "LEFT BACK wheel",
+    ("right", 0): "RIGHT FRONT wheel",
+    ("right", 1): "RIGHT BACK wheel",
+}
+
 PULSE_S = 2.0
 CMD_GAP_S = 0.1
 
@@ -46,11 +55,11 @@ def _ask(question: str, options: tuple) -> str:
         try:
             v = input(f"[{'/'.join(options)}] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n⛔ أُلغي.")
+            print("\n⛔ Cancelled.")
             raise SystemExit(1)
         if v in options:
             return v
-        print(f"  حرف من: {' · '.join(options)}")
+        print(f"  Please type one of: {' / '.join(options)}")
 
 
 def _pulse(bridge, lp: float, rp: float, seconds: float) -> None:
@@ -81,69 +90,76 @@ def probe_wheels(bridge, power: float, seconds: float) -> int:
     حدث فعلاً على العتاد (2026-09-12) بسبب خطأ ترتيب قنوات السفلية
     اليسرى. **جانب يتنازع لا تُشتقّ منه خريطة**، فهذا الطور يسبقه.
     """
-    print(f"\n🔍 فحص العجلات واحدةً واحدة — قوة {power:.2f}")
-    print("⚠ الروبوت **مرفوع** والعجلات حرة. راقب **العجلة المسمّاة وحدها**.")
+    print(f"\n🔍 WHEEL CHECK — one wheel at a time (power {power:.2f})")
+    print("⚠ LIFT THE ROBOT UP. Wheels must spin freely.")
+    print("   Watch ONLY the wheel I name before each pulse.")
     bad = []
     for side in ("left", "right"):
         for i, (ch_a, ch_b) in enumerate(FREENOVE_WHEEL_CHANNELS[side]):
             name = FREENOVE_WHEEL_NAMES[side][i]
             try:
-                input(f"\n  ▶ {name}  (قناتا {ch_a}/{ch_b}) — Enter…")
+                input(f"\n  ▶ {WHEEL_EN[(side, i)]}  "
+                      f"(channels {ch_a}/{ch_b}) — press Enter…")
             except (EOFError, KeyboardInterrupt):
-                print("\n⛔ أُلغي."); return 1
+                print("\n⛔ Cancelled."); return 1
             t0 = time.time()
             while time.time() - t0 < seconds:
                 bridge._tp.drive_one_wheel(side, i, power)
                 time.sleep(CMD_GAP_S)
             bridge._tp.drive_one_wheel(side, i, 0.0)
-            ans = _ask("     ماذا حدث؟  o = **هذه العجلة وحدها** دارت · "
-                       "x = عجلة أخرى دارت · m = أكثر من واحدة · "
-                       "n = لا شيء", ("o", "x", "m", "n"))
+            ans = _ask("     What happened?\n"
+                       "       o = ONLY this wheel turned  (good)\n"
+                       "       x = a DIFFERENT wheel turned\n"
+                       "       m = MORE than one wheel turned\n"
+                       "       n = NOTHING turned",
+                       ("o", "x", "m", "n"))
             if ans != "o":
                 bad.append((name, ans))
-    print("\n  ── النتيجة ──")
+    print("\n  ── RESULT ──")
     if not bad:
-        print("  ✅ كل عجلة تستجيب لقناتيها وحدها — الخريطة سليمة.")
-        print("     تابِع إلى طور المعالم (بلا --wheels).")
+        print("  ✅ Every wheel responds to its own two channels. Map is OK.")
+        print("     Next step: run the probe WITHOUT --wheels.")
         return 0
-    ar = {"x": "دارت عجلة أخرى ⇒ **تبديل قنوات**",
-          "m": "دارت أكثر من واحدة ⇒ قنوات متداخلة/تغذية",
-          "n": "لا دوران ⇒ قناة غير مقودة أو محرّك ميت"}
+    why = {"x": "a different wheel moved  ⇒ channels are swapped",
+           "m": "more than one wheel moved ⇒ overlapping channels / power",
+           "n": "nothing moved ⇒ channel not driven, or dead motor"}
     for name, ans in bad:
-        print(f"  🔴 {name}: {ar[ans]}")
-    print("\n  🔴 لا تُكمل إلى طور المعالم: خريطة القنوات خاطئة، وأي")
-    print("     اشتقاق فوقها يقيس العطل لا الاتجاه. صحّح")
-    print("     FREENOVE_WHEEL_CHANNELS في pi/config.py أولاً.")
-    print("  ⚠ وإن دارت عجلتا جانب **عكس بعضهما** فالسبب ترتيب الزوج:")
-    print("     الزوج (a,b) يعني «موجب يقود b»، وقلبه يقلب العجلة وحدها.")
+        print(f"  🔴 {name}: {why[ans]}")
+    print("\n  🔴 STOP. Do not run the landmark probe yet.")
+    print("     The channel map is wrong, and anything measured on top of")
+    print("     a wrong map measures the fault, not the direction.")
+    print("     Fix FREENOVE_WHEEL_CHANNELS in pi/config.py first.")
+    print("  ⚠ If two wheels on the SAME side spin in OPPOSITE directions,")
+    print("     the pair order is wrong. A pair (a, b) means \"positive")
+    print("     power drives b\". Swapping it flips that one wheel only.")
     return 3
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="مسبار المعالم: اشتقاق MOTOR_SWAP_LR و MOTOR_INVERT")
+        description="Motor map probe: find MOTOR_SWAP_LR and MOTOR_INVERT")
     ap.add_argument("--kind", default=ROVER_KIND,
-                    help="اسم المنصّة (freenove)")
+                    help="platform name (freenove)")
     ap.add_argument("--power", type=float, default=0.3,
-                    help=f"قوة النبضة ({MIN_MOTOR_POWER}–{MAX_MOTOR_POWER})")
+                    help=f"pulse power ({MIN_MOTOR_POWER}-{MAX_MOTOR_POWER})")
     ap.add_argument("--seconds", type=float, default=PULSE_S)
     ap.add_argument("--wheels", action="store_true",
-                    help="🔍 فحص كل عجلة وحدها أولاً — يكشف تعاكس عجلتَي "
-                         "الجانب الواحد الذي يُفسد طور المعالم")
+                    help="check each wheel alone FIRST - catches two wheels "
+                         "on the same side spinning opposite ways")
     ap.add_argument("--allow-sim", action="store_true",
-                    help="متابعة رغم فشل فتح العتاد (لتجربة نص المسبار)")
+                    help="continue even if hardware did not open (text test only)")
     a = ap.parse_args()
 
     from pi.rover.bridge import RoverControlBridge
     bridge = RoverControlBridge(mode="real", kind=a.kind)
-    print(f"الهيكل: {bridge._tp.name}  ·  الوضع: {bridge.mode}")
+    print(f"Platform: {bridge._tp.name}  |  Mode: {bridge.mode}")
     if bridge.mode != "real":
-        print(f"⛔ لم يُفتح العتاد: {bridge.error}")
+        print(f"⛔ Hardware did not open: {bridge.error}")
         if not a.allow_sim:
             # 🔴 لا سقوط صامت إلى المحاكاة: مسبار في المحاكاة يُخرج وصفة
             #    مُختلَقة تُكتب في config وتقود محركات حقيقية (البند 6.1).
             return 2
-        print("⚠ متابعة في المحاكاة — **الوصفة الناتجة بلا معنى**.")
+        print("⚠ Running in SIMULATION - the result is meaningless.")
 
     p = max(MIN_MOTOR_POWER, min(MAX_MOTOR_POWER, abs(a.power)))
 
@@ -156,26 +172,32 @@ def main() -> int:
             except Exception:                 # noqa: BLE001
                 pass
 
-    print(f"\n🧭 مسبار المعالم — قوة {p:.2f} لمدة {a.seconds:.1f}ث لكل نبضة.")
-    print("⚠ الروبوت **مرفوع** والعجلات حرة (اختلال الجانبين تحت الحمل "
-          "أفسد قياساً سابقاً).")
-    print("  المعلم: **أنبوب الجيجر** على أحد جانبي الروبوت — "
-          "لا نستعمل يمين/يسار أبداً.")
+    print(f"\n🧭 LANDMARK PROBE — power {p:.2f}, {a.seconds:.1f}s per pulse.")
+    print("⚠ LIFT THE ROBOT UP, wheels free.")
+    print("   (Measuring on the ground once gave a wrong answer: a weak")
+    print("    battery made one side drag.)")
+    print("  Landmark: the GEIGER TUBE on one side of the robot.")
+    print("  🔴 We never say left/right — those flip depending on where")
+    print("     YOU stand. We only say \"geiger side\" or \"other side\".")
 
     results = {}
     try:
         for field, lp, rp in (("L", p, 0.0), ("R", 0.0, p)):
             try:
-                input(f"\n  ▶ نبضة الحقل {field} وحده (+{p:.2f}) — Enter…")
+                input(f"\n  ▶ Pulse field {field} only (+{p:.2f}) — "
+                      f"press Enter…")
             except (EOFError, KeyboardInterrupt):
-                print("\n⛔ أُلغي."); return 1
+                print("\n⛔ Cancelled."); return 1
             _pulse(bridge, lp, rp, a.seconds)
-            side = _ask("  أي جهة دارت عجلاتها؟  g = جهة أنبوب الجيجر · "
-                        "o = الجهة المقابلة · n = لا شيء دار", ("g", "o", "n"))
+            side = _ask("  Which side's wheels turned?\n"
+                        "       g = the GEIGER TUBE side\n"
+                        "       o = the OTHER side\n"
+                        "       n = nothing turned", ("g", "o", "n"))
             direction = "n"
             if side != "n":
-                direction = _ask("  ودارت نحو:  f = مقدمة الروبوت "
-                                 "(جهة الكاميرا) · b = مؤخرته", ("f", "b"))
+                direction = _ask("  Which way did they roll?\n"
+                                 "       f = toward the FRONT (camera side)\n"
+                                 "       b = toward the BACK", ("f", "b"))
             results[field] = (side, direction)
     finally:
         # الإيقاف مضمون مهما حدث — بما فيه Ctrl-C وسط نبضة
@@ -184,29 +206,33 @@ def main() -> int:
         except Exception:                     # noqa: BLE001
             pass
 
-    ar_side = {"g": "جهة الجيجر", "o": "الجهة المقابلة", "n": "لا دوران"}
-    ar_dir = {"f": "أمام", "b": "خلف", "n": "—"}
-    print("\n  ── المرصود ──")
+    en_side = {"g": "geiger side", "o": "other side", "n": "nothing"}
+    en_dir = {"f": "forward", "b": "backward", "n": "—"}
+    print("\n  ── WHAT YOU SAW ──")
     for field in ("L", "R"):
         sd, dr = results[field]
-        print(f"    الحقل {field}=+{p:.2f} ⇒ {ar_side[sd]} · {ar_dir[dr]}")
+        print(f"    field {field}=+{p:.2f}  ⇒  {en_side[sd]}, {en_dir[dr]}")
 
     ls, ld = results["L"]
     rs, rd = results["R"]
-    print("\n  ── الاشتقاق ──")
+    print("\n  ── RESULT ──")
     if "n" in (ls, rs):
-        print("  🔴 حقل بلا استجابة — جانب ميت أو قناة غير مقودة.")
-        print("     على Freenove: راجع خريطة القنوات FREENOVE_WHEEL_CHANNELS "
-              "وتغذية لوح المحركات. لا يصلحه أي ثابت اتجاه.")
+        print("  🔴 One field did nothing — dead side or undriven channel.")
+        print("     Check FREENOVE_WHEEL_CHANNELS in pi/config.py and the")
+        print("     power going to the Freenove motor board.")
+        print("     No direction constant can fix this.")
         return 3
     if ls == rs:
-        print("  🔴 الحقلان يحرّكان الجهة نفسها — قناتا الخرج على جانب واحد.")
-        print("     خطأ خريطة قنوات لا خطأ قطبية. لا يصلحه أي ثابت اتجاه.")
+        print("  🔴 Both fields moved the SAME side.")
+        print("     This is a channel-map error, not a polarity error.")
+        print("     No direction constant can fix this.")
         return 3
     if ld != rd:
-        print("  🔴 قطبية الجانبين مختلفة — انعكاس محرّك جانب واحد (أسلاك).")
-        print("     العرَض المميّز: أمر التقدّم يجعله **يدور بالمكان** بدل أن "
-              "يتقدّم. 🔴 لا يصلحه أي ثابت في config — أصلح الأسلاك.")
+        print("  🔴 The two sides have OPPOSITE polarity — one side's motor")
+        print("     is wired backwards.")
+        print("     Telltale sign: a \"go forward\" command makes the robot")
+        print("     SPIN IN PLACE instead of moving forward.")
+        print("  🔴 No config value can fix this — fix the wiring.")
         return 3
 
     # الجيجر على **يسار** الروبوت (تثبيت هذا المشروع)
@@ -214,13 +240,20 @@ def main() -> int:
     swap = not left_is_L               # True ⇒ الحقل L يقود الجانب الأيمن
     invert = -1 if ld == "b" else +1   # ‎+p يجب أن يدفع العجلة للأمام
 
-    print(f"  ✅ الوصفة في pi/config.py:")
+    print(f"  ✅ DONE. Put these two lines in pi/config.py:")
     print(f"     MOTOR_SWAP_LR = {swap}")
     print(f"     MOTOR_INVERT  = {invert}")
-    print(f"\n  ⚠ ثم **تحقّق** بلفّة 90° (لا 180°: تنتهي مواجهة نفس الجهة في")
-    print(f"     الاتجاهين فلا تكشف الانعكاس)، وشاهدها **من خلف الروبوت**.")
-    print(f"  ⚠ ولا تلمس MPU6050_GYRO_Z_SIGN — تُقاس باليد بلا محركات:")
-    print(f"     python3 -m pi.tests.calibrate_mpu6050")
+    print(f"\n  Next: check it with a 90 degree turn on the ground:")
+    print(f"     python3 -m pi.tests.check_directions --power 0.25")
+    print(f"  ⚠ Use 90 degrees, NOT 180. After a 180 turn the robot faces")
+    print(f"     the same way whether it turned left or right, so a 180")
+    print(f"     turn cannot tell you if the direction is flipped.")
+    print(f"  ⚠ Stand BEHIND the robot when you judge left/right.")
+    print(f"\n  🔴 If the turn goes the WRONG way, do NOT change")
+    print(f"     MPU6050_GYRO_Z_SIGN. That value was measured by turning")
+    print(f"     the robot BY HAND with motors off, so it does not depend")
+    print(f"     on motor wiring. Changing it hides the real bug.")
+    print(f"     Run this probe again instead.")
     return 0
 
 
