@@ -25,6 +25,7 @@ import logging
 from pi.config import (
     FREENOVE_I2C_BUS, FREENOVE_PCA9685_ADDR, FREENOVE_PWM_FREQ_HZ,
     FREENOVE_WHEEL_CHANNELS, FREENOVE_BRAKE_ON_STOP, FREENOVE_DUTY_MAX,
+    MOTOR_MAP_CALIBRATED,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,8 @@ class FreenoveTransport(Transport):
     kind = "freenove"
     name = "Freenove 4WD (PCA9685/I2C)"
     clamp_reason = "حدّ أمان (PCA9685 دقّته 12 بت — لا التفاف عددي)"
-    motor_map_calibrated = False     # 🔴 تُشتقّ بمسبار المعالم — م2
+    #: 🔴 تُشتقّ بمسبار المعالم (م2) ويُقرّها المشغّل في config بعد تطبيقها
+    motor_map_calibrated = MOTOR_MAP_CALIBRATED
 
     def __init__(self, bus: int = FREENOVE_I2C_BUS,
                  address: int = FREENOVE_PCA9685_ADDR,

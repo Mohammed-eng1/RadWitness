@@ -301,6 +301,10 @@ def main() -> int:
     print(f"  ✅ DONE. Put these two lines in pi/config.py:")
     print(f"     MOTOR_SWAP_LR = {swap}")
     print(f"     MOTOR_INVERT  = {invert}")
+    # ⚠ الإقرار سطر ثالث لا اختياري: بدونه يبقى تحذير الإقلاع يصرخ بعد
+    #    الاشتقاق، وتحذيرٌ لا يسكت يُدرَّب الناس على تجاهله.
+    print(f"     MOTOR_MAP_CALIBRATED = True   <-- set this too, or the "
+          f"boot warning keeps firing")
     print(f"\n  Next: check it with a 90 degree turn on the ground:")
     print(f"     python3 -m pi.tests.check_directions --power 0.25")
     print(f"  ⚠ Use 90 degrees, NOT 180. After a 180 turn the robot faces")
