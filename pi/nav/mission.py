@@ -61,6 +61,7 @@ from pi.nav.sim_world import SimWorld
 from pi.nav.reactive import ReactiveSafety
 from pi.nav.executor import DriveExecutor
 from pi.nav.motion_check import SHORT, OVERSHOOT, NO_MOTION
+from pi.ai import background as _bg
 from pi.nav.wall_heading import WallHeadingCorrector
 from pi.nav.heading_hold import config_sanity as heading_config_sanity
 from pi.nav.perimeter import PerimeterTracker, FOLLOW, TURN, DONE, ABORT, SEEK
@@ -292,10 +293,25 @@ class MissionSim:
         # ── محدِّد موقع المصدر: يُنشأ مع الغرفة ويُغذّى من كل قراءة مسح ──
         # ⚠ محاور الشبكة البايزية: x = العرض، y = الطول — نفس اصطلاح
         #   `grid.cell_center` تماماً، وإلا انعكست الخريطة الحرارية صامتةً.
+        # 🔴 **الخلفية مقاسةً إن وُجدت، لا الافتراضَ دائماً**: كل حكم بوجود
+        #    مصدر مقارنةٌ بها، فرقمٌ مفترض يُزيح الحكم كلّه — يُفوّت مصدراً
+        #    إن كان أعلى من الحقيقي، ويخترع مصدراً إن كان أدنى.
+        #    و`bg_cpm` الممرَّر يبقى مرجع **المحاكاة** (SimWorld يولّد به
+        #    حقلاً وهمياً)، بينما محدِّد المصدر يأخذ المقاس على العتاد.
+        bgi = _bg.effective()
+        self.background = bgi
+        bg_for_locator = bgi["cpm"] if bgi["source"] == "measured" else float(bg_cpm)
         self.locator = SourceLocator(width_m=float(width_m),
                                      length_m=float(length_m),
-                                     background_cpm=float(bg_cpm))
-        self.locator.set_background(float(bg_cpm))
+                                     background_cpm=float(bg_for_locator))
+        self.locator.set_background(float(bg_for_locator),
+                                    float(bgi.get("sigma_cpm") or 0.0))
+        # والمصدر يُسجَّل حدثاً: «لا مصدر» على خلفية مفترضة ليس كـ«لا مصدر»
+        # على خلفية مقاسة، والفرق لا يُقرأ من الرقم وحده.
+        self._log("background",
+                  f"الخلفية {bg_for_locator:.2f} CPM "
+                  f"[{'مقاسة' if bgi['source'] == 'measured' else 'مفترضة'}] — "
+                  f"{bgi['reason']}")
         self.state = IDLE
         self.current = self.grid.start_cell()
         self.heading = 0.0
@@ -2214,6 +2230,17 @@ class MissionSim:
         if self.profile is None:
             blockers.append("لا ملف معايرة — المسافة تُشتق من السرعة المعايرة")
 
+        # ③ب 🔴 الخلفية: مفترضة ⇒ تحذير صريح لا صمت. كل حكم بوجود مصدر
+        #     مقارنةٌ بها، و«لا مصدر» على رقم مُختلَق ليس نتيجة.
+        bgi = getattr(self, "background", None) or _bg.effective()
+        if bgi.get("source") != "measured":
+            warnings.append(
+                "⚠ الخلفية **مفترضة لا مقاسة** — كل حكم بوجود مصدر مقارنةٌ "
+                "بها: الأعلى يُفوّت مصدراً والأدنى يخترع واحداً. قِسها خارج "
+                "الغرفة: python3 -m pi.tests.calibrate_background")
+        elif not bgi.get("ok"):
+            warnings.append(f"⚠ خلفية مقاسة لكن {bgi.get('reason')}")
+
         # ④ غرفة
         if self.grid is None:
             blockers.append("لم تُعرَّف الغرفة بعد")
@@ -2811,6 +2838,9 @@ class MissionSim:
                        "stuck_streak": self._stuck,
                        "partial_m": round(self._cell_progress, 2),
                        "last": self._last_motion},
+            # 🔴 الخلفية **ومصدرها** في البثّ: «لا دليل على مصدر» محسوبةً
+            #    على خلفية مفترضة ليست نتيجةً بل غياب قياس.
+            "background": getattr(self, "background", None),
             # المراحل الست + أثر المسار (البنود 4 و6)
             "phase": self.phase,
             "phase_ar": PHASE_AR.get(self.phase, self.phase),

@@ -3600,6 +3600,98 @@ def main() -> int:
     # ومنه السيرفر) أو وسم «أداة خارجية» في السطر الأول من docstring.
     # ⚠ فحص نصّي تقريبي: ذكر الاسم في تعليق يُحتسب استدعاءً — فهو يمسك
     #   الاسم الذي لا يذكره أحد إطلاقاً، وهذه كانت بصمة الحالات الست كلها.
+    # ═══ (ص) 🔴 الجيجر: «صفر» عطلٌ لا «مكان آمن» ═══════════════════
+    print("\nص) الجيجر والخلفية:")
+    from pi.ai.risk import classify as _risk
+    from pi.ai import background as _bgm
+    from pi.config import (GEIGER_SILENCE_FAULT_S, GEIGER_BG_FLOOR_CPM,
+                           BACKGROUND_MIN_S, SOURCE_BG_CPM_DEFAULT)
+
+    # 🔴 الانقلاب الذي أُصلح: عدّاد لا يعدّ ⇒ usvh=0.0 ⇒ **Safe أخضر**، أي
+    #    أن الجهاز يُعلن المكان آمناً لأنه لا يقيس. (شوهد على العتاد:
+    #    الواجهة عرضت CPM=0 و«الخطورة Safe» بينما العدّاد صامت تماماً.)
+    check("🔴 عدّاد لا يعدّ ⇒ **Unknown** لا Safe (الصفر ليس شهادة سلامة)",
+          _risk(0.0, counting=False)["risk"] == "Unknown"
+          and _risk(0.0, counting=False)["lvl"] is None,
+          f"{_risk(0.0, counting=False)['risk']}")
+    check("و«لم يُحسم بعد» كذلك Unknown (لا تبرئة قبل الدليل)",
+          _risk(0.0, counting=None)["risk"] == "Unknown")
+    check("وعدّاد حيّ عند صفر جرعة يبقى Safe (لا إنذار كاذب)",
+          _risk(0.0, counting=True)["risk"] == "Safe")
+    check("والخطر الحقيقي لا يُبتلع بالحارس",
+          _risk(3.0, counting=True)["risk"] in ("Medium", "High", "Critical"))
+
+    # حارس الصمت في القارئ نفسه — بلا عتاد (يُبنى بالحقول مباشرة)
+    from pi.sensors.geiger import GeigerReader as _GR
+    _g = _GR.__new__(_GR)
+    _g.ok, _g._seen_any, _g._silent_s = True, False, 0.0
+    check("صمت قصير ⇒ **لا حكم** (None) لا اتهام", _g.counting is None)
+    _g._silent_s = GEIGER_SILENCE_FAULT_S
+    check(f"🔴 وصمت {GEIGER_SILENCE_FAULT_S:.0f}ث ⇒ عطل معلَن",
+          _g.counting is False,
+          f"احتمال بواسون {_g.silence_p:.1e} عند خلفية {GEIGER_BG_FLOOR_CPM}")
+    check("⚠ والحكم إحصائي لا ذوقي: الاحتمال ضئيل فعلاً", _g.silence_p < 1e-6)
+    _g._seen_any = True
+    check("ونبضة واحدة تُثبت الحياة فلا يعود الحارس يتّهم", _g.counting is True)
+
+    # ═══ الخلفية: مقاسة لا مفترضة ═══════════════════════════════
+    # ⚠ نفس μ من زمنين مختلفين ⇒ **نفس الرقم وشكّ مختلف تماماً**: هذا
+    #   بالضبط ما يضيع حين تُكتب الخلفية رقماً بلا زمنه.
+    _s_long, _s_short = _bgm.summarize(90, 300.0), _bgm.summarize(6, 20.0)
+    check("خلفية 300ث و20ث تُعطيان **نفس μ** — والفرق كلّه في σ",
+          _s_long["cpm"] == _s_short["cpm"]
+          and _s_short["sigma_cpm"] > 3 * _s_long["sigma_cpm"],
+          f"μ={_s_long['cpm']} · σ: {_s_long['sigma_cpm']} مقابل {_s_short['sigma_cpm']}")
+    check(f"والقصيرة تُوسم «دون {BACKGROUND_MIN_S:.0f}ث» لا تُقبل بصمت",
+          _s_long["long_enough"] and not _s_short["long_enough"])
+    check("وخطأ بواسون 1/√N محسوب لا مُقدَّر",
+          abs(_s_long["rel_error"] - (1 / 90 ** 0.5)) < 1e-3,
+          f"±{_s_long['rel_error'] * 100:.1f}%")
+    _eff_none = _bgm.effective(path="/nonexistent/bg.json")
+    check("🔴 وبلا قياس: المصدر **يُعلَن «مفترضاً»** ولا يُلفَّق رقم بلا سند",
+          _eff_none["source"] == "assumed" and _eff_none["ok"] is False
+          and _eff_none["cpm"] == SOURCE_BG_CPM_DEFAULT)
+
+    # 🔴 **اختبار تكامل** (القاعدة 8): المهمة تستعمل المقاسة فعلاً ويتغيّر بها
+    #    سلوكها — لا مجرد وجود دالة.
+    import json as _json, tempfile as _tf, os as _os2, time as _t2
+    _tmp = _os2.path.join(_tf.mkdtemp(), "background.json")
+    _rec = _bgm.summarize(300, 600.0)          # 30 CPM مقاسة
+    _rec["note"] = "اختبار"
+    _bgm.save(_rec, _tmp)
+    _back = _bgm.effective(path=_tmp)
+    check("قياس محفوظ يُقرأ مقاساً بمتوسطه",
+          _back["source"] == "measured" and abs(_back["cpm"] - 30.0) < 0.1,
+          f"{_back['cpm']} CPM")
+    _m_bg = MissionSim()
+    _orig_eff = _bgm.effective
+    try:
+        _bgm.effective = lambda *a2, **k2: _back      # يحاكي وجود قياس
+        import pi.nav.mission as _mm
+        _mm._bg.effective = _bgm.effective
+        _m_bg.configure_room(length_m=2, width_m=2, scan_spacing_m=1.0)
+        check("🔴 والمهمة **تُمرّرها إلى محدِّد المصدر** لا تتجاهلها",
+              abs(_m_bg.locator.background_cpm - 30.0) < 0.1,
+              f"locator.background_cpm={_m_bg.locator.background_cpm}")
+        check("وσ تصل معها (هي التي تحدّد حدّ الكشف)",
+              _m_bg.locator.background_sigma > 0,
+              f"σ={_m_bg.locator.background_sigma:.2f}")
+        check("ولا تحذير «خلفية مفترضة» مع قياس سليم",
+              not any("مفترضة" in w for w in
+                      _m_bg.mission_readiness()["warnings"]))
+    finally:
+        _bgm.effective = _orig_eff
+        _mm._bg.effective = _orig_eff
+    _m_as = MissionSim()
+    _m_as.configure_room(length_m=2, width_m=2, scan_spacing_m=1.0)
+    check("🔴 وبلا قياس: تحذير صريح في الجاهزية (لا صمت)",
+          any("مفترضة" in w for w in _m_as.mission_readiness()["warnings"])
+          and _m_as.background["source"] == "assumed")
+    # ⚠ `state` سمة نصّية لا دالة (IDLE/RUNNING…) — البثّ من `state_dict`.
+    check("والخلفية ومصدرها يصلان البثّ (تفسير «لا مصدر» مستحيل بدونهما)",
+          (_m_as.state_dict().get("background") or {}).get("source") == "assumed",
+          f"{(_m_as.state_dict().get('background') or {}).get('cpm')} CPM")
+
     print("\nع) حارس التوصيل:")
     import ast as _ast
     import pathlib as _pl

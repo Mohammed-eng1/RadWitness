@@ -12,7 +12,9 @@ from collections import deque
 from pi.config import (
     GEIGER_GPIO, CPM_PER_USVH, DEADTIME_TAU_S,
     GEIGER_WINDOW_S, GEIGER_EMA_ALPHA, HIGH_RATE_WARNING_CPM, GEIGER_PRESENT,
+    GEIGER_BG_FLOOR_CPM, GEIGER_SILENCE_WARN_S, GEIGER_SILENCE_FAULT_S,
 )
+import math
 
 try:
     import lgpio
@@ -45,6 +47,9 @@ class GeigerReader:
         self._cpm = 0.0
         self._usvh = 0.0
         self._total = 0
+        # 🔴 حارس الصمت: ثوانٍ مرّت **بلا أي عدّة منذ الإقلاع**
+        self._silent_s = 0.0
+        self._seen_any = False
 
         # 🔴 معلَن غائباً ⇒ لا يُحجز المنفذ ولا يُقرأ (منفذ طافٍ يعدّ ضجيجاً
         #    فيبدو إشعاعاً — وهو أخطر فشل ممكن في عدّاد إشعاع).
@@ -81,6 +86,14 @@ class GeigerReader:
         self._last_total = total
         self._total = total
         self._per_sec.append(counts)
+        # 🔴 حارس «صفر عدّات»: أنبوب حيّ يرى الخلفية دائماً — والصمت الطويل
+        #    عطل لا سلامة. يُقاس **منذ الإقلاع حتى أول عدّة** لا كنافذة
+        #    منزلقة: نبضة واحدة تثبت الحياة، وبعدها يخصّ التقييمَ المستوى
+        #    لا الوجود.
+        if counts > 0:
+            self._seen_any = True
+        if not self._seen_any:
+            self._silent_s += 1.0
 
         window_counts = sum(self._per_sec)
         window_min = len(self._per_sec) / 60.0
@@ -105,7 +118,43 @@ class GeigerReader:
         except Exception:                 # noqa: BLE001
             return None
 
+    @property
+    def silence_p(self) -> float:
+        """احتمال بواسون لهذا الصمت لو كان العدّاد سليماً: exp(−B·T/60)."""
+        return math.exp(-GEIGER_BG_FLOOR_CPM * self._silent_s / 60.0)
+
+    @property
+    def counting(self):
+        """
+        🔴 **هل يعدّ العدّاد أصلاً؟** `True` رأى عدّة · `False` صمتٌ يتجاوز
+        اليقين العملي · `None` **لم يُحسم بعد** (لم يمرّ زمن كافٍ).
+
+        وهذا ليس تفصيلاً تجميلياً: بدونه يُصنَّف `usvh = 0.0` **Safe أخضر**،
+        أي أن الجهاز يُعلن المكان آمناً **لأنه لا يقيس** — انقلابٌ كامل
+        لمعنى القياس، ومخالفة صريحة للقاعدة 6.1 (الغائب مجهول لا شهادة).
+        """
+        if not self.ok:
+            return False                  # لم يُحجز الخط أصلاً
+        if self._seen_any:
+            return True
+        if self._silent_s >= GEIGER_SILENCE_FAULT_S:
+            return False
+        return None                       # لم يُحسم — لا تبرئة ولا اتهام
+
     def state(self) -> dict:
+        counting = self.counting
+        silent = round(self._silent_s, 1)
+        note = None
+        if counting is False and self.ok:
+            note = (f"⛔ **صفر عدّات منذ {silent:.0f}ث** — أنبوب حيّ يرى "
+                    f"الخلفية دائماً (احتمال هذا الصمت سليماً "
+                    f"{self.silence_p:.1e}). افحص: جهد الأنبوب · دبوس "
+                    f"BCM{GEIGER_GPIO} · السطر عائم بلا مقاومة رفع. "
+                    f"🔴 الجرعة صفر هنا تعني **لا قياس** لا «آمن».")
+        elif counting is None and self._silent_s >= GEIGER_SILENCE_WARN_S:
+            note = (f"⚠ لا عدّات منذ {silent:.0f}ث (احتمال "
+                    f"{self.silence_p:.1e}) — يُحسم عند "
+                    f"{GEIGER_SILENCE_FAULT_S:.0f}ث")
         return {
             "ok": self.ok,
             "error": self.error,          # يُعرض في الواجهة عند فشل حجز الخط
@@ -116,6 +165,11 @@ class GeigerReader:
             "ema": round(self._ema, 0),
             "total": self._total,
             "high_rate": self._cpm_raw > HIGH_RATE_WARNING_CPM,
+            # 🔴 «يعدّ أم لا» جزء من الحالة — والصفر بلا هذا الحقل كذبة
+            "counting": counting,
+            "silent_s": silent,
+            "silence_p": self.silence_p if not self._seen_any else None,
+            "counting_note": note,
         }
 
     def close(self) -> None:

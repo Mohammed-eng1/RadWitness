@@ -316,12 +316,16 @@ def _full_state(include_full_grid: bool = False) -> dict:
 
 def _sensor_telemetry() -> dict:
     g = geiger.state(); p = gps.state(); m = imu.state(); r = rover.state()
-    risk = classify(g["usvh"])
+    # 🔴 التصنيف يعرف **هل يعدّ العدّاد**: صفرُ عطلٍ ليس مكاناً آمناً.
+    risk = classify(g["usvh"], counting=g.get("counting", True))
     return {
         "t": "telemetry", "ts": int(time.time()),
         "cpm_raw": g["cpm_raw"], "cpm": g["cpm"], "usvh": g["usvh"],
         "high_rate": g["high_rate"], "total": g["total"],
         "geiger_err": g.get("error"), "geiger_samples": g.get("samples", 0),
+        # حالة «يعدّ أم لا» تصل الواجهة صراحةً مع سببها المقروء
+        "geiger_counting": g.get("counting"), "geiger_silent_s": g.get("silent_s"),
+        "geiger_note": g.get("counting_note"),
         "risk": risk["risk"], "lvl": risk["lvl"], "risk_color": risk["color"],
         "fix": p["fix"], "lat": p["lat"], "lng": p["lng"], "sats": p["sats"], "hdop": p["hdop"],
         "heading": m["heading"], "mag_cal": m["mag_cal"], "sys_cal": m["sys_cal"],
