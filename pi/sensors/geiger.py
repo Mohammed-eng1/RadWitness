@@ -2,7 +2,8 @@
 """
 geiger.py — قارئ عداد جيجر (منقول حرفياً من pi/tests/test_geiger.py المثبت)
 ==========================================================================
-lgpio، BCM17، RISING_EDGE، SET_PULL_NONE (عائم). عدّ عبر tally في خيط lgpio،
+lgpio، **BCM21 (الدبوس 40)**، RISING_EDGE، SET_PULL_NONE (عائم).
+الدبوس من `GEIGER_GPIO` في config — نُقل من BCM17 في 2026-09-13. عدّ عبر tally في خيط lgpio،
 نافذة 30ث منزلقة + EMA سريع، تصحيح زمن ميت، تحويل لـµSv/h بمعايرة Cs-137.
 القيم من config.py — لا تُغيَّر.
 """

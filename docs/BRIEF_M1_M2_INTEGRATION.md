@@ -7,7 +7,7 @@
 هذه قيم مؤكدة تجريبياً على منصة الراسبري الفعلية (Debian trixie)، أي انحراف عنها يكسر القراءة:
 
 1. **المنصة: lgpio** (وليس pigpio — محذوف في trixie). كل تعامل GPIO عبر lgpio.
-2. **الجيجر**: BCM17، `lgpio.RISING_EDGE`، **بلا أي مقاومة `lgpio.SET_PULL_NONE`** (عائم — مخرج CAJOE عالي الممانعة؛ أي pull داخلي يقتل الإشارة → CPM=0). السطر الحرفي المثبت:
+2. **الجيجر**: **BCM21 (دبوس 40)** 📜 كان BCM17 حتى 2026-09-13، `lgpio.RISING_EDGE`، **بلا أي مقاومة `lgpio.SET_PULL_NONE`** (عائم — مخرج CAJOE عالي الممانعة؛ أي pull داخلي يقتل الإشارة → CPM=0). السطر الحرفي المثبت:
    ```python
    lgpio.gpio_claim_alert(h, 17, lgpio.RISING_EDGE, lgpio.SET_PULL_NONE)
    ```

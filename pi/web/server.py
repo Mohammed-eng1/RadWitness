@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from pi.config import (
     WEB_HOST, WEB_PORT, BROADCAST_S, CAPTURES_DIR, BATTERY_MONITOR_ENABLED,
-    LORA_ENABLED, LORA_PORT, MISSION_RECORD_DIR,
+    LORA_ENABLED, LORA_PORT, MISSION_RECORD_DIR, GEIGER_GPIO,
 )
 from pi.comms.control import ManualControl, SOURCE_MANUAL, SOURCE_RADIO
 from pi.comms.lora import LoRaLink
@@ -112,7 +112,9 @@ _active_calib = {"name": None}
 _sim_clients: set[WebSocket] = set()
 
 # ── الحساسات الحقيقية (M1 — تعمل على الراسبري، خاملة على ويندوز) ──
-geiger = _boot("عدّاد جيجر (lgpio BCM17)", GeigerReader)
+# ⚠ الاسم **مشتقّ من config** لا مكتوب: سطرُ إقلاع يطبع دبوساً غير الذي
+#   يحجزه الكود هو بالضبط «الإرشاد إلى رقم ميت» الذي تمنعه §2.0.1.
+geiger = _boot(f"عدّاد جيجر (lgpio BCM{GEIGER_GPIO})", GeigerReader)
 gps = _boot("GPS", GPSReader)
 imu = _boot("وحدة القصور الذاتي (القارئ المشترك)", get_imu)
 # 🔴 **اسم الشريحة المكتشَف يُطبع** لا المفترض: العائلة أربع شرائح بنفس
