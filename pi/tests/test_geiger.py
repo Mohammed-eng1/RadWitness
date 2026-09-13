@@ -23,11 +23,23 @@ Debian trixie (راسبري باي أوس الحالي). lgpio هو البديل
     المصدر: legacy/RadiationRover/firmware/esp32_main/{config.h, geiger.h}
 
 التشغيل على الراسبري (بلا daemon — المستخدم pi ضمن مجموعة gpio):
-    python3 pi/tests/test_geiger.py   # Ctrl-C للإيقاف
+    python3 -m pi.tests.test_geiger   # المفضَّل · Ctrl-C للإيقاف
+    python3 pi/tests/test_geiger.py   # يعمل أيضاً (المسار يُضبط ذاتياً أدناه)
 """
+import os
 import sys
 import time
 from collections import deque
+
+# 🔴 **يعمل بالطريقتين**: `python3 -m pi.tests.test_geiger` و
+#    `python3 pi/tests/test_geiger.py`. التشغيل كملف مباشر لا يضع جذر
+#    المستودع على `sys.path` فيسقط استيراد `pi.config` بـModuleNotFoundError
+#    — وهذا **سكربت طوارئ يُشغَّل على عجل لتشخيص عدّاد صامت**، فسقوطه
+#    باستيراد فاشل يضيف عطلاً ثانياً فوق الأول بدل أن يشخّص. (حدث فعلاً
+#    2026-09-13 لحظة نقل الثوابت إلى config.)
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 try:
     import lgpio
