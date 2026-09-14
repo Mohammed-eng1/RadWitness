@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-calibrate_heading.py — معايرة الاتجاه على العتاد مع BNO055 (البند 1)
+calibrate_heading.py — معايرة الاتجاه على العتاد مع MPU-6050 (البند 1)
 ====================================================================
-⚠ **كل معايرة اتجاه سابقة باطلة**: أُخذت بجايرو الروفر الداخلي الذي مات
-   (I2C الداخلي معطّل)، وBNO055 حسّاس آخر بمعدل قراءة آخر (~50ms مقابل
-   ~120ms). لا تنسخ رقماً من الجدول القديم — قِس كل شيء من جديد هنا.
+⚠ **كل معايرة اتجاه سابقة باطلة**: أُخذت بجايرو الروفر الداخلي (مات مع
+   Wave Rover) أو بـBNO055 (تلفت §0). المصدر الحيّ وحدة **MPU على
+   `/dev/i2c-4` @0x68** بمعدل قراءة آخر — لا تنسخ رقماً من جدول قديم،
+   قِس كل شيء من جديد هنا.
 
 ثلاث مراحل، كل واحدة تُشغَّل وحدها أو الثلاث بالتسلسل:
 
@@ -21,7 +22,6 @@ calibrate_heading.py — معايرة الاتجاه على العتاد مع BN
     python3 -m pi.tests.calibrate_heading --stage 1
     python3 -m pi.tests.calibrate_heading --stage 2 --angle 180 --trials 3
     python3 -m pi.tests.calibrate_heading --stage 3 --duration 4
-    RMS_HEADING_SOURCE=bno055_fusion python3 -m pi.tests.calibrate_heading --stage 2
 
 ⚠ السلامة:
   - المحركات تُوقَف في `finally` وعند Ctrl-C في كل مسار.
@@ -29,7 +29,7 @@ calibrate_heading.py — معايرة الاتجاه على العتاد مع BN
     عند STOP_CM.
   - **مراقبة الجهد معطّلة الآن** → ابدأ ببطارية مشحونة، والحماية زمنية
     (MISSION_TIME_LIMIT_S في المهمة؛ هذا السكربت أشواطه ثوانٍ).
-  - كل قوة تمرّ عبر `WaveRoverBridge.motors()` فتُحكم بـMAX_MOTOR_POWER.
+  - كل قوة تمرّ عبر `bridge.motors()` فتُحكم بـMAX_MOTOR_POWER.
 
 النتائج تُحفظ في `docs/results/heading_calibration_<ts>.json` وتُطبع كأسطر
 config جاهزة للّصق — **لا يُعدّل config تلقائياً** (قيمة مقاسة تُراجَع بعين
@@ -48,9 +48,9 @@ from pi.config import (
     ROVER_MODE, HEADING_SOURCE, GYRO_SCALE,
     HEADING_DEADBAND_DPS, HEADING_KP, HEADING_KD, HEADING_MAX_CORR,
     STRAIGHT_BASE_POWER, MOTOR_TRIM_L, MOTOR_TRIM_R, MAX_MOTOR_POWER,
-    HEADING_HOLD_LOOP_S, BNO055_READ_PERIOD_S, GYRO_BIAS_CALIB_S,
+    HEADING_HOLD_LOOP_S, MPU6050_READ_PERIOD_S, GYRO_BIAS_CALIB_S,
     STOP_CM, BATTERY_MONITOR_ENABLED, MISSION_TIME_LIMIT_S,
-    BNO055_ADDR, BNO055_I2C_BUS,
+    MPU6050_ADDR, MPU6050_I2C_BUS,
 )
 from pi.nav.heading_hold import HeadingController, signed_error, available_headroom, config_sanity
 from pi.rover.bridge import WaveRoverBridge
@@ -144,7 +144,7 @@ def stage1_bias(rover, seconds: float, interactive: bool = True) -> dict:
         v = src._read_rate_dps() if src.kind == "rate" else src._read_angle_deg()
         if v is not None:
             samples.append((time.time(), float(v)))
-        time.sleep(BNO055_READ_PERIOD_S)
+        time.sleep(MPU6050_READ_PERIOD_S)
     elapsed = time.time() - t0
     if len(samples) < 10:
         return {"ok": False, "reason": f"عينات غير كافية ({len(samples)}) — تحقّق من الحسّاس",
@@ -174,11 +174,12 @@ def stage1_bias(rover, seconds: float, interactive: bool = True) -> dict:
     if all(v == 0.0 for v in raw):
         print(f"\n  ⛔ كل العينات ({len(raw)}) **صفر مضبوط** — الحسّاس لا يرسل.")
         print(f"     المصدر الفعلي «{src.name}» بينما المطلوب {HEADING_SOURCE}.")
-        if src.name == "rover_gyro":
-            print("     جايرو الروفر الداخلي **ميت** (CLAUDE.md §1) — سقط "
-                  "إليه المصنع لتعذّر BNO055.")
-        print(f"     افحص: i2cdetect -y {BNO055_I2C_BUS}  "
-              f"(يجب أن يظهر {hex(BNO055_ADDR)[2:]})")
+        if src.name != "mpu6050":
+            print("     ⚠ سقط المصنع إلى مصدر بديل — ومصادر Wave Rover/BNO055 "
+                  "لقطع لم تعد على العتاد (§0)، فقراءاتها بلا معنى.")
+        print(f"     افحص: i2cdetect -y {MPU6050_I2C_BUS}  "
+              f"(يجب أن يظهر {hex(MPU6050_ADDR)[2:]})، ثم "
+              f"python3 -m pi.tests.check_imu_health")
         print("     ⚠ لا تلصق أي رقم من هذا التشغيل في config — كله باطل.")
         return {"ok": False, "reason": "كل العينات صفر مضبوط — حسّاس ميت",
                 "source": src.name, "samples": len(raw), "rate_hz": round(hz, 1),
@@ -223,8 +224,9 @@ def stage1_bias(rover, seconds: float, interactive: bool = True) -> dict:
 
     # فحص الوحدات: الحسّاس الساكن يجب أن يعطي أعشار الدرجة/ث لا راديان/ث
     if src.kind == "rate" and abs(info["bias"]) > 20.0:
-        print("  ⚠ انحياز ضخم (>20°/ث) والروبوت ساكن — احتمال خطأ وحدات أو "
-              "اهتزاز. راجع BNO055_GYRO_IN_RAD.")
+        print("  ⚠ انحياز ضخم (>20°/ث) والروبوت ساكن — احتمال اهتزاز أو "
+              "خطأ وحدات. سائق MPU يقسّم الخام على 131 فيُخرج °/ث: "
+              "افحص بـ check_imu_health قبل اعتماد أي رقم.")
         out["unit_warning"] = True
     st = src.state()
     print(f"  حالة الحسّاس: {st}")
@@ -317,8 +319,8 @@ def stage2_scale(rover, angle: float, trials: int, interactive: bool = True) -> 
         s = out["suggested_scale"]
         if s > 5 or s < 0.2:
             print(f"  ⚠ معامل شاذ ({s}) — الأرجح خطأ **وحدات** لا معايرة: "
-                  f"≈57 يعني القراءة راديان/ث والعلم يقول درجة/ث (أو العكس ≈0.017). "
-                  f"راجع BNO055_GYRO_IN_RAD.")
+                  f"≈57 يعني القراءة راديان/ث والمفترض درجة/ث (أو العكس ≈0.017). "
+                  f"سائق MPU يقسّم على 131 ⇒ °/ث؛ افحص القسمة لا المعامل.")
         ratios = [r["fusion_ratio"] for r in results if r.get("fusion_ratio")]
         if ratios:
             out["fusion_ratio_median"] = round(statistics.median(ratios), 4)
@@ -545,7 +547,7 @@ def _print_config_lines(payload: dict) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="معايرة الاتجاه مع BNO055")
+    ap = argparse.ArgumentParser(description="معايرة الاتجاه مع MPU-6050")
     ap.add_argument("--stage", type=int, choices=(1, 2, 3), action="append",
                     help="مرحلة محدّدة (تكرارها يجمع مراحل). الافتراضي: الثلاث")
     ap.add_argument("--seconds", type=float, default=GYRO_BIAS_CALIB_S,
@@ -571,8 +573,14 @@ def main(argv=None) -> int:
     rover = WaveRoverBridge(mode=ROVER_MODE)
     src = rover.heading_source
     print("═" * 62)
-    print(f"معايرة الاتجاه · جسر: {rover.mode} (مطلوب {ROVER_MODE}) · "
+    print(f"معايرة الاتجاه · جسر: {rover.mode} "
+          f"(RMS_ROVER_MODE={ROVER_MODE}) · "
           f"مصدر: {src.name} (مطلوب {HEADING_SOURCE})")
+    if rover.mode != "real":
+        # 🔴 اسم متغيّر البيئة يُطبع كاملاً: `ROVER_MODE=real` (بلا البادئة)
+        #    لا يفعل شيئاً، والسكربت يرفض بعدها بسطرين فيبدو الرفض بلا سبب.
+        print("  ⚠ الجسر **محاكاة** — المراحل 2/3 تحتاج جسراً حقيقياً:")
+        print("     RMS_ROVER_MODE=real python3 -m pi.tests.calibrate_heading")
     if rover.error:
         print(f"  ⚠ {rover.error}")
     if getattr(src, "fallback_reason", None):
@@ -589,7 +597,9 @@ def main(argv=None) -> int:
 
     if not src.ok:
         print(f"⛔ مصدر الاتجاه غير سليم: {src.error}")
-        print("   تحقّق: i2cdetect -y 1 (يجب أن يظهر 29)، وتغذية 3.3V، والأسلاك.")
+        print(f"   تحقّق: i2cdetect -y {MPU6050_I2C_BUS} (يجب أن يظهر "
+              f"{hex(MPU6050_ADDR)[2:]})، وتغذية 3.3V، والأسلاك.")
+        print("   والتشخيص الكامل: python3 -m pi.tests.check_imu_health")
         return 2
     motion = [s for s in stages if s in (2, 3)]
     if motion and rover.mode != "real" and not a.allow_sim:

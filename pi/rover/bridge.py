@@ -37,6 +37,7 @@ from pi.config import (
     TURN_STALL_FLOOR_FRAC,
     TURN_SIGN_CHECK_DEG, BATTERY_MONITOR_ENABLED, ROVER_KIND,
     ADS7830_ENABLED, MOTOR_BATT_GOOD_V, MOTOR_BATT_LOW_V, MOTOR_BATT_CRIT_V,
+    BATT_SENSOR_RETRY_S,
     MOTOR_BATT_CELLS,
     TURN_SLOWDOWN_DEG, TURN_MIN_POWER, TURN_SETTLE_S, TURN_SETTLE_RATE_DPS,
     TURN_TOLERANCE_DEG, TURN_CORRECTION_PASSES, TURN_CORRECTION_TIMEOUT_S,
@@ -150,7 +151,9 @@ class RoverControlBridge:
         self.events = []                # أحداث الجسر (قصّ/تجزئة/انحياز) → الواجهة
         # الجهد: المصدر يُعلَن دائماً (البند 5)
         self._ina_reader = None         # None=لم يُجرَّب · False=غير متاح
+        self._ina_retry_ts = 0.0        # آخر محاولة فتح فاشلة (تهدئة الإحياء)
         self._ads_reader = None         # قارئ جهد حزمة المحركات (ADS7830)
+        self._ads_retry_ts = 0.0        # آخر محاولة فتح فاشلة (تهدئة الإحياء)
         self.voltage_source = self.VSRC_NONE
         self.voltage_reason = None
         self.battery_amps = None
@@ -431,8 +434,29 @@ class RoverControlBridge:
             self.charge_detector.state()["unknown"])
 
     def _ina(self):
-        """قارئ INA219 المشترك — يُهيَّأ كسولاً ولا يُسقط الجسر إن غاب."""
+        """
+        قارئ INA219 المشترك — كسول، ولا يُسقط الجسر إن غاب.
+
+        🔴 **والعطل ليس أبدياً** (§1.1): كان فشل فتح واحد يضبط `False` نهائياً
+           فيبقى حارس الجهد ساقطاً لعمر العملية والحماية حدّاً زمنياً وحده —
+           وخطأ ناقل عابر يكفي لذلك (i2c-1 يحمل المحركات). فيُعاد الفتح بعد
+           `BATT_SENSOR_RETRY_S`، **بتهدئة** لأن المحاولة في كل نبضة تُغرق
+           الناقل نفسه الذي يقود المحركات.
+        """
         if self._ina_reader is False:
+            if (time.time() - self._ina_retry_ts) < BATT_SENSOR_RETRY_S:
+                return None
+            self._ina_retry_ts = time.time()
+            try:
+                from pi.sensors.ina219 import get_ina219
+                r = get_ina219()
+                if r.reopen():
+                    self._ina_reader = r
+                    self._event("battery_source", "✅ INA219 عاد بعد إعادة فتح")
+                    return r
+                self.voltage_reason = r.error
+            except Exception as e:              # noqa: BLE001
+                self.voltage_reason = str(e)
             return None
         if self._ina_reader is None:
             try:
@@ -440,12 +464,14 @@ class RoverControlBridge:
                 r = get_ina219()
                 self._ina_reader = r if r.ok else False
                 if not r.ok:
+                    self._ina_retry_ts = time.time()
                     self.voltage_reason = r.error
                     self._event("battery_source",
                                 f"⚠ INA219 غير متاح: {r.error}")
                     return None
             except Exception as e:              # noqa: BLE001
                 self._ina_reader = False
+                self._ina_retry_ts = time.time()
                 self.voltage_reason = str(e)
                 return None
         return self._ina_reader or None
@@ -467,8 +493,29 @@ class RoverControlBridge:
 
     # ── جهد **حزمة المحركات** — نطاق مستقلّ تماماً ───────────────
     def _ads(self):
-        """قارئ ADS7830 المشترك — كسول، ولا يُسقط الجسر إن غاب."""
-        if self._ads_reader is False or not ADS7830_ENABLED:
+        """
+        قارئ ADS7830 المشترك — كسول، ولا يُسقط الجسر إن غاب.
+
+        🔴 **والإحياء بعد تهدئة** كما في `_ina()`: خطأ قراءة واحد يضبط
+           `ok=False` داخل القارئ نفسه، فتبقى **الحزمة التي تُحرّك فعلاً**
+           بلا رقيب جهد حتى إعادة تشغيل العملية.
+        """
+        if not ADS7830_ENABLED:
+            return None
+        if self._ads_reader is False:
+            if (time.time() - self._ads_retry_ts) < BATT_SENSOR_RETRY_S:
+                return None
+            self._ads_retry_ts = time.time()
+            try:
+                from pi.sensors.ads7830 import get_ads7830
+                r = get_ads7830()
+                if r.reopen():
+                    self._ads_reader = r
+                    self._event("motor_batt_source",
+                                "✅ ADS7830 عاد بعد إعادة فتح")
+                    return r
+            except Exception:                   # noqa: BLE001
+                pass
             return None
         if self._ads_reader is None:
             try:
@@ -476,12 +523,18 @@ class RoverControlBridge:
                 r = get_ads7830()
                 self._ads_reader = r if r.ok else False
                 if not r.ok:
+                    self._ads_retry_ts = time.time()
                     self._event("motor_batt_source",
                                 f"⚠ ADS7830 غير متاح: {r.error}")
                     return None
             except Exception as e:              # noqa: BLE001
                 self._ads_reader = False
+                self._ads_retry_ts = time.time()
                 return None
+        # ⚠ القارئ قد يُطفئ نفسه عند خطأ قراءة لاحق — يُعاد إلى مسار الإحياء
+        if not getattr(self._ads_reader, "ok", False):
+            self._ads_reader, self._ads_retry_ts = False, time.time()
+            return None
         return self._ads_reader or None
 
     def motor_pack_state(self) -> dict:

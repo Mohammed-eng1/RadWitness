@@ -45,14 +45,31 @@ class ADS7830:
         self.bus_num, self.address = int(bus), int(address)
         self.ok, self.error = False, None
         self._bus = None
+        self._open()
+
+    def _open(self) -> bool:
+        """يفتح الناقل ويتحقّق من وجود الشريحة. يضبط `ok`/`error` ولا يرمي."""
         try:
             import smbus2                    # كسول (البند 7)
+            self.close()
             self._bus = smbus2.SMBus(self.bus_num)
             self._bus.read_byte(self.address)   # تحقّق وجود فعلي
-            self.ok = True
+            self.ok, self.error = True, None
         except Exception as e:               # noqa: BLE001
+            self.ok = False
             self.error = (f"تعذّر فتح ADS7830 على i2c-{self.bus_num} "
                           f"@0x{self.address:02x}: {e}")
+        return self.ok
+
+    def reopen(self) -> bool:
+        """
+        **أداة داخلية** يستدعيها الجسر بعد تهدئة.
+
+        🔴 خطأ قراءة واحد كان يضبط `ok=False` **بلا طريق رجوع**: عثرة ناقل
+           عابرة (وi2c-1 يحمل المحركات معه — §2.0.1) تُسقط رقيب حزمة
+           المحركات لعمر العملية، فتبقى الحزمة التي تُحرّك فعلاً بلا جهد.
+        """
+        return self._open()
 
     def _read_raw(self, channel: int):
         """

@@ -25,7 +25,7 @@ from pi.config import (
     FRONT_WALL_CORRECTION_ENABLED, GEIGER_OFFSET_FWD_M, GEIGER_OFFSET_LEFT_M,
     FRONT_US_TRUST_MAX_CM, CPM_PER_USVH, SOURCE_R_MIN_M, SOURCE_BG_CPM_DEFAULT,
     TURN_RELIABILITY_MIN_V, BATT_GOOD_V, BATT_LOG_MIN_GAP_S,
-    BATT_RTH_OVERRIDE_FLOOR_V,
+    BATT_RTH_OVERRIDE_FLOOR_V, MOTOR_BATT_GOOD_V, MOTOR_BATT_LOW_V,
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
@@ -2290,6 +2290,52 @@ class MissionSim:
                     f"({TURN_RELIABILITY_MIN_V}V) — اختلال الجانبين تحت الحمل "
                     f"قد يُفسد اللفّات (قيس: لفّة انعكست عند 32%). اشحن قبل "
                     f"مهمة فيها لفّات كثيرة.")
+            elif v_now is None and getattr(self.rover, "mode", "sim") == "real":
+                # 🔴 المراقبة **مفعّلة ولا قراءة** — أي أن حارس الجهد ساقط
+                #    والحماية صارت الحدّ الزمني وحده (§6: حارس واحد = نقطة
+                #    فشل واحدة). وقبل هذا السطر كان السقوط **صامتاً**: لا
+                #    حاجب ولا تحذير، فتبدأ المهمة على طبقة واحدة بلا أن
+                #    يعلم المشغّل. والتحذير يحمل **سبب** التعذّر لا الغياب
+                #    وحده — بلا ذلك يستحيل تمييز ناقل مقطوع من لوح مفكوك.
+                # ⚠ وعلى جسر محاكاة لا يُعلَن: لا عتاد أصلاً، والتحذير هناك
+                #   ضجيج دائم يُدرَّب المشغّل على تجاهله (ومعه الحقيقي).
+                b_now = (self.rover.battery_state()
+                         if hasattr(self.rover, "battery_state") else {})
+                why = (b_now.get("source_reason")
+                       or f"المصدر: {b_now.get('source')}")
+                warnings.append(
+                    f"⚠ جهد حزمة الراسبري **غير معروف** ({why}) — حارس الجهد "
+                    f"ساقط والحماية صارت الحدّ الزمني وحده "
+                    f"({MISSION_TIME_LIMIT_S:.0f}ث). شخّصه: i2cdetect -y 1 "
+                    f"ثم python3 -m pi.tests.test_ina219")
+
+        # ⑧ 🔴 حزمة **المحركات** (2S) نطاق مستقلّ — وهي التي تُحرّك فعلاً:
+        #    نفادها يوقف الروبوت حيث هو ولا تُنقذه عودة (العودة تحتاج طاقة).
+        #    ⚠ ولا تُصنَّف بعتبات 3S أبداً (§2.0.1).
+        mp = (self.rover.motor_pack_state()
+              if hasattr(self.rover, "motor_pack_state")
+              else {"v": None, "action": None,
+                    "text": "الجسر لا يوفّر قراءة حزمة المحركات"})
+        mp_v, mp_act = mp.get("v"), mp.get("action")
+        if mp_v is None:
+            # ⚠ على جسر **محاكاة** لا معنى لإعلان قراءة غائبة: لا عتاد أصلاً،
+            #   والتحذير هناك ضجيج دائم يُدرَّب المشغّل على تجاهله (§2.0).
+            if getattr(self.rover, "mode", "sim") == "real":
+                warnings.append(
+                    f"⚠ جهد حزمة المحركات غير معروف "
+                    f"({mp.get('source_reason') or mp.get('text')}) — ابدأ "
+                    f"بحزمة مشحونة: python3 -m pi.tests.battery")
+        elif mp_act == batt.ACTION_RTH:
+            # حاجب لا تحذير — نفس علّة حاجب حزمة الراسبري: البدء داخل نطاق
+            # العودة الإجبارية يعني دورة بدء-وعودة بلا مسح.
+            blockers.append(
+                f"حزمة المحركات {mp_v:.2f}V ({mp_v / max(mp.get('cells') or 1, 1):.2f}V/خلية) "
+                f"داخل نطاق العودة الإجبارية (<{MOTOR_BATT_LOW_V}V) — "
+                f"المهمة ستبدأ لتعود فوراً. اشحن أولاً.")
+        elif mp_act == batt.ACTION_WARN:
+            warnings.append(
+                f"⚠ حزمة المحركات {mp_v:.2f}V منخفضة (<{MOTOR_BATT_GOOD_V}V) — "
+                f"اللفّ أول ما يسقط مع ضعفها (§6.2).")
         return {"ready": not blockers, "blockers": blockers,
                 "warnings": warnings,
                 "heading_ok": bool(src and getattr(src, "ok", False)),

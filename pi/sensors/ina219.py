@@ -65,10 +65,15 @@ class INA219Reader:
         self._bus = None
         self._lock = threading.Lock()
 
+        self._open()
+
+    def _open(self) -> bool:
+        """يفتح الناقل ويكتب الإعدادات. يضبط `ok`/`error` ولا يرمي."""
         if not _SMBUS_OK:
             self.error = "smbus2 غير مثبّتة (pip install smbus2)"
-            return
+            return False
         try:
+            self._close_bus()
             self._bus = SMBus(self.bus_num)
             # ⚠ الإعداد يُكتب **قبل** أول قراءة: بلا قياس مستمر يبقى السجل
             #    على قيمة قديمة أو صفر فتُقرأ بطارية «ميتة» وهي سليمة.
@@ -76,11 +81,24 @@ class INA219Reader:
                 self.addr, REG_CONFIG,
                 [(INA219_CONFIG_VALUE >> 8) & 0xFF, INA219_CONFIG_VALUE & 0xFF])
             self.ok = True
+            self.error = None
         except Exception as e:         # noqa: BLE001
+            self.ok = False
             self.error = (f"تعذّر فتح INA219 على i2c-{self.bus_num} "
                           f"@ {hex(self.addr)}: {e} — تحقّق بـ"
                           f"`i2cdetect -y {self.bus_num}`")
             self._close_bus()
+        return self.ok
+
+    def reopen(self) -> bool:
+        """
+        **أداة داخلية** يستدعيها الجسر بعد تهدئة: يُعيد محاولة الفتح.
+
+        🔴 العطل ليس أبدياً (§1.1): خطأ ناقل عابر عند الفتح كان يُسقط حارس
+           الجهد لعمر العملية، والحماية تصير الحدّ الزمني وحده **بصمت**.
+        """
+        with self._lock:
+            return self._open()
 
     def _close_bus(self) -> None:
         try:

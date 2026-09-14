@@ -3692,6 +3692,53 @@ def main() -> int:
           (_m_as.state_dict().get("background") or {}).get("source") == "assumed",
           f"{(_m_as.state_dict().get('background') or {}).get('cpm')} CPM")
 
+    print("\nح1-ب) حارسا البطارية في الجاهزية — حزمتان لا واحدة:")
+    # 🔴 حزمة الراسبري (3S/INA219) وحزمة المحركات (2S/ADS7830) نطاقان
+    #    مستقلّان (§2.0.1)، وسقوط أيّهما كان **صامتاً** في الجاهزية: تبدأ
+    #    المهمة على حارس واحد (الحدّ الزمني) بلا أن يعلم المشغّل.
+    from pi.rover import battery as _sbat
+    _m_bv = MissionSim()
+    _m_bv.configure_room(length_m=2, width_m=2, scan_spacing_m=1.0)
+    _m_bv.rover.mode = "real"          # الإعلان يخصّ العتاد لا المحاكاة
+    _m_bv.rover.voltage = lambda: None
+    _m_bv.rover.battery_state = lambda: {
+        "v": None, "percent": None, "source": "ina219",
+        "source_reason": "تعذّر فتح INA219 على i2c-1 @ 0x42: [Errno 5]"}
+    _w_bv = _m_bv.mission_readiness()["warnings"]
+    check("جهد الراسبري **مجهول** ⇒ تحذير صريح يحمل سببه (لا صمت)",
+          any("غير معروف" in x and "Errno 5" in x for x in _w_bv),
+          f"{len(_w_bv)} تحذيراً")
+    check("والتحذير يقول إن الحماية صارت الحدّ الزمني وحده",
+          any("الحدّ الزمني" in x for x in _w_bv))
+
+    _m_mp = MissionSim()
+    _m_mp.configure_room(length_m=2, width_m=2, scan_spacing_m=1.0)
+    _m_mp.rover.motor_pack_state = lambda: {
+        "v": 6.20, "cell_v": 3.10, "cells": 2, "level": "critical",
+        "action": _sbat.ACTION_RTH, "source": "ads7830"}
+    check("🔴 حزمة المحركات داخل نطاق العودة ⇒ **حاجب** لا تحذير "
+          "(البدء = دورة بدء-وعودة بلا مسح)",
+          any("حزمة المحركات" in b for b in _m_mp.mission_readiness()["blockers"]))
+    _m_mp.rover.motor_pack_state = lambda: {
+        "v": 7.10, "cell_v": 3.55, "cells": 2, "level": "low",
+        "action": _sbat.ACTION_WARN, "source": "ads7830"}
+    _rd_mp = _m_mp.mission_readiness()
+    check("ومنخفضة ⇒ تحذير لا حاجب (اللفّ أول ما يسقط §6.2)",
+          any("حزمة المحركات" in w for w in _rd_mp["warnings"])
+          and not any("حزمة المحركات" in b for b in _rd_mp["blockers"]))
+    _m_mp.rover.motor_pack_state = lambda: {
+        "v": None, "cells": 2, "level": "unknown",
+        "action": _sbat.ACTION_NONE, "source": "unavailable",
+        "text": "جهد المحركات غير معروف"}
+    _m_mp.rover.mode = "real"
+    check("وعلى جسر **حقيقي** بلا قراءة ⇒ تُعلَن مجهولة (§6.1)",
+          any("حزمة المحركات غير معروف" in w
+              for w in _m_mp.mission_readiness()["warnings"]))
+    _m_mp.rover.mode = "sim"
+    check("وعلى جسر محاكاة لا ضجيج: لا عتاد أصلاً فلا إعلان غياب",
+          not any("حزمة المحركات غير معروف" in w
+                  for w in _m_mp.mission_readiness()["warnings"]))
+
     print("\nع) حارس التوصيل:")
     import ast as _ast
     import pathlib as _pl
