@@ -1719,6 +1719,24 @@ def main() -> int:
           _ex2.imu is None and _w2.n == 0 and _w2.verdict is None,
           f"عيّنات={_w2.n} · حكم={_w2.verdict}")
 
+    # 🐞 **وإحياء المقبض كشف عطباً كامناً في سكربت المعايرة** (وُجد على
+    #    العتاد 2026-09-14): `calibrate_heading` كان ينادي `imu.euler_yaw()`
+    #    — واجهة **BNO055 وحدها** — وكان الفرع يُتخطّى صامتاً لأن المقبض
+    #    يعود `None` على مصادر MPU. فلمّا صار `imu` جزءاً من العقد أعلاه عاد
+    #    المقبض حيّاً فانفجر `AttributeError` عند **أول لفّة** من المعايرة.
+    #    ⇒ النداء صار خلف حارس يُعيد `None` لقطعة لا توفّره.
+    from pi.tests.calibrate_heading import _fused_yaw as _fy
+    from pi.sensors.mpu6050 import MPU6050Reader as _MpuR
+
+    class _YawIMU:
+        def euler_yaw(self): return 12.5
+
+    check("🔴 قراءة yaw المدموج محروسة: قطعة بلا `euler_yaw` ⇒ None لا انفجار",
+          _fy(_MpuR.__new__(_MpuR)) is None and _fy(None) is None
+          and not hasattr(_MpuR, "euler_yaw"))
+    check("ومع قطعة توفّره تُقرأ فعلاً (الحارس لا يُعمي المقارنة)",
+          _fy(_YawIMU()) == 12.5)
+
     # 🔴 **الأثر الحقيقي للعطل**: بلا مرجع أمامي (واقع هذا العتاد — لا
     #    ألترا سونيك بعد) يكون مقياس التسارع **الشاهد الوحيد**. فموته
     #    الصامت كان يُعطّل كاشف «الروبوت عالق» كلياً: الروبوت يقف مكانه

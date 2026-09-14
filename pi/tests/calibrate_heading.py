@@ -234,6 +234,28 @@ def stage1_bias(rover, seconds: float, interactive: bool = True) -> dict:
     return out
 
 
+def _fused_yaw(imu):
+    """
+    yaw المدموج داخلياً **إن كانت القطعة توفّره** — وإلا `None`.
+
+    🔴 `euler_yaw()` واجهة **BNO055 وحدها** (زاوية مطلقة من الدمج الداخلي).
+       ووحدة MPU جايرو خام بلا دمج، فلا مقابل لها.
+    🐞 وكان النداء مباشراً `imu.euler_yaw()` — وانفجر على العتاد 2026-09-14
+       بـ`AttributeError` عند أول لفّة. والسبب أن المقبض `imu` كان **يعود
+       None على مصادر MPU** فيُتخطّى الفرع صامتاً، حتى صار `imu` جزءاً من
+       عقد `HeadingSource` (§2.2) فعاد المقبض حيّاً… ونادى واجهة قطعة ميتة.
+       أي أن إصلاحاً صحيحاً في مكان **كشف** عطباً كامناً في مكان آخر.
+    ⚠ والمقارنة المدموجة ليست شرطاً للمعايرة: غيابها يُسقط سطر مقارنة لا أكثر.
+    """
+    fn = getattr(imu, "euler_yaw", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception:                      # noqa: BLE001 — مقارنة لا قياس
+        return None
+
+
 # ═══ المرحلة 2: معامل التحويل (GYRO_SCALE) ═══════════════════════
 def stage2_scale(rover, angle: float, trials: int, interactive: bool = True) -> dict:
     src = rover.heading_source
@@ -257,12 +279,12 @@ def stage2_scale(rover, angle: float, trials: int, interactive: bool = True) -> 
     for i in range(1, trials + 1):
         _pause(f"\n  [{i}/{trials}] مساحة دوران خالية؟ اضغط Enter للفّ "
                f"{angle:.0f}°… ", interactive)
-        yaw_before = imu.euler_yaw() if imu is not None else None
+        yaw_before = _fused_yaw(imu)
         src.reset(0.0)
         t0 = time.time()
         res = rover.turn_by_angle(angle)
         dur = time.time() - t0
-        yaw_after = imu.euler_yaw() if imu is not None else None
+        yaw_after = _fused_yaw(imu)
         fusion_delta = None
         if yaw_before is not None and yaw_after is not None:
             fusion_delta = (yaw_after - yaw_before + 180.0) % 360.0 - 180.0
