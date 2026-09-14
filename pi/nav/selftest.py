@@ -3710,6 +3710,24 @@ def main() -> int:
     finally:
         _bgm.effective = _orig_eff
         _mm._bg.effective = _orig_eff
+    # 🔴🔴 خلفية فوق السقف الطبيعي = **مصدر كان في المدى** لا مكان ساخن،
+    #    وقبولها يقلب النظام: كل قراءة تُطرح من مرجع يحوي المصدر نفسه ⇒
+    #    المصدر يختفي بقدر قوّته والمكان يُعلَن نظيفاً. (سُئل عنها صراحةً
+    #    2026-09-14: «أضع مصدراً أمامه وأعاير قبل الدخول؟».)
+    from pi.config import BACKGROUND_MAX_PLAUSIBLE_CPM as _BG_MAX
+    _hot = dict(_rec)
+    _hot["cpm"] = _BG_MAX * 3.0
+    _tmp_hot = _tmp + ".hot"
+    _bgm.save(_hot, _tmp_hot)
+    _eff_hot = _bgm.effective(path=_tmp_hot)
+    check("🔴 خلفية فوق السقف الطبيعي تُرفض بوصفها **مصدراً في المدى**",
+          not _eff_hot["ok"] and "مصدر" in _eff_hot["reason"],
+          f"{_eff_hot['cpm']} CPM · سقف {_BG_MAX}")
+    check("والسقف **مشتقّ من K** لا مكتوب (0.5 µSv/h × المعامل المخبري)",
+          abs(_BG_MAX - 0.5 * 111.0) < 0.11, f"{_BG_MAX}")
+    check("والمقاس الحقيقي 19.60 CPM يمرّ بمريح دون السقف",
+          19.60 < _BG_MAX, f"19.60 مقابل {_BG_MAX}")
+
     _m_as = MissionSim()
     _m_as.configure_room(length_m=2, width_m=2, scan_spacing_m=1.0)
     check("🔴 وبلا قياس: تحذير صريح في الجاهزية (لا صمت)",
