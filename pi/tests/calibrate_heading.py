@@ -539,6 +539,27 @@ def _save(payload: dict) -> str:
     return path
 
 
+# 🔴 كل مصدر يقرأ **ثابت معامله هو**، والاسم يُشتقّ من المصدر الفعّال
+#    لا يُكتب. (مقاس 2026-09-14: كان السكربت يوصي بلصق النتيجة في
+#    `GYRO_SCALE` — ثابت جايرو Wave Rover الميت الذي لا يقرأه أحد —
+#    بينما المصدر الحيّ `mpu6050` يقرأ `MPU6050_GYRO_SCALE`. فمعايرة
+#    صحيحة تماماً تُكتب في رقم ميت، والاتجاه يبقى على 1.000 والمشغّل
+#    يظنّ أنه عاير. اسمٌ مكتوب يدوياً يتخلّف عن تبديل القطعة دائماً.)
+_SCALE_CONST_BY_SOURCE = {
+    "mpu6050": "MPU6050_GYRO_SCALE",
+    "bno055_gyro": "BNO055_GYRO_SCALE",      # صحّة-مسموح: خريطة لا إرشاد
+    "bno055_fusion": "BNO055_GYRO_SCALE",    # صحّة-مسموح: خريطة لا إرشاد
+    "rover_gyro": "GYRO_SCALE",              # صحّة-مسموح: خريطة لا إرشاد
+}
+
+
+def _scale_const_name(src_name: str) -> str:
+    """اسم ثابت المعامل الذي يقرأه المصدر الفعّال — ومجهولٌ يُعلَن لا يُخمَّن."""
+    return _SCALE_CONST_BY_SOURCE.get(
+        str(src_name or "").strip().lower(),
+        f"<معامل المصدر «{src_name}» غير معروف — راجع pi/sensors/heading.py>")
+
+
 def _print_config_lines(payload: dict) -> None:
     print("\n" + "═" * 62)
     print("أسطر config الجاهزة (راجعها بعينك ثم الصقها في pi/config.py):")
@@ -556,9 +577,10 @@ def _print_config_lines(payload: dict) -> None:
         print(f"  HEADING_DEADBAND_DPS = {s1['suggested_deadband_dps']}   "
               f"# 3σ مقاس ({s1['sigma_dps']}) على {src}")
     if s2.get("suggested_scale"):
-        # 🔴 المصدر الوحيد mpu6050 (BNO055 تالفة §0) — الثابت الحيّ واحد
-        print(f"  GYRO_SCALE = {s2['suggested_scale']}   "
+        # 🔴 الاسم من **المصدر الفعّال** لا مكتوباً (انظر _scale_const_name)
+        print(f"  {_scale_const_name(src)} = {s2['suggested_scale']}   "
               f"# وسيط {len(s2.get('trials', []))} لفّات × {s2.get('angle')}°")
+        print(f"     (ثابت المصدر «{src}» — وليس أي معامل جايرو آخر في config)")
     if s3.get("suggested_kp"):
         print(f"  HEADING_KP = {s3['suggested_kp']}       "
               f"# أدنى خطأ بلا تذبذب عند {s3['best_run']['loop_hz']} دورة/ث")
@@ -607,10 +629,10 @@ def main(argv=None) -> int:
         print(f"  ⚠ {rover.error}")
     if getattr(src, "fallback_reason", None):
         print(f"  {src.fallback_reason}")
-    # ⚠ BNO055 قطعة ميتة — تُعرض للتوثيق لا للتعديل (§0)
-    print(f"  المعامل الحيّ: GYRO_SCALE={GYRO_SCALE} (⚠ غير معاير على "
-          f"Freenove) · KP={HEADING_KP} · KD={HEADING_KD} · "
-          f"MAX_CORR={HEADING_MAX_CORR}")
+    # 🔴 المعامل يُقرأ من **الكائن الحيّ** (`src.scale`) لا من ثابت مكتوب:
+    #    ثابتٌ باسم خاطئ يعرض رقماً لا علاقة له بما يجري في التكامل فعلاً.
+    print(f"  المعامل الحيّ: {_scale_const_name(src.name)}={src.scale} "
+          f"· KP={HEADING_KP} · KD={HEADING_KD} · MAX_CORR={HEADING_MAX_CORR}")
 
     if not BATTERY_MONITOR_ENABLED:
         print(f"  ⚠ مراقبة الجهد معطّلة — ابدأ ببطارية مشحونة (الحماية زمنية: "
@@ -632,8 +654,10 @@ def main(argv=None) -> int:
     payload = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                "source": src.name, "requested_source": HEADING_SOURCE,
                "rover_mode": rover.mode, "stages": stages,
+               "scale_const": _scale_const_name(src.name),
                "config_before": {
-                   "GYRO_SCALE": GYRO_SCALE,
+                   # 🔴 المعامل **الحيّ** بقيمته واسم ثابته — لا ثابت ميت
+                   "live_scale": src.scale,
                    "HEADING_DEADBAND_DPS": HEADING_DEADBAND_DPS,
                    "HEADING_KP": HEADING_KP, "HEADING_KD": HEADING_KD,
                    "HEADING_MAX_CORR": HEADING_MAX_CORR,

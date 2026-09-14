@@ -248,7 +248,7 @@ def main() -> int:
           not _hyg, "؛ ".join(_hyg)[:110] if _hyg else "نظيف")
     # ويُثبَت أنه **يكشف** لا أنه يمرّ: حارس لا يفشل أبداً ليس حارساً.
     check("والحارس يكشف التكرار فعلاً (لا يمرّ لأنه أعمى)",
-          len(_cfg_hygiene("A = 1\nGYRO_SCALE = 0.9\nGYRO_SCALE = 0.9\n")) == 1)
+          len(_cfg_hygiene("A = 1\nGYRO_SCALE = 0.9\nGYRO_SCALE = 0.9\n")) == 1)  # صحّة-مسموح: نصّ اختبار يُغذّى للحارس
     check("ويكشف ثابتاً مشتقّاً كُتب رقماً",
           len(_cfg_hygiene("HEADING_SPIKE_DPS_STEER = 120.0\n")) == 1)
 
@@ -471,10 +471,20 @@ def main() -> int:
 
     # ═══ باتش ما قبل التشغيل: الجايرو + التجزئة + التفعيل ═════════
     print("\nط) معامل الجايرو وتجزئة اللفّ:")
-    from pi.config import GYRO_SCALE, MAX_TURN_SEGMENT_DEG
+    from pi.config import GYRO_SCALE, MAX_TURN_SEGMENT_DEG, MPU6050_GYRO_SCALE
+    from pi.sensors.heading import MPU6050GyroHeading
+    from pi.sensors.mpu6050 import MPU6050Reader as _MpuReader
     from pi.rover.bridge import robust_bias
 
-    check("GYRO_SCALE محدّث إلى 0.9275", GYRO_SCALE == 0.9275)
+    # 🔴 **الثابت الحيّ هو ما يُثبَّت** — لا `GYRO_SCALE` (جايرو Wave Rover
+    #    الميت): معايرة 2026-09-14 كانت ستُكتب فيه فتضيع بلا أثر.
+    _live_src = MPU6050GyroHeading(_MpuReader.__new__(_MpuReader))
+    check("🔴 معامل المصدر الحيّ من MPU6050_GYRO_SCALE لا من GYRO_SCALE",  # صحّة-مسموح: تحذير **من** الثابت الميت لا إرشاد إليه
+          _live_src.scale == MPU6050_GYRO_SCALE
+          and MPU6050_GYRO_SCALE != GYRO_SCALE,
+          f"حيّ={_live_src.scale} · ميت={GYRO_SCALE}")  # صحّة-مسموح: عرض الفارق
+    check("وهو **مقاس** لا اسمي (3 لفّات × 180°، 2026-09-14)",
+          abs(MPU6050_GYRO_SCALE - 0.9918) < 1e-9, f"{MPU6050_GYRO_SCALE}")
 
     # الانحياز بالوسيط: عينتان شاذتان من 320 لا تُفسدانه
     clean = [-0.28 + (i % 7 - 3) * 0.1 for i in range(318)]

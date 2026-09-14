@@ -45,10 +45,21 @@ DERIVED_NAMES = ("HEADING_SPIKE_DPS_STEER",)
 #: إلى تعديل رقم لا يقرأه أحد. وأخطرها `BNO055_GYRO_Z_SIGN`: كان
 #: `check_directions` يقارن الإشارة المقاسة به، و`bridge` يطلب مراجعته
 #: عند `sign_mismatch` — وهو بالضبط ما تمنعه القاعدة §2.
-DEAD_PART_NAMES = ("BNO055_GYRO_Z_SIGN", "BNO055_GYRO_SCALE")
+#: 🔴 و`GYRO_SCALE` معها: مستهلكه الوحيد `RoverGyroHeading` (جايرو
+#: Wave Rover الداخلي — منصّة ميتة)، والمصدر الحيّ `mpu6050` يقرأ
+#: `MPU6050_GYRO_SCALE`. ومقاس 2026-09-14 أن `calibrate_heading` كان
+#: يوصي بلصق نتيجة معايرة **صحيحة** فيه ⇒ الرقم يُكتب ولا يُقرأ، والاتجاه
+#: يبقى على 1.000 والمشغّل يظنّ أنه عاير. وهذا أسوأ من خطأ صريح: **معايرة
+#: تبدو ناجحة ولا تغيّر شيئاً**.
+DEAD_PART_NAMES = ("BNO055_GYRO_Z_SIGN", "BNO055_GYRO_SCALE", "GYRO_SCALE")
 
 #: الملفات التي يُمنع فيها **الإرشاد** إلى ثابت قطعة ميتة
 _SCRIPT_DIRS = ("pi/tests", "pi/rover", "pi/nav")
+
+#: إعفاء سطر بعينه — **معلَن وقابل للبحث** لا استثناء مخبّأ في الحارس.
+#: يُستعمل حيث يكون الاسم **بياناً لا إرشاداً**: خريطة «مصدر → ثابته»،
+#: أو نصّ اختبار يُغذّى للحارس نفسه. وأي إعفاء بلا هذا السبب غشّ للحارس.
+ALLOW_MARK = "صحّة-مسموح"
 
 _ASSIGN = re.compile(r"^([A-Z_][A-Z0-9_]*)\s*=")
 _LITERAL = re.compile(r"^[A-Z_][A-Z0-9_]*\s*=\s*-?[\d.]+\s*(#.*)?$")
@@ -112,10 +123,17 @@ def dead_part_guidance(root: str = None) -> dict:
                 st = line.strip()
                 if st.startswith("#"):
                     continue              # تعليق = توثيق مشروع
+                if ALLOW_MARK in line:
+                    continue              # إعفاء **معلَن** لا صمت (انظر أعلاه)
                 for name in DEAD_PART_NAMES:
-                    if name in line and ('"' in line or "'" in line):
+                    # 🐞 **بحدود الكلمة**: بلا ذلك يبتلع `GYRO_SCALE`
+                    #    اسمَ `MPU6050_GYRO_SCALE` الحيّ فيُبلّغ عن الثابت
+                    #    الصحيح كأنه ميت — وحارسٌ يُنذر كذباً يُدرَّب الناس
+                    #    على تجاهله (نفس علّة تحذير خريطة المحركات §2.0).
+                    m = re.search(r"(?<![A-Z0-9_])" + name + r"(?![A-Z0-9_])", line)
+                    if m and ('"' in line or "'" in line):
                         # داخل سلسلة نصية ⇒ يُطبع للمشغّل
-                        before = line.split(name)[0]
+                        before = line[:m.start()]
                         if before.count('"') % 2 == 1 or before.count("'") % 2 == 1:
                             hits.append((i, name))
             if hits:
@@ -145,7 +163,7 @@ def run(text: str = None) -> list:
         for ln, name in hits:
             problems.append(
                 f"🔴 `{path}` س{ln} يُرشد المشغّل إلى `{name}` — ثابت "
-                f"**قطعة ميتة** (BNO055 تلفت، §0)")
+                f"**قطعة/منصّة ميتة** لا يقرأه أي مصدر حيّ (§0)")
     return problems
 
 
