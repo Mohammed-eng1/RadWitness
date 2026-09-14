@@ -3738,6 +3738,43 @@ def main() -> int:
           (_m_as.state_dict().get("background") or {}).get("source") == "assumed",
           f"{(_m_as.state_dict().get('background') or {}).get('cpm')} CPM")
 
+    print("\nح1-أ) الحدود الزمنية: ترتيب مفروض ورفعٌ معلَن:")
+    # 🔴 الحدّ الزمني حارس سلامة، ومع تعذّر INA219 هو **الوحيد** على حزمة
+    #    الراسبري. فرفعه مشروع لتجربة لكنه **لا يكون صامتاً**، وترتيبه
+    #    يُفرض لا يُفترض: صلبٌ دون حدّ العودة يُلغي العودة كلياً.
+    import importlib as _il
+    import os as _os2
+    import pi.config as _cfg
+    _old_env = {k: _os2.environ.get(k) for k in
+                ("RMS_MISSION_TIME_LIMIT_S", "RMS_MISSION_HARD_LIMIT_S",
+                 "RMS_MISSION_TIME_WARN_S")}
+    try:
+        _os2.environ["RMS_MISSION_TIME_LIMIT_S"] = "1800"
+        _os2.environ.pop("RMS_MISSION_HARD_LIMIT_S", None)
+        _c = _il.reload(_cfg)
+        check("🔴 صلبٌ دون حدّ العودة يُرفع فوقه (وإلا فُقدت العودة كلياً)",
+              _c.MISSION_HARD_LIMIT_S > _c.MISSION_TIME_LIMIT_S,
+              f"عودة={_c.MISSION_TIME_LIMIT_S:.0f} صلب={_c.MISSION_HARD_LIMIT_S:.0f}")
+        check("والرفع يُعلَن علماً صريحاً لا يُستنتج",
+              _c.MISSION_TIME_LIMITS_RAISED is True)
+        _os2.environ["RMS_MISSION_TIME_LIMIT_S"] = "0"
+        _c = _il.reload(_cfg)
+        check("🔴 و«بلا حدّ» (صفر/سالب) مرفوض — يسقط إلى الافتراضي الآمن",
+              _c.MISSION_TIME_LIMIT_S == 480.0
+              and _c.MISSION_TIME_LIMITS_RAISED is False,
+              f"{_c.MISSION_TIME_LIMIT_S:.0f}ث")
+    finally:
+        for k, v in _old_env.items():
+            if v is None:
+                _os2.environ.pop(k, None)
+            else:
+                _os2.environ[k] = v
+        _il.reload(_cfg)
+    check("والافتراضي يعود بعد رفع التجاوز (لا تسرّب بين الجلسات)",
+          _cfg.MISSION_TIME_LIMIT_S == 480.0
+          and _cfg.MISSION_TIME_LIMITS_RAISED is False,
+          f"{_cfg.MISSION_TIME_LIMIT_S:.0f}ث")
+
     print("\nح1-ب) حارسا البطارية في الجاهزية — حزمتان لا واحدة:")
     # 🔴 حزمة الراسبري (3S/INA219) وحزمة المحركات (2S/ADS7830) نطاقان
     #    مستقلّان (§2.0.1)، وسقوط أيّهما كان **صامتاً** في الجاهزية: تبدأ

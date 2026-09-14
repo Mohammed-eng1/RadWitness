@@ -31,7 +31,8 @@ from pi.config import (
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
     GEIGER_WINDOW_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
-    MISSION_HARD_LIMIT_S, BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
+    MISSION_HARD_LIMIT_S, MISSION_TIME_LIMITS_RAISED,
+    BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
     BATT_SHUTDOWN_ENABLED, MOTION_TRUST_MEASURED, MOTION_STUCK_LIMIT,
     MOTION_CELL_ENTER_TOL_M, UNCERTAINTY_INITIAL, DWELL_MAX_S, IR_PRESENT,
     HEADING_SIGMA_PER_TURN_DEG,
@@ -2308,6 +2309,16 @@ class MissionSim:
                     f"ساقط والحماية صارت الحدّ الزمني وحده "
                     f"({MISSION_TIME_LIMIT_S:.0f}ث). شخّصه: i2cdetect -y 1 "
                     f"ثم python3 -m pi.tests.test_ina219")
+
+        # ⑦ب 🔴 رفع الحدّ الزمني **يُعلَن** — إضعاف حارس بصمت ممنوع.
+        #     والساعة زمن حائط من بدء المهمة، فالرفع يعني أن الروبوت قد يبقى
+        #     يقود عشرات الدقائق بلا أي حارس على حزمة الراسبري إن تعذّر INA219.
+        if MISSION_TIME_LIMITS_RAISED:
+            warnings.append(
+                f"⚠⚠ الحدّ الزمني **مرفوع بمتغيّر بيئة**: عودة إجبارية عند "
+                f"{MISSION_TIME_LIMIT_S:.0f}ث وإيقاف عند "
+                f"{MISSION_HARD_LIMIT_S:.0f}ث (الافتراضي 480/600). "
+                f"هذا يُضعف حارساً — لا تتركه مرفوعاً بعد التجربة.")
 
         # ⑧ 🔴 حزمة **المحركات** (2S) نطاق مستقلّ — وهي التي تُحرّك فعلاً:
         #    نفادها يوقف الروبوت حيث هو ولا تُنقذه عودة (العودة تحتاج طاقة).
