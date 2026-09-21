@@ -109,8 +109,19 @@ class Link:
             if time.monotonic() >= t_end:
                 return
 
+    def drain(self):
+        """يرمي كل ما تراكم قبل السؤال. الردّ **القديم** أخطر من غياب الردّ:
+        إطاراً بثٍّ متراكماً أو ردّاً وصل بعد انتهاء مهلته يجعل كل قراءة
+        لاحقة متأخّرة إطاراً كاملاً، فتقرأ حالةً مضت وتظنّها الآن."""
+        self._buf = b""
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+
     def ask(self, cmd, want_t, seconds):
         """يرسل أمراً وينتظر ردّاً بـT المطلوب. يعيد (كائن، زمن الردّ، أسطر شاردة)."""
+        self.drain()
         strays = []
         t0 = time.monotonic()
         self.send(cmd)

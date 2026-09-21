@@ -117,7 +117,18 @@ class Link:
             if time.monotonic() >= t_end:
                 return
 
+    def drain(self):
+        """يرمي كل ما تراكم قبل السؤال. الردّ **القديم** أخطر من غياب الردّ:
+        إطاراً بثٍّ متراكماً أو ردّاً وصل بعد انتهاء مهلته يجعل كل قراءة
+        لاحقة متأخّرة إطاراً كاملاً، فتقرأ حالةً مضت وتظنّها الآن."""
+        self._buf = b""
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+
     def ask(self, cmd, want_t, seconds):
+        self.drain()
         strays = []
         t0 = time.monotonic()
         self.send(cmd)
@@ -251,6 +262,37 @@ def watch_until_stopped(link, last_cmd_t, watch_s, writer, phase):
     return stop_ms, samples
 
 
+def watch_until_stopped_polled(link, last_cmd_t, watch_s, writer, phase, interval):
+    """بديل **ملوَّث** حين لا يعمل البثّ: يستعلم دورياً بدل أن يصمت.
+
+    الاستعلام نفسه قد يجدّد مؤقّت النبضة، فنتيجته لا تُقرأ كنتيجة البثّ:
+    توقُّفٌ رغم الاستعلام قياسٌ صالح، وعدمُ توقّف **ملتبس** لا يميّز بين
+    «الاستعلام يجدّد المؤقّت» و«الحارس لا يعمل».
+    """
+    samples = []
+    streak = 0
+    stop_ms = None
+    t_end = time.monotonic() + watch_s
+    while time.monotonic() < t_end:
+        obj, _, _ = link.ask({"T": 130}, 1001, 0.3)
+        if obj is not None:
+            left, right = num(obj.get("L")), num(obj.get("R"))
+            if left is not None and right is not None:
+                now = time.monotonic()
+                ms = (now - last_cmd_t) * 1000.0
+                samples.append((now, left, right))
+                writer.writerow([phase, round(ms, 1), left, right])
+                if abs(left) <= STOPPED_MPS and abs(right) <= STOPPED_MPS:
+                    streak += 1
+                    if streak >= STOPPED_STREAK and stop_ms is None:
+                        stop_ms = (samples[-STOPPED_STREAK][0] - last_cmd_t) * 1000.0
+                        break
+                else:
+                    streak = 0
+        time.sleep(interval)
+    return stop_ms, samples
+
+
 def stream_period_ms(samples):
     """فترة البثّ المرصودة = دقّة القياس. رقمٌ بلا مقياسه ادّعاء."""
     if len(samples) < 3:
@@ -365,21 +407,32 @@ def main():
 
         period = stream_period_ms(samples)
         # ── المرحلة ب: صمت تام ────────────────────────────────────────
-        print("\n[5] المرحلة ب: **صمت تام** — لا بايت واحد نحو اللوحة.")
-        print("    مراقبة L/R حتى تصفر (حدّ %.1fث)…" % a.watch)
-        stop_ms, watch_samples = watch_until_stopped(
-            link, last_cmd, a.watch, writer, "silence")
+        if stream_alive:
+            print("\n[5] المرحلة ب: **صمت تام** — لا بايت واحد نحو اللوحة.")
+            print("    مراقبة L/R في البثّ حتى تصفر (حدّ %.1fث)…" % a.watch)
+            stop_ms, watch_samples = watch_until_stopped(
+                link, last_cmd, a.watch, writer, "silence")
+            if period is None:
+                period = stream_period_ms(watch_samples)
+        else:
+            print("\n[5] المرحلة ب: لا بثّ ⇒ مراقبة بالاستعلام (منهج ملوَّث).")
+            print("    مراقبة L/R كل %.1fث حتى تصفر (حدّ %.1fث)…" % (0.3, a.watch))
+            stop_ms, watch_samples = watch_until_stopped_polled(
+                link, last_cmd, a.watch, writer, "silence_polled", 0.3)
+            period = None
         fh.flush()
-
-        if period is None:
-            period = stream_period_ms(watch_samples)
 
         # ── المرحلة ج (اختيارية): هل T:130 يجدّد النبضة؟ ──────────────
         poll_kept_alive = None
         if a.probe_poll:
             print("\n[6] المرحلة ج: هل استعلام T:130 وحده يُبقي المحركات حيّة؟")
+            # 🔴 يُطفأ البثّ هنا: السؤال هو «هل الاستعلام وحده يكفي»، وبثٌّ
+            # يعمل بالتوازي يملأ المخزن بإطارات تُقرأ بعد حين فتبدو حيّة.
+            link.send({"T": 131, "cmd": 0})
+            time.sleep(0.3)
             hard_stop(link)
-            time.sleep(0.5)
+            time.sleep(0.8)
+            link.drain()
             t0 = time.monotonic()
             last_cmd = 0.0
             while time.monotonic() - t0 < min(a.timeout, 2.0):
@@ -388,6 +441,7 @@ def main():
                 for _ in link.lines(0.2):
                     pass
             print("    الآن: لا أوامر حركة — استعلام T:130 كل 500ms لمدة 5ث…")
+            print("    (البثّ مطفأ، وكل استعلام يبدأ من مخزن نظيف.)")
             alive_after = []
             t0 = time.monotonic()
             while time.monotonic() - t0 < 5.0:
@@ -409,12 +463,23 @@ def main():
         # ── الحكم ───────────────────────────────────────────────────────
         ok = stop_ms is not None
         reasons = []
-        if period:
+        if stream_alive and period:
             reasons.append("فترة البثّ المرصودة (= دقّة القياس): %.0f ms" % period)
-        if stop_ms is None:
-            reasons.append("🔴 المحركات **لم تتوقف** خلال %.1fث من الصمت." % a.watch)
-            reasons.append("   حارس النبضة لا يعمل كما هو موصوف ⇒ لا تعتمد عليه")
-            reasons.append("   كطبقة سلامة حتى يُفهم السبب. (أُرسل إيقاف قسري.)")
+        if stop_ms is None and not watch_samples:
+            reasons.append("🔴 **لم تصل أي عيّنة** أثناء مرحلة الصمت.")
+            reasons.append("   هذا ليس «المحركات لم تتوقف» — نحن لم نرَ شيئاً أصلاً،")
+            reasons.append("   فلا قياس هنا لا سلباً ولا إيجاباً. شغّل test_link.")
+        elif stop_ms is None and stream_alive:
+            reasons.append("🔴 المحركات **لم تتوقف** خلال %.1fث من صمت تام." % a.watch)
+            reasons.append("   القياس نظيف (بثّ، بلا أي بايت خارج) ⇒ حارس النبضة لا")
+            reasons.append("   يعمل كما هو موصوف. لا تعتمد عليه كطبقة سلامة حتى يُفهم")
+            reasons.append("   السبب. (أُرسل إيقاف قسري.)")
+        elif stop_ms is None:
+            reasons.append("⚠ المحركات لم تتوقف خلال %.1fث — والنتيجة **ملتبسة**:"
+                           % a.watch)
+            reasons.append("   القياس تمّ بالاستعلام، فلا تمييز بين «الاستعلام يجدّد")
+            reasons.append("   المؤقّت» و«الحارس لا يعمل». أصلح البثّ (T:131) أولاً،")
+            reasons.append("   أو شغّل --probe-poll للإجابة عن الشقّ الأول وحده.")
         else:
             reasons.append("✅ توقّفت المحركات بعد **%.0f ms** من آخر أمر." % stop_ms)
             reasons.append("   (المواصفة تقول ~3000 ms — هذا هو المقاس على جهازك،")

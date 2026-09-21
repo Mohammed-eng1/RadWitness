@@ -119,7 +119,18 @@ class Link:
             if time.monotonic() >= t_end:
                 return
 
+    def drain(self):
+        """يرمي كل ما تراكم قبل السؤال. الردّ **القديم** أخطر من غياب الردّ:
+        إطاراً بثٍّ متراكماً أو ردّاً وصل بعد انتهاء مهلته يجعل كل قراءة
+        لاحقة متأخّرة إطاراً كاملاً، فتقرأ حالةً مضت وتظنّها الآن."""
+        self._buf = b""
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+
     def ask(self, cmd, want_t, seconds):
+        self.drain()
         strays = []
         t0 = time.monotonic()
         self.send(cmd)
@@ -208,7 +219,10 @@ class Keepalive(threading.Thread):
         self.period = period_s
         self._cmd = dict(STOP_CMD)
         self._cmd_lock = threading.Lock()
-        self._stop = threading.Event()
+        # ⚠ الاسم `_stop_evt` لا `_stop`: ‏threading.Thread يملك `_stop()`
+        # داخلياً ويستدعيها join()، فتظليلها بـEvent يجعل join يرمي
+        # TypeError — **داخل finally وقبل الإيقاف**، فتبقى المحركات تدور.
+        self._stop_evt = threading.Event()
 
     def set_speed(self, left, right):
         with self._cmd_lock:
@@ -216,7 +230,7 @@ class Keepalive(threading.Thread):
         self.link.send(self._cmd)
 
     def run(self):
-        while not self._stop.wait(self.period):
+        while not self._stop_evt.wait(self.period):
             with self._cmd_lock:
                 cmd = dict(self._cmd)
             try:
@@ -225,7 +239,7 @@ class Keepalive(threading.Thread):
                 pass
 
     def shutdown(self):
-        self._stop.set()
+        self._stop_evt.set()
 
 
 def sample_phase(link, label, seconds, writer, rejects):
@@ -403,9 +417,18 @@ def main():
         print("\nأُوقف بـCtrl+C — يُرسل الإيقاف الآن.")
         return 2
     finally:
+        # لا استثناء يعبر مسار الإيقاف: كل خطوة معزولة، والإيقاف يُنفَّذ
+        # مهما فشل ما قبله.
         if keeper:
-            keeper.shutdown()
-            keeper.join(timeout=2.0)
+            try:
+                keeper.set_speed(0, 0)   # أي إرسال متأخّر من الخيط يصير إيقافاً
+            except Exception:
+                pass
+            try:
+                keeper.shutdown()        # أوقف التجديد قبل الإيقاف النهائي
+                keeper.join(timeout=2.0)
+            except Exception:
+                pass
         try:
             hard_stop(link)
         except Exception:
