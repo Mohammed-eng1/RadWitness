@@ -3,7 +3,8 @@
 """
 test_battery.py — الجهد تحت الحمل: كم يهبط، ومتى يعود؟
 ================================================================================
-🔴 الروبوت **على الأرض** في مساحة خالية (أو --lifted مع قبول قراءة متفائلة).
+🔴 الروبوت **على الأرض** في مساحة خالية (--floor، وهو الافتراضي)، أو --lifted
+مع قبول قراءة متفائلة.
 
 جهد ساكن لا يقول شيئاً مفيداً. البطارية تنهار تحت **الحمل**، والدوران بالمكان
 أثقل مناورة ممكنة: أربعة محركات تعمل معاً ضدّ احتكاك جانبي كامل. فهو أوّل ما
@@ -25,13 +26,20 @@ test_battery.py — الجهد تحت الحمل: كم يهبط، ومتى يع�
 أصلاً، فالرقم حينها خطأ قياس لا حالة بطارية — وقبوله يصنع إنذاراً كاذباً أخطر
 من غياب القراءة.
 
+🔴 **هبوط < 0.02 فولت تحت لفّ بالمكان ليس «بطارية ممتازة»**: جلسة 2026-09-23
+قرأت 11.303 فولت **بالضبط** قبل الحمل وأثناءه (أربعة محركات تدور فعلاً)،
+ولم يتغيّر v إلا مرة واحدة في 13 ثانية. أي أن حقل v في T:1001 قد لا يُحدَّث
+بمعدّل يرى الحمل أصلاً. فيُطبع تحذير صريح: «قيمة v قد تكون غير محدّثة — لا
+تُعتمد لحماية الجهد»، ومعه عدد مرات تغيّر v خلال الجلسة.
+
 ⚠ العتبات أدناه موروثة من منصّة 3S السابقة وتُمرَّر كخيارات: تحقّق من مواصفة
-حزمة UGV01 قبل الاعتماد عليها.
+حزمة UGV01 قبل الاعتماد عليها. (عتبة الرفض اسمها --min-volts؛ و--floor صار
+يعني «على الأرض» كما في test_encoder.)
 
 الأمان: تأكيد "yes" · --timeout حدّ مرحلة الحمل · finally يرسل الإيقاف دائماً.
 
 التشغيل:
-    python3 -m pi.tests.ugv01.test_battery
+    python3 -m pi.tests.ugv01.test_battery --floor
     python3 -m pi.tests.ugv01.test_battery --lifted --load-seconds 3
 """
 from __future__ import annotations
@@ -80,6 +88,7 @@ STOP_CMD = {"T": 1, "L": 0, "R": 0}
 MAX_SPEED_MPS = 0.5
 RESEND_MS = 800
 V_SANE_MIN, V_SANE_MAX = 5.0, 14.0     # خارجها: خطأ قياس لا حالة بطارية
+STALE_SAG_V = 0.02    # هبوط دونه تحت لفّ بالمكان ⇒ v على الأرجح غير محدَّث
 
 
 def find_port(explicit=None):
@@ -299,11 +308,14 @@ def main():
     ap.add_argument("--speed", type=float, default=0.2, help="م/ث لكل عجلة في الدوران")
     ap.add_argument("--timeout", type=float, default=3.0,
                     help="الحدّ الأقصى الصارم لمرحلة الحمل (ث)")
-    ap.add_argument("--lifted", action="store_true",
-                    help="الروبوت مرفوع — الحمل أخفّ والهبوط سيبدو متفائلاً")
+    where = ap.add_mutually_exclusive_group()
+    where.add_argument("--floor", action="store_true",
+                       help="الروبوت على الأرض مع لفّ بالمكان (الافتراضي — للتصريح)")
+    where.add_argument("--lifted", action="store_true",
+                       help="الروبوت مرفوع — الحمل أخفّ والهبوط سيبدو متفائلاً")
     ap.add_argument("--warn-below", type=float, default=11.0,
                     help="تحذير إن نزل خطّ الأساس عنه (موروث من منصّة 3S)")
-    ap.add_argument("--floor", type=float, default=10.0,
+    ap.add_argument("--min-volts", type=float, default=10.0,
                     help="رفض إن نزل الجهد تحت الحمل عنه (موروث من منصّة 3S)")
     a = ap.parse_args()
 
@@ -411,23 +423,31 @@ def main():
         if rejects:
             reasons.append("قراءات مرفوضة (خارج %.0f–%.0f فولت أو بلا v): %d — عُدّت"
                            " ولم تدخل الإحصاء." % (V_SANE_MIN, V_SANE_MAX, len(rejects)))
-        if load_min < a.floor:
+        all_v = base + load + recovery
+        changes = sum(1 for v0, v1 in zip(all_v, all_v[1:]) if v1 != v0)
+        stale = sag < STALE_SAG_V
+        reasons.append("تغيّر v خلال الجلسة: %d مرة في %d قراءة (%d قيمة مختلفة)"
+                       % (changes, len(all_v), len(set(all_v))))
+        if stale:
+            reasons.append("⚠ الهبوط %.3f فولت < %.2f تحت لفّ بالمكان:" % (sag, STALE_SAG_V))
+            reasons.append("   «قيمة v قد تكون غير محدّثة — لا تُعتمد لحماية الجهد».")
+        if load_min < a.min_volts:
             ok = False
             reasons.append("🔴 الجهد تحت الحمل %.2f نزل تحت الحدّ %.2f فولت."
-                           % (load_min, a.floor))
+                           % (load_min, a.min_volts))
             reasons.append("   لا تُكمل اختبارات الحركة قبل الشحن.")
         elif base_mean < a.warn_below:
             reasons.append("⚠ خطّ الأساس %.2f دون %.2f فولت: البطارية ليست ممتلئة."
                            % (base_mean, a.warn_below))
             reasons.append("   على المنصّة السابقة انعكست لفّة مهمة كاملة عند 11.04")
             reasons.append("   فولت والبطارية «تعمل» — فلا تُعاير حركةً على هذا الشحن.")
-        else:
+        elif not stale:
             reasons.append("✅ الجهد بقي فوق الحدود طوال الحمل.")
         if a.lifted:
             reasons.append("⚠ قيس والروبوت **مرفوع**: الحمل الحقيقي على الأرض أثقل")
             reasons.append("   والهبوط الفعلي أكبر من %.2f فولت. أعده على الأرض." % sag)
         reasons.append("⚠ العتبات (%.1f تحذير · %.1f رفض) موروثة من منصّة 3S — تحقّق"
-                       % (a.warn_below, a.floor))
+                       % (a.warn_below, a.min_volts))
         reasons.append("   من مواصفة حزمة UGV01 قبل الاعتماد عليها.")
         reasons.append("السجل: " + path)
         return verdict(ok, reasons)
