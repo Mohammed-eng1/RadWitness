@@ -18,14 +18,20 @@ test_imu.py — هل جايرو UGV01 حيّ؟  (لا يحرّك شيئاً)
   • معدل القراءة (هرتز)
   • σ و المتوسّط لـ gx/gy/gz  ← الحكم على σ(gz)
   • أطول سلسلة أصفار مضبوطة متتابعة في gz (تعليق مؤقّت لا يظهر في σ)
-  • مقدار الجاذبية من ax,ay,az — يجب أن يقع بين 9.0 و10.6
+  • مقدار الجاذبية من ax,ay,az — **بعد تحويل الوحدة إلى م/ث²** — بين 9.0 و10.6
+
+⚠ **وحدة التسارع تُكتشف من المقدار، لا تُفترض**: فيرموير UGV01 يرسلها بوحدة
+×100 (مقاس 2026-09-23: ‏|a| = 980.03 ساكناً = 9.80 م/ث²). المقارنة الخام بـ
+9.0–10.6 كانت ترسب حسّاساً سليماً. المرشّحات: ≈980 (÷100) · ≈9.8 (م/ث²) ·
+≈1.0 (g). مقدار خارجها كلها ⇒ رفض بالقيمة الخام، لا تحويل مخمَّن.
   • يطبع y مع تحذير صريح
 
 ⚠ الروبوت **ساكن تماماً** أثناء الاختبار: أي تحريك باليد يضخّم σ ويُنجح
 اختباراً كان يجب أن يرسب.
 
 الحكم:
-  NO-GO  لا ردود · σ(gz)=0.0 بالضبط · الجاذبية خارج 9.0–10.6
+  NO-GO  لا ردود · σ(gz)=0.0 بالضبط · وحدة تسارع غير معروفة ·
+         الجاذبية بعد التحويل خارج 9.0–10.6
 
 التشغيل:
     python3 -m pi.tests.ugv01.test_imu
@@ -75,7 +81,15 @@ INIT_CMDS = (
 )
 
 # حدود الحكم — كلها هنا لا مبعثرة في الكود
-GRAVITY_MIN, GRAVITY_MAX = 9.0, 10.6
+GRAVITY_MIN, GRAVITY_MAX = 9.0, 10.6       # م/ث² — بعد تحويل الوحدة
+G_STD = 9.80665
+# (المدى الخام، القاسم إلى م/ث²، الوصف). المدى واسع عمداً (±50٪ حول القيمة
+# المتوقَّعة) ليلتقط الوحدة لا ليحكم: الحكم بعد التحويل على 9.0–10.6.
+ACCEL_UNITS = (
+    ((490.0, 1470.0), 100.0, "×100 (سم/ث²) — 980 ⇒ 9.80 م/ث²"),
+    ((4.9, 14.7), 1.0, "م/ث²"),
+    ((0.5, 1.5), 1.0 / G_STD, "g"),
+)
 ZERO_RUN_WARN = 5          # سلسلة أصفار بهذا الطول ⇒ تحذير تعليق
 RATE_WARN_HZ = 10.0        # دون هذا المعدل: تحذير لا رفض
 
@@ -215,6 +229,14 @@ def longest_zero_run(values):
 
 
 # ═══ الاختبار ════════════════════════════════════════════════════════════
+def detect_accel_unit(raw_mag):
+    """يعيد (القاسم إلى م/ث²، الوصف) من المقدار الخام الساكن، أو None."""
+    for (lo, hi), divisor, label in ACCEL_UNITS:
+        if lo <= raw_mag <= hi:
+            return divisor, label
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="UGV01: فحص حياة الجايرو والتسارع")
     ap.add_argument("--port", default=None, help="افتراضياً: بحث تلقائي")
@@ -314,12 +336,19 @@ def main():
         print("    أصفار gz المضبوطة    : %d من %d · أطول سلسلة %d"
               % (zeros, n, zero_run))
 
-        grav = statistics.mean(gmag) if gmag else None
-        if grav is None:
+        grav_raw = statistics.mean(gmag) if gmag else None
+        unit = detect_accel_unit(grav_raw) if grav_raw is not None else None
+        grav = grav_raw / unit[0] if unit else None
+        if grav_raw is None:
             print("    مقدار الجاذبية       : — (لا حقول ax/ay/az في الردّ)")
         else:
-            print("    مقدار الجاذبية |a|   : %.3f   (المقبول %.1f–%.1f)"
-                  % (grav, GRAVITY_MIN, GRAVITY_MAX))
+            print("    مقدار الجاذبية الخام : %.3f" % grav_raw)
+            if unit:
+                print("    الوحدة المكتشفة      : %s" % unit[1])
+                print("    مقدار الجاذبية م/ث²  : %.3f   (المقبول %.1f–%.1f)"
+                      % (grav, GRAVITY_MIN, GRAVITY_MAX))
+            else:
+                print("    الوحدة المكتشفة      : ❌ لا مرشّح يطابق %.3f" % grav_raw)
 
         if yaws:
             print("    y (yaw) آخر قراءة    : %+.2f°" % yaws[-1])
@@ -344,22 +373,22 @@ def main():
             reasons.append("⚠ أطول سلسلة أصفار مضبوطة = %d ⇒ تعليق متقطّع محتمل"
                            " (σ وحدها تخفيه)." % zero_run)
 
-        if grav is None:
+        if grav_raw is None:
             ok = False
             reasons.append("🔴 لا حقول ax/ay/az في T:1002 ⇒ لا يمكن التحقق من الجاذبية.")
+        elif unit is None:
+            ok = False
+            reasons.append("🔴 مقدار التسارع الخام %.3f لا يطابق أي وحدة معروفة"
+                           " (≈980 · ≈9.8 · ≈1.0)." % grav_raw)
+            reasons.append("   لا تحويل مخمَّن: تحقّق من الحقول ومن سكون الروبوت.")
         elif not (GRAVITY_MIN <= grav <= GRAVITY_MAX):
             ok = False
-            reasons.append("🔴 مقدار الجاذبية %.3f خارج %.1f–%.1f."
-                           % (grav, GRAVITY_MIN, GRAVITY_MAX))
-            # تلميح وحدات: لا يغيّر الحكم، لكنه يمنع تشخيص «حسّاس تالف» وهو سليم
-            if 0.90 <= grav <= 1.06:
-                reasons.append("   تلميح: القيمة ≈1 ⇒ الوحدة g لا م/ث². الحسّاس على"
-                               " الأرجح سليم والمقياس مختلف — تحقّق قبل استبداله.")
-            elif 900.0 <= grav <= 1060.0:
-                reasons.append("   تلميح: القيمة ≈1000 ⇒ الوحدة mg. الحسّاس على الأرجح"
-                               " سليم والمقياس مختلف — تحقّق قبل استبداله.")
-            else:
-                reasons.append("   الروبوت مائل أثناء القياس؟ أعِده مستوياً وكرّر.")
+            reasons.append("🔴 الجاذبية %.3f م/ث² (الخام %.3f، الوحدة %s) خارج %.1f–%.1f."
+                           % (grav, grav_raw, unit[1], GRAVITY_MIN, GRAVITY_MAX))
+            reasons.append("   الروبوت مائل أثناء القياس؟ أعِده مستوياً وكرّر.")
+        else:
+            reasons.append("الجاذبية %.3f م/ث² (الخام %.3f · الوحدة %s) ✅"
+                           % (grav, grav_raw, unit[1]))
 
         if rate < RATE_WARN_HZ:
             reasons.append("⚠ معدل %.1f هرتز منخفض (تحذير لا رفض) — تكامل الاتجاه"
