@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import random
+import threading
 import time
 
 from pi.config import (
@@ -47,6 +48,7 @@ from pi.config import (
     TURN_RATE_FADE_WARN,
     ESP32_BOOT_WAIT_S, ESP32_STUCK_ZERO_BYTES, ESP32_STUCK_RETRY_S,
     ESP32_STUCK_RETRIES,
+    IS_UGV01, UGV01_INIT_CMDS, UGV01_INIT_GAP_S,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
@@ -181,6 +183,9 @@ class WaveRoverBridge:
         self._stuck_attempts = 0
         self._stuck_cooldown_until = 0.0
         self._port_ready_ts = 0.0
+        # 🔴 يحجز كل مُرسِل حتى تنتهي نافذة الإقلاع **والتهيئة** معاً — انظر
+        #    `_wait_esp32_boot`.
+        self._boot_lock = threading.Lock()
         # ذروة معدل الدوران لأول لفّة — مرجع كشف إنهاك البطارية سلوكياً
         # ⚠ يبقى **طبقة ثانية** بعد عودة INA219: يكشف الإنهاك سلوكياً بلا
         #   فولتميتر (الدوران بالمكان أول ما يسقط)، والحارسان لا يتعارضان.
@@ -270,13 +275,46 @@ class WaveRoverBridge:
         ما انقضى منذ فتح المنفذ (تهيئة بقية الأنظمة تستهلك المدة غالباً).
         """
         if not self._port_ready_ts:
+            return                                  # المسار السريع بعد الإقلاع
+        # 🔴 قفل لا علم: عطل مقاس (2026-09-23، لوحة وهمية): كان العلم يُصفَّر
+        #    **قبل** النوم، فخيط ثانٍ يجده صفراً ويكتب فوراً أثناء نافذة
+        #    الإقلاع. النتيجة المقاسة: «إيقاف» من خيط ثانٍ خرج أولاً، ثم
+        #    «تقدّم» الخيط الأول بعد النوم — **فبقي الروبوت يتحرّك بعد أمر
+        #    الإيقاف**. وعلى UGV01 يسبق الأمرُ المتسرّب T:900 أيضاً. الآن
+        #    يُصفَّر العلم **بعد** التهيئة، وكل مُرسِل آخر ينتظر القفل.
+        with self._boot_lock:
+            if not self._port_ready_ts:
+                return                              # أنهاه خيط آخر ونحن ننتظر
+            wait = self._port_ready_ts - time.time()
+            if wait > 0:
+                self._event("esp32_boot_wait",
+                            f"انتظار اكتمال إقلاع ESP32 ({wait:.1f}ث) قبل أول أمر")
+                time.sleep(wait)
+            self._ugv01_init()
+            self._port_ready_ts = 0.0
+
+    def _ugv01_init(self) -> None:
+        """
+        تهيئة لوحة UGV01 قبل أول أمر فعلي (وبعد كل إعادة فتح للمنفذ).
+
+        🔴 `{"T":900,"main":3}` إلزامي: بدونه تستعمل اللوحة ثوابت روبوت آخر
+        **بصمت** (قطر عجلة وعرض مسار) فتكذب كل سرعة مقاسة وكل أمر T:1.
+        والبقية تُطفئ الصدى والتشخيص والبثّ المستمر كي يبقى التحليل السطري
+        نظيفاً. نفس التهيئة المختبرة على العتاد في pi/tests/ugv01.
+        ⚠ كتابة مباشرة لا `_send`: هذا المسار داخل `_send` نفسه، ولا يرفع
+        استثناءً أبداً (§6.3) — فشله يُعلَن حدثاً ويبقى `link_ok` لـ`_send`.
+        """
+        if not IS_UGV01 or self.mode != "real" or self._ser is None:
             return
-        wait = self._port_ready_ts - time.time()
-        self._port_ready_ts = 0.0
-        if wait > 0:
-            self._event("esp32_boot_wait",
-                        f"انتظار اكتمال إقلاع ESP32 ({wait:.1f}ث) قبل أول أمر")
-            time.sleep(wait)
+        try:
+            for cmd in UGV01_INIT_CMDS:
+                self._ser.write((json.dumps(cmd) + "\n").encode("ascii"))
+                time.sleep(UGV01_INIT_GAP_S)
+            self._ser.reset_input_buffer()      # ردود التهيئة لا تخصّ أحداً
+            self._event("ugv01_init",
+                        "تهيئة UGV01: T:900 main=3 · إطفاء الصدى/التشخيص/البثّ")
+        except Exception as e:                  # noqa: BLE001
+            self._event("ugv01_init_fault", f"⚠ تعذّرت تهيئة UGV01: {e}")
 
     def _mark_esp32_alive(self) -> None:
         """أي JSON صالح من الفيرموير يصفّر الكاشف ويرفع إعلان العلق إن وُجد."""
@@ -349,6 +387,7 @@ class WaveRoverBridge:
                 except Exception:            # noqa: BLE001
                     pass
             self._ser = serial.Serial(self.port, self.baud, timeout=0.3)
+            self._ugv01_init()        # لوحة أُعيد إقلاعها تنسى T:900
             return True
         except Exception:                    # noqa: BLE001
             return False
@@ -461,7 +500,8 @@ class WaveRoverBridge:
             self.last_clamp_msg = (
                 f"⚠ قُصّت القوة إلى ±{MAX_MOTOR_POWER} "
                 f"(طُلب L={lw:.2f} R={rw:.2f} → L={lc:.2f} R={rc:.2f}) — "
-                f"التفاف فيرموير Wave Rover فوق 0.5")
+                + ("سقف سرعة UGV01 العملي 0.5 م/ث" if IS_UGV01
+                   else "التفاف فيرموير Wave Rover فوق 0.5"))
             logger.warning(self.last_clamp_msg)
             self._event("power_clamp", self.last_clamp_msg)
 

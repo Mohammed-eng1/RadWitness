@@ -29,6 +29,7 @@ from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
+    IS_UGV01,
     GEIGER_WINDOW_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
     MISSION_HARD_LIMIT_S, BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
@@ -2136,6 +2137,15 @@ class MissionSim:
         فتتقدّم الخريطة إلى 100% والروبوت ساكن.
         """
         blockers, warnings = [], []
+
+        # ⓪ 🔴 UGV01 على العتاد: قيادة يدوية فقط حتى تُهاجَر نماذج الحركة.
+        #    T:1 هناك **سرعة م/ث بحلقة مغلقة** لا قوة، وكل ثوابت المسح (القوة
+        #    ↔ السرعة، اللفّ، القصور، التحقق من الحركة) مقاسة على Wave Rover.
+        #    تشغيلها على UGV01 = مسافات ولفّات محسوبة على دلالة خاطئة بصمت.
+        #    المحاكاة غير متأثرة (لا عتاد يُساء قيادته).
+        if IS_UGV01 and getattr(self.rover, "mode", "sim") == "real":
+            blockers.append("المسح الذاتي مقفل على UGV01 — القيادة اليدوية فقط "
+                            "حتى تُهاجَر نماذج الحركة (T:1 سرعة م/ث لا قوة)")
 
         # ① مصدر اتجاه صالح — بلا اتجاه لا ملاحة أصلاً
         src = getattr(self.rover, "heading_source", None)

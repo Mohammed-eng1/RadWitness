@@ -293,6 +293,7 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
         <span class="muted" style="white-space:nowrap">السرعة</span>
         <input type="range" id="pw" min="0.1" max="0.5" step="0.05" value="0.3">
         <b id="pwv" style="min-width:42px;text-align:center">0.30</b>
+        <span id="pwu" class="muted" style="white-space:nowrap"></span>
       </div>
       <!-- 🔴 تجاوز الحساسات — يدوي فقط وبطلب صريح: يُصفَّر تلقائياً عند
            الخروج من اليدوية، وheartbeat وحدّ القوة وESTOP لا يتأثرون -->
@@ -1664,6 +1665,18 @@ function apply(st){
   // لافتة الجسر في القيادة اليدوية — القبول الصامت على sim وقع فعلاً
   const bb = $("#bridgeBanner");
   const man = st.manual || {};
+  // منزلق السرعة يتبع حدود السيرفر: سقف مكتوب هنا (0.5) كان يعطي على UGV01
+  // ‏(سقف 0.35) نصف مسار لا يفعل شيئاً — القصّ صامت في السيرفر.
+  const pw = $("#pw");
+  if (man.power_max != null && pw.max !== String(man.power_max)){
+    pw.min = man.power_min; pw.max = man.power_max;
+    if (!pw.dataset.init && man.power_default != null){
+      pw.value = man.power_default; pw.dataset.init = "1";
+    }
+    if (parseFloat(pw.value) > man.power_max) pw.value = man.power_max;
+    $("#pwv").textContent = power().toFixed(2);
+    $("#pwu").textContent = man.power_unit ? "(" + man.power_unit + ")" : "";
+  }
   if (rov.mode === "real"){
     bb.className = "bridge real";
     bb.innerHTML = "✅ جسر <b>حقيقي</b> — المحركات ستتحرك فعلياً · البوابة: " +

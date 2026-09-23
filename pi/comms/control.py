@@ -50,7 +50,7 @@ from pi.comms.protocol import (
 )
 from pi.config import (
     MANUAL_POWER_MIN, MANUAL_POWER_MAX, MANUAL_POWER_DEFAULT,
-    MANUAL_HEARTBEAT_S, LORA_COMMAND_TIMEOUT_S,
+    MANUAL_HEARTBEAT_S, LORA_COMMAND_TIMEOUT_S, IS_UGV01,
 )
 
 SOURCE_MANUAL = "manual"
@@ -411,6 +411,10 @@ class ManualControl:
                 "ignore_sensors": self.ignore_sensors,
                 "overridden": self.overridden_count,
                 "power_min": MANUAL_POWER_MIN, "power_max": MANUAL_POWER_MAX,
+                "power_default": MANUAL_POWER_DEFAULT,
+                # الواجهة تبني منزلق السرعة من هذه الحدود لا من أرقام مكتوبة
+                # فيها — على UGV01 القيمة **سرعة م/ث** وسقفها أدنى (0.35).
+                "power_unit": "م/ث" if IS_UGV01 else "قوة",
                 "heartbeat_s": MANUAL_HEARTBEAT_S,
                 "radio_timeout_s": LORA_COMMAND_TIMEOUT_S}
 
