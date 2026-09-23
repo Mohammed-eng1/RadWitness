@@ -1,0 +1,1 @@
+mode,run,commanded,cmd_L,cmd_R,duration_s,enc_L_m,enc_R_m,enc_mean_m,gz_bias,gz_raw_deg,gz_corr_deg,coast_deg,peak_rate_dps,samples,measured_truth
