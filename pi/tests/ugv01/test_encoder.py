@@ -30,11 +30,23 @@ test_encoder.py — هل الإنكودر يردّ، وبإشارة صحيحة؟
 أمر السرعة يُجدَّد من **خيط مستقل كل 800ms** لأن اللوحة توقف المحركات عند
 انقطاع الأوامر ~3000ms (قِسْ هذا الرقم بـtest_heartbeat).
 
-الأمان: تأكيد "yes" · --timeout لكل طور (افتراضي 3ث) · finally يرسل الإيقاف دائماً.
+── وضع الأرض: --floor ────────────────────────────────────────────────
+🔴 الروبوت **على الأرض**: أمام --seconds (افتراضي 8ث) ثم خلف بالمدة نفسها
+فيعود قرب نقطة البداية (مساحة ≈ السرعة × المدة + هامش، أماماً وخلفاً).
+في الهواء لا حمل ولا احتكاك، فالفرق بين الجانبين هناك لا يقول شيئاً عن
+الأرض. هنا يُطبع **الفرق بين الجانبين بعد استقرار أول ثانيتين فقط**
+(اندفاع البدء والتسارع خارج الحساب): متوسّط L وR، والفرق L−R بالم/ث وبالنسبة،
+والفرق في المسافة المتكاملة خلال نافذة الاستقرار.
+--timeout في هذا الوضع افتراضياً = --seconds، وقيمة أصغر منه **تُرفض** لا تقصّ.
+
+الأمان: تأكيد "yes" · --timeout لكل طور (افتراضي 3ث، أو --seconds مع --floor) ·
+finally يرسل الإيقاف دائماً.
 
 التشغيل:
     python3 -m pi.tests.ugv01.test_encoder
     python3 -m pi.tests.ugv01.test_encoder --speed 0.15 --timeout 3
+    python3 -m pi.tests.ugv01.test_encoder --floor               # على الأرض 8ث
+    python3 -m pi.tests.ugv01.test_encoder --floor --seconds 10
 """
 from __future__ import annotations
 
@@ -86,6 +98,8 @@ RESEND_MS = 800            # تجديد الأمر — دون مهلة النب�
 # يلفت النظر إلى لا تماثل صارخ، لا أن يحكم بدقّة. عدّله بـ--symmetry-tol
 # بعد أن تصير لديك عدّة قراءات من هذا العتاد.
 SYMMETRY_TOL_PCT = 15.0    # فرق أكبر منه بين الذهاب والعودة (أو بين L وR) ⇒ رفض
+FLOOR_SETTLE_S = 2.0       # وضع الأرض: أول ثانيتين خارج حساب الفرق بين الجانبين
+LIFTED_TIMEOUT_S = 3.0     # الحدّ الافتراضي لكل طور والروبوت مرفوع
 
 
 def find_port(explicit=None):
@@ -280,13 +294,14 @@ class Keepalive(threading.Thread):
 
 
 # ═══ طور واحد ════════════════════════════════════════════════════════════
-def run_phase(link, keeper, label, speed, seconds, settle_s, writer):
+def run_phase(link, keeper, label, speed, seconds, settle_s, writer, print_every=0.0):
     """يأمر بسرعة ويجمع L/R المقاستين. يعيد قائمة (t, L, R) بعد زمن الاستقرار."""
     print("\n   ▶ %s: أمر L=%+.3f R=%+.3f م/ث لمدة %.1fث"
           % (label, speed, speed, seconds))
     keeper.set_speed(speed, speed)
     t0 = time.monotonic()
     steady, allsamp = [], []
+    last_print = -1e9
     while time.monotonic() - t0 < seconds:
         obj, _, _ = link.ask({"T": 130}, 1001, 0.3)
         if obj is None:
@@ -299,9 +314,34 @@ def run_phase(link, keeper, label, speed, seconds, settle_s, writer):
         writer.writerow([label, round(t, 3), speed, speed, left, right])
         if t >= settle_s:
             steady.append((t, left, right))
-        print("      %4.2fث   L=%+7.3f   R=%+7.3f" % (t, left, right))
+        if t - last_print >= print_every:       # الطور الطويل على الأرض لا يُغرق الشاشة
+            last_print = t
+            print("      %4.2fث   L=%+7.3f   R=%+7.3f" % (t, left, right))
     keeper.set_speed(0, 0)
     return steady, allsamp
+
+
+def side_difference(label, steady):
+    """الفرق بين الجانبين في نافذة الاستقرار — أرقام فقط. يعيد (L−R، ٪) أو None."""
+    if len(steady) < 2:
+        print("      ⚠ %s: عيّنات استقرار غير كافية للفرق بين الجانبين." % label)
+        return None
+    mean_l = statistics.mean(s[1] for s in steady)
+    mean_r = statistics.mean(s[2] for s in steady)
+    dist_l = dist_r = 0.0
+    for (t0, l0, r0), (t1, l1, r1) in zip(steady, steady[1:]):
+        dist_l += 0.5 * (l0 + l1) * (t1 - t0)
+        dist_r += 0.5 * (r0 + r1) * (t1 - t0)
+    window = steady[-1][0] - steady[0][0]
+    pct = pct_diff(abs(mean_l), abs(mean_r))
+    print("      ── %s · الفرق بين الجانبين (بعد %.0fث، نافذة %.1fث، %d عيّنة) ──"
+          % (label, FLOOR_SETTLE_S, window, len(steady)))
+    print("         L %+.4f · R %+.4f م/ث  ⇒  L−R = %+.4f م/ث (%s)"
+          % (mean_l, mean_r, mean_l - mean_r,
+             ("%+.1f٪ من متوسّطهما" % pct) if pct is not None else "—"))
+    print("         المسافة المتكاملة: L %+.3f · R %+.3f م  ⇒  الفرق %+.1f سم"
+          % (dist_l, dist_r, (dist_l - dist_r) * 100.0))
+    return mean_l - mean_r, pct
 
 
 def summarize(label, speed, steady):
@@ -328,8 +368,12 @@ def main():
     ap.add_argument("--baud", type=int, default=BAUD)
     ap.add_argument("--boot-wait", type=float, default=BOOT_WAIT_S)
     ap.add_argument("--speed", type=float, default=0.1, help="م/ث (|s| ≤ 0.5)")
-    ap.add_argument("--timeout", type=float, default=3.0,
-                    help="الحدّ الأقصى لكل طور حركة (ث) — حدّ سلامة")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="الحدّ الأقصى لكل طور حركة (ث) — افتراضي 3، أو --seconds مع --floor")
+    ap.add_argument("--floor", action="store_true",
+                    help="الروبوت على الأرض: طوران بمدة --seconds والفرق بين الجانبين")
+    ap.add_argument("--seconds", type=float, default=8.0,
+                    help="مدة كل طور في وضع --floor (ث)")
     ap.add_argument("--duration", type=float, default=2.0, help="مدة كل طور (ث)")
     ap.add_argument("--settle", type=float, default=0.5,
                     help="يُستبعد من المتوسّط أول هذه الثواني (اندفاع البدء)")
@@ -345,19 +389,38 @@ def main():
     if abs(a.speed) > MAX_SPEED_MPS:
         return verdict(False, ["--speed %.2f يتجاوز الحدّ العملي %.2f م/ث."
                                % (a.speed, MAX_SPEED_MPS)])
-    duration = min(a.duration, a.timeout)
-    if duration < a.duration:
-        print("ℹ المدة قُصّت إلى %.1fث بحدّ --timeout." % duration)
-    if a.settle >= duration:
-        return verdict(False, ["--settle %.1f ≥ مدة الطور %.1f ⇒ لا عيّنات للمتوسّط."
-                               % (a.settle, duration)])
+    if a.floor:
+        timeout = a.seconds if a.timeout is None else a.timeout
+        if timeout < a.seconds:
+            return verdict(False, [
+                "--seconds %.1f أطول من --timeout %.1f — الطور يُرفض ولا يُقصّ في صمت."
+                % (a.seconds, timeout),
+                "ارفع --timeout صراحةً أو قصّر --seconds."])
+        duration = a.seconds
+        settle = FLOOR_SETTLE_S
+    else:
+        timeout = LIFTED_TIMEOUT_S if a.timeout is None else a.timeout
+        duration = min(a.duration, timeout)
+        if duration < a.duration:
+            print("ℹ المدة قُصّت إلى %.1fث بحدّ --timeout." % duration)
+        settle = a.settle
+    if settle >= duration:
+        return verdict(False, ["زمن الاستقرار %.1f ≥ مدة الطور %.1f ⇒ لا عيّنات للمتوسّط."
+                               % (settle, duration)])
+    print("الوضع: %s · %.1fث لكل طور · استقرار %.1fث · حدّ %.1fث"
+          % ("🔴 على الأرض (--floor)" if a.floor else "مرفوع", duration, settle, timeout))
 
     port = find_port(a.port)
     if not port:
         return verdict(False, ["لم يُعثر على أي منفذ: %s" % ", ".join(PORT_CANDIDATES)])
     print("المنفذ: %s @ %d" % (port, a.baud))
 
-    if not confirm_motion("🔴 **مرفوع عن الأرض** والعجلات حرّة تدور في الهواء"):
+    if a.floor:
+        placement = ("🔴 **على الأرض**، خالية ≥ %.1fم أمامه **وخلفه** (أمام %.0fث ثم خلف)"
+                     % (abs(a.speed) * duration + 0.5, duration))
+    else:
+        placement = "🔴 **مرفوع عن الأرض** والعجلات حرّة تدور في الهواء"
+    if not confirm_motion(placement):
         return 2
 
     try:
@@ -376,22 +439,25 @@ def main():
         init_board(link)
 
         fh, writer, path = new_csv(
-            "encoder", ["phase", "t_s", "cmd_L", "cmd_R", "meas_L", "meas_R"])
+            "encoder_floor" if a.floor else "encoder", ["phase", "t_s", "cmd_L", "cmd_R", "meas_L", "meas_R"])
 
         keeper = Keepalive(link, RESEND_MS / 1000.0)
         keeper.start()
         print("\n[3] خيط تجديد الأمر يعمل كل %dms." % RESEND_MS)
 
+        every = 0.5 if a.floor else 0.0
         fwd_steady, _ = run_phase(link, keeper, "forward", +a.speed,
-                                  duration, a.settle, writer)
+                                  duration, settle, writer, every)
         mean_fl, mean_fr = summarize("أمام", +a.speed, fwd_steady)
+        side_fwd = side_difference("أمام", fwd_steady) if a.floor else None
 
         print("\n   ⏸ توقّف ثانية واحدة…")
         time.sleep(1.0)
 
         rev_steady, _ = run_phase(link, keeper, "reverse", -a.speed,
-                                  duration, a.settle, writer)
+                                  duration, settle, writer, every)
         mean_rl, mean_rr = summarize("خلف", -a.speed, rev_steady)
+        side_rev = side_difference("خلف", rev_steady) if a.floor else None
 
         keeper.set_speed(0, 0)
         fh.flush()
@@ -486,9 +552,19 @@ def main():
             reasons.append("✅ التماثل ضمن %.0f٪: ذهابٌ كعودة، وL كـR."
                            % a.symmetry_tol)
 
-        reasons.append("⚠ كل ما سبق **تشخيص لا معايرة**: لا معامل يُشتقّ ولا إعداد")
-        reasons.append("   يُكتب. وعجلات تدور في الهواء بلا حمل ولا احتكاك أرض لا")
-        reasons.append("   تصلح مرجع معايرة أصلاً.")
+        if a.floor:
+            for lab, sd in (("أمام", side_fwd), ("خلف", side_rev)):
+                if sd is not None:
+                    reasons.append("على الأرض · %s: L−R = %+.4f م/ث (%s) بعد أول %.0fث"
+                                   % (lab, sd[0], ("%+.1f٪" % sd[1]) if sd[1] is not None
+                                      else "—", FLOOR_SETTLE_S))
+            reasons.append("⚠ **تشخيص لا معايرة**: لا معامل يُشتقّ ولا إعداد يُكتب —")
+            reasons.append("   أرضية واحدة وبطارية واحدة. والإنكودر يقيس دوران العجلة لا")
+            reasons.append("   حركة الروبوت: انزلاق جانب لا يظهر هنا (قارن بالمسطرة).")
+        else:
+            reasons.append("⚠ كل ما سبق **تشخيص لا معايرة**: لا معامل يُشتقّ ولا إعداد")
+            reasons.append("   يُكتب. وعجلات تدور في الهواء بلا حمل ولا احتكاك أرض لا")
+            reasons.append("   تصلح مرجع معايرة أصلاً.")
         reasons.append("السجل: " + path)
         return verdict(ok, reasons)
 
