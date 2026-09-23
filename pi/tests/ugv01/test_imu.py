@@ -92,6 +92,10 @@ ACCEL_UNITS = (
 )
 ZERO_RUN_WARN = 5          # سلسلة أصفار بهذا الطول ⇒ تحذير تعليق
 RATE_WARN_HZ = 10.0        # دون هذا المعدل: تحذير لا رفض
+BIAS_OUTLIER_SIGMA = 3.0   # الانحياز بالوسيط بعد استبعاد ما خرج عن 3σ
+# قفزات gz منفردة مقاسة ساكناً (2026-09-23): ±15.9°/ث في 3 من 200 عيّنة —
+# 256 عدّة بالضبط. عتبة العدّ نصفها: فوق ضجيج σ≈0.23 بمراحل.
+SPIKE_JUMP_DPS = 8.0
 
 
 def find_port(explicit=None):
@@ -229,6 +233,32 @@ def longest_zero_run(values):
 
 
 # ═══ الاختبار ════════════════════════════════════════════════════════════
+def robust_bias(values, k=BIAS_OUTLIER_SIGMA):
+    """(الانحياز بالوسيط بعد استبعاد ما خرج عن k·σ حول الوسيط، المستبعَد).
+    لا بالمتوسط: قفزة ±16 واحدة تزيح المتوسط وتبقى في كل تكامل لاحق."""
+    med = statistics.median(values)
+    if len(values) < 3:
+        return med, 0
+    sd = statistics.stdev(values)
+    kept = [v for v in values if abs(v - med) <= k * sd] or values
+    return statistics.median(kept), len(values) - len(kept)
+
+
+def median3_series(values):
+    """(السلسلة بعد وسيط ثلاثي، عدد القفزات المرفوضة فوق SPIKE_JUMP_DPS)."""
+    if len(values) < 3:
+        return list(values), 0
+    out = [values[0]]
+    rejected = 0
+    for k in range(1, len(values) - 1):
+        m = sorted(values[k - 1:k + 2])[1]
+        if abs(values[k] - m) > SPIKE_JUMP_DPS:
+            rejected += 1
+        out.append(m)
+    out.append(values[-1])
+    return out, rejected
+
+
 def detect_accel_unit(raw_mag):
     """يعيد (القاسم إلى م/ث²، الوصف) من المقدار الخام الساكن، أو None."""
     for (lo, hi), divisor, label in ACCEL_UNITS:
@@ -335,6 +365,14 @@ def main():
                   % (statistics.mean(gy), statistics.stdev(gy) if len(gy) > 1 else 0.0))
         print("    أصفار gz المضبوطة    : %d من %d · أطول سلسلة %d"
               % (zeros, n, zero_run))
+        bias, bias_out = robust_bias(gz)
+        gz_f, spikes = median3_series(gz)
+        print("    انحياز gz (وسيط)     : %+.4f   (استُبعد %d شاذّ خارج %.0fσ)"
+              % (bias, bias_out, BIAS_OUTLIER_SIGMA))
+        print("    قفزات gz مرفوضة       : %d   (وسيط ثلاثي، عتبة %.0f°/ث)"
+              % (spikes, SPIKE_JUMP_DPS))
+        print("    σ(gz) بعد الوسيط      : %.4f   (الخام أعلاه %.4f)"
+              % (statistics.stdev(gz_f), sigma_gz))
 
         grav_raw = statistics.mean(gmag) if gmag else None
         unit = detect_accel_unit(grav_raw) if grav_raw is not None else None
@@ -368,6 +406,8 @@ def main():
             reasons.append("   وناقله، وأعد إقلاع اللوحة، ثم أعد الاختبار.")
         else:
             reasons.append("σ(gz) = %.4f ≠ 0 ⇒ إشارة حيّة." % sigma_gz)
+        reasons.append("انحياز gz (وسيط) %+.4f · قفزات مرفوضة %d · σ بعد الوسيط %.4f"
+                       % (bias, spikes, statistics.stdev(gz_f)))
 
         if zero_run >= ZERO_RUN_WARN:
             reasons.append("⚠ أطول سلسلة أصفار مضبوطة = %d ⇒ تعليق متقطّع محتمل"

@@ -79,6 +79,11 @@ STOP_CMD = {"T": 1, "L": 0, "R": 0}
 MAX_SPEED_MPS = 0.5
 RESEND_MS = 800
 BIAS_SECONDS = 1.5        # نافذة قياس انحياز gz قبل كل لفّة
+BIAS_OUTLIER_SIGMA = 3.0  # في نافذة الانحياز: ما بعد 3σ عن الوسيط شاذّ يُستبعد
+# قفزات gz المنفردة المقاسة ساكناً (2026-09-23): ±15.9°/ث في 3 من 200 عيّنة
+# (= 256 عدّة بالضبط عند 16 عدّة لكل °/ث). عتبة العدّ نصفها: فوق ضجيج σ≈0.23
+# بمراحل، ودون القفزة بهامش. تُعدّ فقط — الاستبدال يفعله الوسيط نفسه.
+SPIKE_JUMP_DPS = 8.0
 
 
 def find_port(explicit=None):
@@ -327,8 +332,67 @@ def run_straight(link, keeper, distance, speed, timeout):
 
 
 # ═══ شوط لفّ بالمكان ═════════════════════════════════════════════════════
+def robust_bias(values, k=BIAS_OUTLIER_SIGMA):
+    """انحياز بالوسيط بعد استبعاد ما خرج عن k·σ حول الوسيط.
+
+    ⚠ لا بالمتوسط: قفزة ±16°/ث واحدة في نافذة ~27 عيّنة تزيح المتوسط ~0.6°/ث،
+    وهذا ما حدث فعلاً في لفّتين من جلسة 2026-09-23 (−1.34 و−1.44 بدل ~−0.25) —
+    ثم يُطرح الانحياز الخاطئ من كل عيّنة فيتراكم خطأً في الزاوية.
+    يعيد (الانحياز، عدد المستعمَل، عدد المستبعَد)."""
+    med = statistics.median(values)
+    if len(values) < 3:
+        return med, len(values), 0
+    sd = statistics.stdev(values)
+    kept = [v for v in values if abs(v - med) <= k * sd] or values
+    return statistics.median(kept), len(kept), len(values) - len(kept)
+
+
+class Median3Integrator:
+    """تكامل gz بعد مرشّح وسيط ثلاثي: كل عيّنة تُستبدل بوسيط (السابقة، هي، التالية).
+
+    قفزة منفردة لا تنجو من الوسيط أبداً، ومنحدر رتيب (تسارع/تباطؤ حقيقي) يمرّ
+    كما هو لأن العيّنة الوسطى فيه هي الوسيط أصلاً.
+    ⚠ الثمن: عيّنة تأخير — العيّنة تُثبَّت بعد وصول جارتها. فقرار «بلغنا الهدف»
+    يقرأ `provisional()` = المثبَّت + العيّنة المعلّقة خاماً، وإلا تأخّر القطع
+    عيّنةً كاملة (~5° عند 88°/ث و18 هرتز). والعيّنة الأخيرة تُثبَّت خاماً في
+    `finish()` إذ لا جارة لها — قفزة فيها بالذات (~1.5٪) لا تُلتقط."""
+
+    def __init__(self, bias, seed=None):
+        self.bias = bias
+        self.prev = seed          # سياق فقط من طور سابق — لا يُكامَل مرتين
+        self.pend = None          # (القيمة، dt) تنتظر جارتها التالية
+        self.total = 0.0
+        self.rejected = 0
+
+    def add(self, value, dt):
+        if self.pend is not None:
+            b, db = self.pend
+            if self.prev is None:
+                v = b                                  # الحافّة الأولى بلا جارة سابقة
+            else:
+                v = sorted((self.prev, b, value))[1]
+                if abs(b - v) > SPIKE_JUMP_DPS:
+                    self.rejected += 1
+            self.total += (v - self.bias) * db
+            self.prev = b
+        self.pend = (value, dt)
+
+    def provisional(self):
+        if self.pend is None:
+            return self.total
+        return self.total + (self.pend[0] - self.bias) * self.pend[1]
+
+    def finish(self):
+        if self.pend is not None:
+            self.total += (self.pend[0] - self.bias) * self.pend[1]
+            self.prev = self.pend[0]
+            self.pend = None
+        return self.total
+
+
 def measure_gz_bias(link, seconds):
-    """انحياز gz والروبوت ساكن — يُقاس في كل شوط ولا يُثبَّت في الكود أبداً."""
+    """انحياز gz والروبوت ساكن — يُقاس في كل شوط ولا يُثبَّت في الكود أبداً.
+    يعيد (الانحياز، المستعمَل، المستبعَد) — بالوسيط لا بالمتوسط."""
     values = []
     t_end = time.monotonic() + seconds
     while time.monotonic() < t_end:
@@ -339,17 +403,27 @@ def measure_gz_bias(link, seconds):
         if gz is not None:
             values.append(gz)
     if not values:
-        return None, 0
-    return statistics.mean(values), len(values)
+        return None, 0, 0
+    return robust_bias(values)
+
+
+def median3_series(values):
+    """سلسلة بعد وسيط ثلاثي (الطرفان كما هما) — للذروة لا للتكامل."""
+    if len(values) < 3:
+        return list(values)
+    return [values[0]] + [sorted(values[k - 1:k + 2])[1]
+                          for k in range(1, len(values) - 1)] + [values[-1]]
 
 
 def run_turn(link, keeper, degrees, speed, timeout):
-    """يلفّ بالمكان ويكامل gz خاماً ومطروحاً منه الانحياز. يعيد قاموس القياس."""
+    """يلفّ بالمكان ويكامل gz خاماً، ومرشَّحاً بالوسيط الثلاثي ومطروحاً منه
+    الانحياز. يعيد قاموس القياس."""
     print("      قياس انحياز gz %0.1fث والروبوت ساكن…" % BIAS_SECONDS)
-    bias, bias_n = measure_gz_bias(link, BIAS_SECONDS)
+    bias, bias_n, bias_out = measure_gz_bias(link, BIAS_SECONDS)
     if bias is None:
         return {"error": "لا قراءات gz — اللوحة لا تردّ T:1002"}
-    print("      الانحياز: %+.4f (من %d عيّنة)" % (bias, bias_n))
+    print("      الانحياز (وسيط): %+.4f (من %d عيّنة · استُبعد %d شاذّ خارج %.0fσ)"
+          % (bias, bias_n, bias_out, BIAS_OUTLIER_SIGMA))
 
     # الإشارة الموجبة تقابل L=+ و R=− اصطلاحاً هنا، وهي **غير مفترضة**:
     # الأمر يُحفظ كما أُرسل والزاوية الحقيقية تأتي من المنقلة.
@@ -362,9 +436,9 @@ def run_turn(link, keeper, degrees, speed, timeout):
     keeper.set_speed(cmd_l, cmd_r)
     t0 = time.monotonic()
     t_prev = t0
-    raw_deg = corr_deg = 0.0
-    samples = 0
-    peak_rate = 0.0
+    raw_deg = 0.0
+    integ = Median3Integrator(bias)
+    turn_vals = []
     deadline = t0 + timeout
     hit_target = False
     while time.monotonic() < deadline:
@@ -378,18 +452,19 @@ def run_turn(link, keeper, degrees, speed, timeout):
         if gz is None:
             continue
         raw_deg += gz * dt
-        corr_deg += (gz - bias) * dt
-        peak_rate = max(peak_rate, abs(gz))
-        samples += 1
-        if abs(corr_deg) >= abs(degrees):
+        integ.add(gz, dt)
+        turn_vals.append(gz)
+        if abs(integ.provisional()) >= abs(degrees):
             hit_target = True
             break
     keeper.set_speed(0, 0)
     elapsed = time.monotonic() - t0
     hard_stop(link, times=1)
+    corr_deg = integ.finish()
 
-    # القصور الذاتي بعد قطع الطاقة: يُقاس ولا يُفترض
-    coast_deg = 0.0
+    # القصور الذاتي بعد قطع الطاقة: يُقاس ولا يُفترض. المرشّح يُكمل بسياق
+    # آخر عيّنة من اللفّة فلا تُعامَل أول عيّنة قصور كحافّة بلا جارة.
+    coast = Median3Integrator(bias, seed=turn_vals[-1] if turn_vals else None)
     t_prev = time.monotonic()
     t_end = t_prev + 1.0
     while time.monotonic() < t_end:
@@ -401,12 +476,16 @@ def run_turn(link, keeper, degrees, speed, timeout):
             continue
         gz = num(obj.get("gz"))
         if gz is not None:
-            coast_deg += (gz - bias) * dt
+            coast.add(gz, dt)
+    coast_deg = coast.finish()
     time.sleep(0.4)
+    peak_rate = max((abs(v) for v in median3_series(turn_vals)), default=0.0)
     return {"duration_s": elapsed, "cmd_L": cmd_l, "cmd_R": cmd_r,
-            "gz_bias": bias, "gz_raw_deg": raw_deg, "gz_corr_deg": corr_deg,
+            "gz_bias": bias, "bias_n": bias_n, "bias_excluded": bias_out,
+            "gz_raw_deg": raw_deg, "gz_corr_deg": corr_deg,
             "coast_deg": coast_deg, "peak_rate_dps": peak_rate,
-            "samples": samples, "hit_target": hit_target}
+            "spikes_rejected": integ.rejected + coast.rejected,
+            "samples": len(turn_vals), "hit_target": hit_target}
 
 
 # ═══ الاختبار ════════════════════════════════════════════════════════════
@@ -473,7 +552,7 @@ def main():
             "mode", "run", "commanded", "cmd_L", "cmd_R", "duration_s",
             "enc_L_m", "enc_R_m", "enc_mean_m",
             "gz_bias", "gz_raw_deg", "gz_corr_deg", "coast_deg", "peak_rate_dps",
-            "samples", "measured_truth"])
+            "samples", "measured_truth", "bias_n", "bias_excluded", "spikes_rejected"])
 
         keeper = Keepalive(link, RESEND_MS / 1000.0)
         keeper.start()
@@ -512,7 +591,7 @@ def main():
                                  round(result["enc_L_m"], 4), round(result["enc_R_m"], 4),
                                  round(result["enc_mean_m"], 4),
                                  "", "", "", "", "", result["samples"],
-                                 "" if truth is None else truth])
+                                 "" if truth is None else truth, "", "", ""])
                 fh.flush()
 
         # ── أشواط اللفّ ─────────────────────────────────────────────────
@@ -533,8 +612,10 @@ def main():
                     print("      ✗ %s" % result["error"])
                     aborted = True
                     break
-                print("      تكامل gz: خام=%+.2f° · بعد طرح الانحياز=%+.2f°"
+                print("      تكامل gz: خام=%+.2f° · بعد الوسيط الثلاثي وطرح الانحياز=%+.2f°"
                       % (result["gz_raw_deg"], result["gz_corr_deg"]))
+                print("      قفزات gz مرفوضة بالوسيط (>%.0f°/ث): %d"
+                      % (SPIKE_JUMP_DPS, result["spikes_rejected"]))
                 print("      قصور بعد قطع الطاقة=%+.2f° · ذروة المعدل=%.1f · %d عيّنة"
                       % (result["coast_deg"], result["peak_rate_dps"], result["samples"]))
                 if not result["hit_target"]:
@@ -553,7 +634,9 @@ def main():
                                  round(result["coast_deg"], 3),
                                  round(result["peak_rate_dps"], 2),
                                  result["samples"],
-                                 "" if truth is None else truth])
+                                 "" if truth is None else truth,
+                                 result["bias_n"], result["bias_excluded"],
+                                 result["spikes_rejected"]])
                 fh.flush()
 
         keeper.set_speed(0, 0)
