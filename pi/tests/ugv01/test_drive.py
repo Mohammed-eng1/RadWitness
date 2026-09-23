@@ -10,12 +10,22 @@ test_drive.py — حركة على الأرض: ما يقوله الروبوت م�
 
   --straight <متر>  يمشي بأمر سرعة ومدة، ويكامل L/R من الإنكودر، ثم يسألك
                     المسافة الحقيقية بالمسطرة.
-  --turn <درجة>     يلفّ بالمكان ويكامل gz، ثم يسألك الزاوية الحقيقية المقاسة.
+  --turn <درجات>    يلفّ بالمكان ويكامل gz، ثم يسألك الزاوية الحقيقية المقاسة.
+                    يقبل عدة زوايا في تشغيل واحد: --turn 45,90,180
 
-خمسة تكرارات لكل أمر، ويُطبع تشتّت كل عمود على حدة.
+خمسة تكرارات لكل أمر (لكل زاوية)، ويُطبع تشتّت كل عمود على حدة.
 
-⚠ **لا يُحسب هنا أي معامل ولا يُقترح أي تعديل إعدادات.** الأرقام تُطبع وتُحفظ
-في CSV فقط. سبب هذا صريح: معامل يُشتقّ من خمسة أشواط على أرضية واحدة ببطارية
+مع زاويتين أو أكثر يُحسب **خط مستقيم** بالمربعات الصغرى:
+    المنقلة = الميل × الجايرو + التقاطع        ومعه R²
+والجايرو هنا = |التكامل حتى القطع + القصور بعده| — لأن المنقلة ترى الدوران كله
+لا ما قبل القطع وحده. ويُطبع الخط الثاني (حتى القطع فقط) للمقارنة.
+  • الميل ≠ 1 بثبات عبر الزوايا ⇒ خطأ مقياس (تناسبي).
+  • التقاطع ≠ 0 ⇒ خطأ ثابت لكل لفّة مهما كبرت (بدء/قطع/قصور).
+  • R² منخفض ⇒ التشتّت يغلب أي علاقة خطية — لا ميل يُعتمد.
+⚠ أرقام فقط: الميل **لا يُطبَّق** على شيء ولا يُقترح إعداداً.
+
+⚠ **لا يُقترح هنا أي تعديل إعدادات ولا يُطبَّق أي معامل.** الأرقام — ومنها ميل
+الخط أدناه — تُطبع وتُحفظ في CSV فقط. سبب هذا صريح: معامل يُشتقّ من خمسة أشواط على أرضية واحدة ببطارية
 واحدة يُتبنّى كأنه ثابت فيزيائي، ثم يُطارَد شهراً حين يكذب على أرضية أخرى.
 الاشتقاق جلسة معايرة مستقلة تقرأ هذه الملفات.
 
@@ -31,6 +41,7 @@ test_drive.py — حركة على الأرض: ما يقوله الروبوت م�
 التشغيل:
     python3 -m pi.tests.ugv01.test_drive --straight 1.0 --timeout 8
     python3 -m pi.tests.ugv01.test_drive --turn 90 --timeout 5
+    python3 -m pi.tests.ugv01.test_drive --turn 45,90,180 --timeout 6
     python3 -m pi.tests.ugv01.test_drive --straight 0.5 --turn 90 --repeats 5 --timeout 6
 """
 from __future__ import annotations
@@ -292,6 +303,34 @@ def stats_line(label, values, unit):
             % (label, mean, unit, sd, min(clean), max(clean), len(clean)))
 
 
+def linfit(xs, ys):
+    """مربعات صغرى y = a·x + b. يعيد (a، b، R²) أو None إن لم يكفِ التنوّع."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return None
+    a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    b = my - a * mx
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return a, b, r2
+
+
+def parse_angles(text):
+    """'45,90,180' ← قائمة درجات. يرفع ValueError عند مدخل فاسد."""
+    angles = [float(t) for t in text.split(",") if t.strip()]
+    if not angles:
+        raise ValueError("لا زاوية")
+    for ang in angles:
+        if ang == 0 or abs(ang) > 360:
+            raise ValueError("زاوية %.1f خارج (0، 360]" % ang)
+    return angles
+
+
 # ═══ شوط سير مستقيم ══════════════════════════════════════════════════════
 def run_straight(link, keeper, distance, speed, timeout):
     """يمشي مدةً محسوبة من السرعة، ويكامل L/R المقاستين. يعيد قاموس القياس."""
@@ -496,8 +535,8 @@ def main():
     ap.add_argument("--boot-wait", type=float, default=BOOT_WAIT_S)
     ap.add_argument("--straight", type=float, default=None, metavar="متر",
                     help="مسافة سير تقديرية بالمتر")
-    ap.add_argument("--turn", type=float, default=None, metavar="درجة",
-                    help="زاوية لفّ بالمكان بالدرجة")
+    ap.add_argument("--turn", default=None, metavar="درجات",
+                    help="زاوية أو أكثر مفصولة بفواصل، مثل 45,90,180")
     ap.add_argument("--speed", type=float, default=0.2, help="م/ث للسير")
     ap.add_argument("--turn-speed", type=float, default=0.15, help="م/ث للفّ")
     ap.add_argument("--repeats", type=int, default=5, help="تكرارات كل أمر")
@@ -510,7 +549,13 @@ def main():
     print("═" * 66)
 
     if a.straight is None and a.turn is None:
-        return verdict(False, ["حدّد --straight <متر> و/أو --turn <درجة>."])
+        return verdict(False, ["حدّد --straight <متر> و/أو --turn <درجات>."])
+    angles = []
+    if a.turn is not None:
+        try:
+            angles = parse_angles(a.turn)
+        except ValueError as exc:
+            return verdict(False, ["--turn غير صالح (%r): %s" % (a.turn, exc)])
     for name, value in (("--speed", a.speed), ("--turn-speed", a.turn_speed)):
         if abs(value) > MAX_SPEED_MPS or value == 0:
             return verdict(False, ["%s = %.3f خارج النطاق العملي (0, %.2f] م/ث."
@@ -595,72 +640,123 @@ def main():
                 fh.flush()
 
         # ── أشواط اللفّ ─────────────────────────────────────────────────
-        if a.turn is not None and not aborted:
-            print("\n[4] لفّ بالمكان %+.1f° × %d تكرار" % (a.turn, a.repeats))
-            for i in range(1, a.repeats + 1):
-                print("\n   ▶ شوط %d/%d" % (i, a.repeats))
-                print("      علّم اتجاه الروبوت الحالي (شريط لاصق/منقلة)، ثم:")
-                try:
-                    if input('      اضغط Enter للانطلاق (أو "q" للإنهاء): ').strip().lower() == "q":
+        turn_runs = []          # قاموس لكل شوط مكتمل الإدخال: الزاوية والجايرو والمنقلة
+        if angles and not aborted:
+            print("\n[4] لفّ بالمكان: %s° × %d تكرار لكل زاوية"
+                  % (", ".join("%+.0f" % g for g in angles), a.repeats))
+            run_no = 0
+            for ang in angles:
+                if aborted:
+                    break
+                print("\n   ══ الزاوية %+.1f° ══" % ang)
+                for i in range(1, a.repeats + 1):
+                    run_no += 1
+                    print("\n   ▶ %+.0f° · شوط %d/%d" % (ang, i, a.repeats))
+                    print("      علّم اتجاه الروبوت الحالي (شريط لاصق/منقلة)، ثم:")
+                    try:
+                        if input('      اضغط Enter للانطلاق (أو "q" للإنهاء): ').strip().lower() == "q":
+                            aborted = True
+                            break
+                    except EOFError:
                         aborted = True
                         break
-                except EOFError:
-                    aborted = True
-                    break
-                result = run_turn(link, keeper, a.turn, a.turn_speed, a.timeout)
-                if "error" in result:
-                    print("      ✗ %s" % result["error"])
-                    aborted = True
-                    break
-                print("      تكامل gz: خام=%+.2f° · بعد الوسيط الثلاثي وطرح الانحياز=%+.2f°"
-                      % (result["gz_raw_deg"], result["gz_corr_deg"]))
-                print("      قفزات gz مرفوضة بالوسيط (>%.0f°/ث): %d"
-                      % (SPIKE_JUMP_DPS, result["spikes_rejected"]))
-                print("      قصور بعد قطع الطاقة=%+.2f° · ذروة المعدل=%.1f · %d عيّنة"
-                      % (result["coast_deg"], result["peak_rate_dps"], result["samples"]))
-                if not result["hit_target"]:
-                    print("      ⚠ انتهت المهلة قبل بلوغ الهدف — الشوط غير مكتمل.")
-                truth = ask_float("      📐 الزاوية الحقيقية المقاسة (درجة، فارغ=تخطّي): ")
-                gz_vals.append(result["gz_corr_deg"])
-                coast_vals.append(result["coast_deg"])
-                turn_truth.append(truth)
-                writer.writerow(["turn", i, a.turn,
-                                 result["cmd_L"], result["cmd_R"],
-                                 round(result["duration_s"], 3),
-                                 "", "", "",
-                                 round(result["gz_bias"], 5),
-                                 round(result["gz_raw_deg"], 3),
-                                 round(result["gz_corr_deg"], 3),
-                                 round(result["coast_deg"], 3),
-                                 round(result["peak_rate_dps"], 2),
-                                 result["samples"],
-                                 "" if truth is None else truth,
-                                 result["bias_n"], result["bias_excluded"],
-                                 result["spikes_rejected"]])
-                fh.flush()
+                    result = run_turn(link, keeper, ang, a.turn_speed, a.timeout)
+                    if "error" in result:
+                        print("      ✗ %s" % result["error"])
+                        aborted = True
+                        break
+                    total = result["gz_corr_deg"] + result["coast_deg"]
+                    print("      تكامل gz: خام=%+.2f° · بعد الوسيط الثلاثي وطرح الانحياز=%+.2f°"
+                          % (result["gz_raw_deg"], result["gz_corr_deg"]))
+                    print("      قفزات gz مرفوضة بالوسيط (>%.0f°/ث): %d"
+                          % (SPIKE_JUMP_DPS, result["spikes_rejected"]))
+                    print("      قصور بعد قطع الطاقة=%+.2f° · المجموع=%+.2f° · ذروة المعدل=%.1f · %d عيّنة"
+                          % (result["coast_deg"], total, result["peak_rate_dps"],
+                             result["samples"]))
+                    if not result["hit_target"]:
+                        print("      ⚠ انتهت المهلة قبل بلوغ الهدف — الشوط غير مكتمل"
+                              " ولن يدخل الخط. ارفع --timeout.")
+                    truth = ask_float("      📐 الزاوية الحقيقية المقاسة (درجة، فارغ=تخطّي): ")
+                    gz_vals.append(result["gz_corr_deg"])
+                    coast_vals.append(result["coast_deg"])
+                    turn_truth.append(truth)
+                    turn_runs.append({"angle": ang, "corr": result["gz_corr_deg"],
+                                      "total": total, "truth": truth,
+                                      "hit": result["hit_target"]})
+                    writer.writerow(["turn", run_no, ang,
+                                     result["cmd_L"], result["cmd_R"],
+                                     round(result["duration_s"], 3),
+                                     "", "", "",
+                                     round(result["gz_bias"], 5),
+                                     round(result["gz_raw_deg"], 3),
+                                     round(result["gz_corr_deg"], 3),
+                                     round(result["coast_deg"], 3),
+                                     round(result["peak_rate_dps"], 2),
+                                     result["samples"],
+                                     "" if truth is None else truth,
+                                     result["bias_n"], result["bias_excluded"],
+                                     result["spikes_rejected"]])
+                    fh.flush()
 
         keeper.set_speed(0, 0)
 
         # ── التشتّت ─────────────────────────────────────────────────────
-        print("\n[5] التشتّت (وصفٌ للبيانات — بلا اشتقاق أي معامل):\n")
+        print("\n[5] التشتّت (وصفٌ للبيانات):\n")
         if enc_vals:
             print("   ── سير مستقيم · المأمور %.3f م ──" % a.straight)
             print(stats_line("تكامل الإنكودر", enc_vals, "م"))
             print(stats_line("المسطرة", straight_truth, "م"))
-        if gz_vals:
-            print("   ── لفّ بالمكان · المأمور %+.1f° ──" % a.turn)
-            print(stats_line("تكامل gz (بعد الانحياز)", gz_vals, "°"))
-            print(stats_line("قصور بعد قطع الطاقة", coast_vals, "°"))
-            print(stats_line("المنقلة", turn_truth, "°"))
+        for ang in angles:
+            runs = [r for r in turn_runs if r["angle"] == ang]
+            if not runs:
+                continue
+            print("   ── لفّ بالمكان · المأمور %+.1f° ──" % ang)
+            print(stats_line("تكامل gz حتى القطع", [r["corr"] for r in runs], "°"))
+            print(stats_line("قصور بعد قطع الطاقة",
+                             [r["total"] - r["corr"] for r in runs], "°"))
+            print(stats_line("المجموع (ما رآه الجايرو)", [r["total"] for r in runs], "°"))
+            print(stats_line("المنقلة", [r["truth"] for r in runs], "°"))
+
+        # ── الخط المستقيم: المنقلة مقابل الجايرو ────────────────────────
+        fit_pts = [r for r in turn_runs if r["hit"] and r["truth"] is not None]
+        fit_total = fit_corr = None
+        if angles:
+            print("\n[6] خط مستقيم: المنقلة = الميل × الجايرو + التقاطع (بالمقادير)\n")
+            n_angles = len(set(r["angle"] for r in fit_pts))
+            print("   نقاط صالحة: %d (مكتملة + لها قراءة منقلة) من %d زاوية"
+                  % (len(fit_pts), n_angles))
+            if n_angles < 2:
+                print("   — لا خط: يلزم زاويتان مختلفتان على الأقل (مثل --turn 45,90,180).")
+            else:
+                ys = [abs(r["truth"]) for r in fit_pts]
+                fit_total = linfit([abs(r["total"]) for r in fit_pts], ys)
+                fit_corr = linfit([abs(r["corr"]) for r in fit_pts], ys)
+                for label, fit in (("الجايرو = حتى القطع + القصور", fit_total),
+                                   ("الجايرو = حتى القطع وحده   ", fit_corr)):
+                    if fit is None:
+                        print("   %s : — (تنوّع غير كافٍ)" % label)
+                    else:
+                        print("   %s : الميل %.4f · التقاطع %+.2f° · R² %.4f"
+                              % (label, fit[0], fit[1], fit[2]))
+                if fit_total:
+                    print("\n   البواقي لكل زاوية (المنقلة − الخط، خط المجموع):")
+                    for ang in angles:
+                        pts = [r for r in fit_pts if r["angle"] == ang]
+                        if pts:
+                            res = [abs(r["truth"]) - (fit_total[0] * abs(r["total"]) + fit_total[1])
+                                   for r in pts]
+                            print("      %+7.1f°   متوسّط %+6.2f° · أقصى |%.2f|° · ن=%d"
+                                  % (ang, statistics.mean(res), max(abs(v) for v in res), len(pts)))
+            print("\n   ⚠ أرقام فقط: الميل لا يُطبَّق على شيء ولا يُقترح إعداداً — من هذه")
+            print("     الأرضية وهذه البطارية وحدهما.")
         print()
-        print("   ⚠ المقارنة بين السطرين متروكة لك ولجلسة المعايرة. هذا السكربت")
-        print("     لا يشتقّ معاملاً ولا يقترح تعديل أي إعداد — خمسة أشواط على")
-        print("     أرضية واحدة ببطارية واحدة لا تصنع ثابتاً فيزيائياً.")
+        print("   ⚠ هذا السكربت لا يطبّق شيئاً ولا يقترح تعديل أي إعداد — أشواط على")
+        print("     أرضية واحدة ببطارية واحدة لا تصنع ثابتاً فيزيائياً؛ القرار لجلسة")
+        print("     معايرة تقرأ ملفات CSV.")
 
         # ── الحكم ───────────────────────────────────────────────────────
         done = len(enc_vals) + len(gz_vals)
-        want = (a.repeats if a.straight is not None else 0) + \
-               (a.repeats if a.turn is not None else 0)
+        want = (a.repeats if a.straight is not None else 0) + a.repeats * len(angles)
         ok = (done == want) and not aborted
         reasons = ["أشواط مكتملة: %d من %d" % (done, want)]
         truths = [t for t in straight_truth + turn_truth if t is not None]
@@ -670,6 +766,9 @@ def main():
         if done and not truths:
             reasons.append("⚠ لا قياس يدوي واحد ⇒ الملف يحوي رأي الروبوت عن نفسه")
             reasons.append("   فقط، ولا يصلح مرجعاً لأي معايرة لاحقة.")
+        if fit_total:
+            reasons.append("الخط (المجموع): الميل %.4f · التقاطع %+.2f° · R² %.4f — أرقام فقط"
+                           % fit_total)
         reasons.append("السجل: " + path)
         return verdict(ok, reasons)
 
