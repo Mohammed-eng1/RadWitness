@@ -28,6 +28,18 @@ test_slip.py — الانزلاق أثناء الدوران بالمكان: ما
 لصار slip ≈ |ω_enc| + |ω_gyr| بلا معنى. السكربت يعدّ العيّنات المتوافقة
 الإشارة ويرسب إن كانت الأغلبية متعاكسة — **ولا يقلب شيئاً بنفسه**.
 
+--gyro-scale k (افتراضي 1.0) يضرب gz في k **قبل** كل حساب — لاختبار أثر معامل
+مقياس جايرو مقاس في test_drive على الانزلاق. الافتراضي يُبقي الجدول [4] مطابقاً
+لخط أساس 2026-09-23. وgz الخام يُحفظ في CSV كما وصل، والمعامل في عمود مستقل.
+
+القسم [5] يفصل المنتظم عن العشوائي لكل سرعة:
+  النسبة  k_s = Σ(ω_enc·ω_gyr)/Σω_enc²   (مربعات صغرى عبر الأصل)  ← المنتظم
+  العرض الفعّال = 0.141 / k_s   — عرض المسار الذي «يرى» الجايرو الروبوت يدور به
+  العشوائي = σ(ω_gyr − k_s·ω_enc)  — ما يبقى بعد طرح المنتظم
+وقبله وسيط ثلاثي على ω_gyr داخل كل لفّة (قفزات ±16°/ث تُعدّ وتُطبع)، فلا تتضخّم
+الكتلة العشوائية بقفزة من الحسّاس لا من الأرض. الجدول [4] يبقى على الخام.
+⚠ وصفٌ لا وصفة: العرض الفعّال رقمٌ من هذه الأرضية، لا يُطبَّق على شيء.
+
 الجدول يُحسب على عيّنات **الاستقرار** (بعد --settle-s من بدء كل لفّة)، لأن
 التسارع يضخّم أثر الفارق الزمني. والملف يحوي **كل** العيّنات مع عمود
 phase = ramp|steady لمن أراد إعادة الحساب.
@@ -226,6 +238,7 @@ STOP_CMD = {"T": 1, "L": 0, "R": 0}
 MAX_SPEED_MPS = 0.5          # أقصى سرعة عملية عبر T:1 على UGV01
 RESEND_MS = 800              # تجديد أمر السرعة — نبضة القلب في الفيرموير 3000ms
 TRACK_WIDTH_M = 0.141        # UGV01 (mainType=3) من مصدر الفيرموير
+SPIKE_JUMP_DPS = 8.0         # قفزة gz منفردة (المقاس ±15.9) — نصفها عتبة العدّ
 ENC_MOVING_RAD_S = 0.05      # تحتها ω_enc يُعدّ «لا دوران» ولا تُحكم إشارته
 GYRO_RANGES_DPS = (250.0, 500.0, 1000.0, 2000.0)   # مدى جايرو شائعة — لكشف التشبّع
 
@@ -298,7 +311,8 @@ def sign(x):
     return (x > 0) - (x < 0)
 
 
-def spin_once(link, keeper, writer, speed, rep, direction, spin_s, settle_s, reply_timeout):
+def spin_once(link, keeper, writer, speed, rep, direction, spin_s, settle_s, reply_timeout,
+              gyro_scale=1.0):
     """لفّة واحدة بالمكان: يأمر، ويجمع أزواج T:1001/T:1002 حتى انقضاء spin_s.
 
     direction = +1 ⇒ L=−v وR=+v (R−L موجب) · ‏−1 ⇒ العكس.
@@ -321,7 +335,7 @@ def spin_once(link, keeper, writer, speed, rep, direction, spin_s, settle_s, rep
             continue
         t_s = r["t1001"] - t0
         w_enc = (R - L) / TRACK_WIDTH_M
-        w_gyr = gz * math.pi / 180.0
+        w_gyr = gz * gyro_scale * math.pi / 180.0
         slip = abs(w_enc - w_gyr)
         dt_ms = (r["t1002"] - r["t1001"]) * 1000.0
         phase = "steady" if t_s >= settle_s else "ramp"
@@ -330,8 +344,43 @@ def spin_once(link, keeper, writer, speed, rep, direction, spin_s, settle_s, rep
         samples.append(s)
         writer.writerow([speed, rep, direction, left, right, round(t_s, 4), phase,
                          L, R, gz, round(w_enc, 5), round(w_gyr, 5), round(slip, 5),
-                         round(dt_ms, 3)])
+                         round(dt_ms, 3), gyro_scale])
     return samples
+
+
+def median3_runs(runs):
+    """وسيط ثلاثي على ω_gyr داخل كل لفّة (عيّنات الاستقرار المتتالية).
+    يعيد (أزواج (ω_enc، ω_gyr المرشَّح)، عدد القفزات المرفوضة)."""
+    jump = math.radians(SPIKE_JUMP_DPS)
+    pairs, rejected = [], 0
+    for run in runs:
+        st_ = [x for x in run if x["phase"] == "steady"]
+        g = [x["w_gyr"] for x in st_]
+        for k, x in enumerate(st_):
+            if 0 < k < len(g) - 1:
+                m = sorted(g[k - 1:k + 2])[1]
+                if abs(g[k] - m) > jump:
+                    rejected += 1
+            else:
+                m = g[k]
+            pairs.append((x["w_enc"], m))
+    return pairs, rejected
+
+
+def split_systematic(runs):
+    """المنتظم (النسبة عبر الأصل والعرض الفعّال) مقابل العشوائي (σ البواقي)."""
+    pairs, spikes = median3_runs(runs)
+    see = sum(e * e for e, _ in pairs)
+    if len(pairs) < 3 or see <= 0:
+        return None
+    k = sum(e * g for e, g in pairs) / see
+    resid = [g - k * e for e, g in pairs]
+    mean_abs_enc = statistics.mean(abs(e) for e, _ in pairs)
+    return {"k": k, "width": TRACK_WIDTH_M / k if k else float("inf"),
+            "rand_sd": statistics.stdev(resid),
+            "rand_pct": 100.0 * statistics.stdev(resid) / mean_abs_enc if mean_abs_enc else 0.0,
+            "sys_mean": statistics.mean(abs(e) * abs(1.0 - k) for e, _ in pairs),
+            "spikes": spikes, "n": len(pairs)}
 
 
 def summarize(speed, runs):
@@ -383,6 +432,8 @@ def main():
     ap.add_argument("--direction", choices=("alt", "ccw", "cw"), default="alt",
                     help="alt يتناوب · ccw: ‏R−L موجب · cw: ‏R−L سالب")
     ap.add_argument("--reply-timeout", type=float, default=0.3)
+    ap.add_argument("--gyro-scale", type=float, default=1.0,
+                    help="معامل يُضرب في gz قبل الحساب (افتراضي 1.0 = خط الأساس)")
     a = ap.parse_args()
 
     print("═" * 66)
@@ -408,6 +459,8 @@ def main():
                                % (a.settle_s, a.spin_s)])
     if a.reps < 1:
         return verdict(False, ["--reps يجب أن يكون 1 على الأقل."])
+    if not (0 < a.gyro_scale <= 5):
+        return verdict(False, ["--gyro-scale %.4f خارج (0، 5]." % a.gyro_scale])
 
     port = find_port(a.port)
     if not port:
@@ -416,6 +469,9 @@ def main():
     total = len(speeds) * a.reps
     print("الخطة: سرعات %s م/ث × %d لفّة = %d لفّة · %.1fث لكل لفّة · اتجاه %s"
           % (", ".join("%.2f" % v for v in speeds), a.reps, total, a.spin_s, a.direction))
+    if a.gyro_scale != 1.0:
+        print("⚠ --gyro-scale %.4f: gz يُضرب فيه قبل كل حساب — الجدول [4] **لا يُقارن**"
+              " بخط الأساس (المقاس بـ 1.0)." % a.gyro_scale)
     for v in speeds:
         w = 2 * v / TRACK_WIDTH_M
         print("   %.2f م/ث ⇒ ω_enc المتوقَّع ≈ %.2f rad/s ≈ %.0f °/ث"
@@ -442,12 +498,12 @@ def main():
 
         fh, writer, path = new_csv("slip", [
             "speed", "rep", "direction", "cmd_L", "cmd_R", "t_s", "phase",
-            "L", "R", "gz", "w_enc", "w_gyr", "slip", "dt_1001_1002_ms"])
+            "L", "R", "gz", "w_enc", "w_gyr", "slip", "dt_1001_1002_ms", "gyro_scale"])
 
         keeper = Keepalive(link, RESEND_MS / 1000.0)
         keeper.start()
 
-        results = {}
+        results, splits, all_runs = {}, {}, []
         print("\n[3] اللفّات:")
         for v in speeds:
             runs = []
@@ -457,7 +513,7 @@ def main():
                 else:
                     direction = 1 if a.direction == "ccw" else -1
                 run = spin_once(link, keeper, writer, v, rep, direction,
-                                a.spin_s, a.settle_s, a.reply_timeout)
+                                a.spin_s, a.settle_s, a.reply_timeout, a.gyro_scale)
                 keeper.set_speed(0, 0)
                 hard_stop(link, times=1)
                 completed += 1
@@ -473,6 +529,8 @@ def main():
                 fh.flush()
                 time.sleep(a.rest_s)
             results[v] = summarize(v, runs)
+            splits[v] = split_systematic(runs)
+            all_runs.extend(runs)
 
         # ── الجدول ──────────────────────────────────────────────────────
         print("\n[4] الجدول (عيّنات الاستقرار فقط · rad/s · ms):\n")
@@ -490,6 +548,25 @@ def main():
         print("   ⚠ القراءتان من لحظتين مختلفتين (العمودان Δt): جزء من «الانزلاق» أعلاه")
         print("     قد يكون فارق زمن لا انزلاقاً. تعديل الفيرموير سيعالج ذلك لاحقاً.")
         print("   ⚠ أرقام فقط — لا معامل مشتقّ ولا تعديل مقترح.")
+
+        # ── المنتظم مقابل العشوائي ─────────────────────────────────────
+        print("\n[5] المنتظم مقابل العشوائي (ω_gyr بعد وسيط ثلاثي · gyro-scale = %.4f):\n"
+              % a.gyro_scale)
+        print("   سرعة   عيّنات  النسبة k   العرض الفعّال م   المنتظم |ω_enc|·|1−k|   العشوائي σ   العشوائي ٪   قفزات")
+        print("   " + "─" * 100)
+        pooled = split_systematic(all_runs)
+        for label, sp in [("%.2f" % v, splits[v]) for v in speeds] + [("الكل", pooled)]:
+            if sp is None:
+                print("   %-5s  —" % label)
+                continue
+            print("   %-5s  %6d   %7.4f   %13.4f   %20.3f   %11.3f   %9.1f   %5d"
+                  % (label, sp["n"], sp["k"], sp["width"], sp["sys_mean"],
+                     sp["rand_sd"], sp["rand_pct"], sp["spikes"]))
+        print()
+        print("   العرض الفعّال = %.3f / k  — ما يلزم ليتطابق الإنكودر مع الجايرو. وصفٌ لا"
+              % TRACK_WIDTH_M)
+        print("   وصفة: يتغيّر بالأرضية والحمل، ولا يُطبَّق على أي إعداد.")
+        print("   العشوائي بالـrad/s وبالنسبة إلى متوسّط |ω_enc|.")
 
         # ── الحكم: صلاحية البيانات لا جودة الروبوت ──────────────────────
         ok = True
@@ -519,6 +596,11 @@ def main():
                                " (الصيغة تفترض °/ث)." % v)
         if ok:
             reasons.append("✅ كل سرعة لها عيّنات استقرار وإشارتان متوافقتان.")
+        if pooled:
+            reasons.append("المنتظم (الكل): k %.4f ⇒ العرض الفعّال %.4f م · العشوائي σ %.3f rad/s"
+                           " (%.1f٪) · gyro-scale %.4f — أرقام فقط"
+                           % (pooled["k"], pooled["width"], pooled["rand_sd"],
+                              pooled["rand_pct"], a.gyro_scale))
         reasons.append("⚠ القراءتان من لحظتين مختلفتين — جزء من الانزلاق قد يكون فارق زمن.")
         reasons.append("السجل: " + path)
         return verdict(ok, reasons)
