@@ -29,7 +29,7 @@ bringup.py — المشغّل الرئيسي: هل الروبوت الجديد �
 
 التشغيل:
     python3 -m pi.tests.ugv01.bringup
-    python3 -m pi.tests.ugv01.bringup --motors --port /dev/ttyUSB0
+    python3 -m pi.tests.ugv01.bringup --motors --port /dev/ttyAMA4
 """
 from __future__ import annotations
 

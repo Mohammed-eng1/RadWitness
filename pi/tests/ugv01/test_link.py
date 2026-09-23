@@ -26,7 +26,7 @@ test_link.py — هل لوحة UGV01 ترد أصلاً؟  (اختبار الإق
 
 التشغيل:
     python3 -m pi.tests.ugv01.test_link
-    python3 -m pi.tests.ugv01.test_link --port /dev/ttyUSB0 --rounds 20
+    python3 -m pi.tests.ugv01.test_link --port /dev/ttyAMA4 --rounds 20
 """
 from __future__ import annotations
 
@@ -49,7 +49,17 @@ except ImportError:
 # مكرّرة عمداً في كل سكربت هنا: هذه اختبارات يوم أول، ولو فشل استيراد من
 # pi.* لأي سبب وجب أن تبقى عاملة. الاستقلال ميزة لا تكرار.
 BAUD = 115200
-PORT_CANDIDATES = ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/serial0")
+# المنفذ المثبت على العتاد (قياس لا افتراض): UART4 على GPIO8/9، والبقية
+# احتياط فقط — serial0 على هذه الراسبري ليس وصلة اللوحة.
+PRIMARY_PORT = "/dev/ttyAMA4"
+PORT_CANDIDATES = (PRIMARY_PORT, "/dev/serial0", "/dev/ttyUSB*", "/dev/ttyACM*")
+PRIMARY_MISSING_HINT = (
+    "⚠ %s غير موجود — وهو منفذ لوحة UGV01 المثبت (UART4)." % PRIMARY_PORT,
+    "   • /boot/firmware/config.txt تحت [all] يجب أن يحوي:  dtoverlay=uart4",
+    "     (مع enable_uart=1 · dtoverlay=disable-bt · dtparam=uart0=on) ثم أعد الإقلاع.",
+    "   • الأسلاك: TX: GPIO8 → الدبوس 24 (إلى RX اللوحة) · RX: GPIO9 → الدبوس 21 (من TX اللوحة) · GND مشترك.",
+    "   • تحقّق:  ls -l /dev/ttyAMA*   و   grep -n uart4 /boot/firmware/config.txt",
+)
 BOOT_WAIT_S = 3.0          # إقلاع ESP32 المقاس على المنصّة السابقة ~3ث
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
@@ -61,12 +71,20 @@ INIT_CMDS = (
 
 
 def find_port(explicit=None):
-    """يعيد المنفذ المطلوب أو أول مرشّح موجود، وNone إن لم يوجد شيء."""
+    """يعيد --port إن مُرِّر، وإلا أول مرشّح موجود بالترتيب، وNone إن لم يوجد شيء.
+    غياب ttyAMA4 يُطبع تشخيصه صراحةً: السقوط الصامت إلى serial0 يفتح منفذاً
+    حيّاً لجهاز آخر فيبدو العطل «اللوحة لا تردّ» وهو في config.txt."""
     if explicit:
         return explicit
+    if not os.path.exists(PRIMARY_PORT):
+        for line in PRIMARY_MISSING_HINT:
+            print(line)
     for pattern in PORT_CANDIDATES:
         hits = sorted(glob.glob(pattern))
         if hits:
+            if hits[0] != PRIMARY_PORT:
+                print("⚠ سقوط احتياطي إلى %s — ليس المنفذ المثبت؛ تأكّد أنه اللوحة فعلاً."
+                      % hits[0])
             return hits[0]
     return None
 
@@ -192,7 +210,7 @@ def main():
     if not port:
         return verdict(False, [
             "لم يُعثر على أي منفذ: %s" % ", ".join(PORT_CANDIDATES),
-            "وصّل اللوحة بالـUSB أو مرّر --port صراحةً.",
+            "راجع التشخيص أعلاه (dtoverlay=uart4 · الدبوسان 24 و21)، أو مرّر --port صراحةً.",
         ])
     print("المنفذ: %s @ %d" % (port, a.baud))
 
