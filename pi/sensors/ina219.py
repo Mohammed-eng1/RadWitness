@@ -33,6 +33,7 @@ from pi.config import (
     INA219_ADDR, INA219_I2C_BUS, INA219_CONFIG_VALUE, INA219_LSB_V,
     INA219_MIN_PLAUSIBLE_V, INA219_MAX_PLAUSIBLE_V,
     INA219_SHUNT_OHM, INA219_CURRENT_LSB_V, INA219_CURRENT_SIGN,
+    PI_I2C1_SHARED_WITH_BOARD,
 )
 
 try:
@@ -65,6 +66,13 @@ class INA219Reader:
         self._bus = None
         self._lock = threading.Lock()
 
+        # 🔴 قبل أي فتح أو كتابة: على UGV01 هذا الناقل ملك الـESP32. والقارئ
+        #    **يكتب** سجل الإعدادات (0x399F) — أي أنه كان سيعيد ضبط INA219
+        #    اللوحة تحت قدمي فيرمويرها، فوق تصادم المتحكّمين.
+        if self.bus_num == 1 and PI_I2C1_SHARED_WITH_BOARD:
+            self.error = ("i2c-1 مشترك مع لوحة UGV01 (حزمة الأسلاك) — الراسبري "
+                          "لا يتحكّم فيه؛ الجهد من حقل v في T:1001")
+            return
         if not _SMBUS_OK:
             self.error = "smbus2 غير مثبّتة (pip install smbus2)"
             return

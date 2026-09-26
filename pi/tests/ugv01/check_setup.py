@@ -85,7 +85,12 @@ GRAVITY_UNITS = (((490.0, 1470.0), 100.0, "×100 (سم/ث²)"),
                  ((4.9, 14.7), 1.0, "م/ث²"),
                  ((0.5, 1.5), 1.0 / 9.80665, "g"))
 SIGN_MIN_DEG = 45.0
-I2C_PASSES = 5                       # كل عنوان يُسأل 5 مرات: ناقل سليم يجيب 5/5 أو 0/5                  # دون هذا في المرحلة اليدوية: حركة غير كافية
+I2C_PASSES = 5
+# 🔴 i2c-1 (الدبوسان 3 و5) مشترك مع لوحة ESP32 عبر حزمة أسلاك المصنع (قطعة
+# Jetson على الدبابيس 1–10 — لا تُغيَّر). المسح عليه **يتصادم** مع الـESP32
+# الذي يقرأ حساساته باستمرار (مقاس 2026-09-26: عناوين عشوائية كل لقطة)، وقد
+# يُفسد قراءاته — ومنها الجايرو. لا يُسأل إلا بـ --i2c-shared-probe صراحةً.
+SHARED_I2C_BUSES = (1,)                       # كل عنوان يُسأل 5 مرات: ناقل سليم يجيب 5/5 أو 0/5                  # دون هذا في المرحلة اليدوية: حركة غير كافية
 
 
 # ═══ السجل والنتيجة ═══════════════════════════════════════════════════
@@ -186,12 +191,15 @@ def check_config_txt(rep):
     want = (("dtoverlay=uart4", "UART4 للوحة (الدبوسان 24 و21)", True),
             ("enable_uart=1", "UART", False),
             ("dtoverlay=disable-bt", "إطلاق UART0 من البلوتوث", False),
-            ("dtparam=uart0=on", "UART0 للـGPS", False),
-            ("dtparam=i2c_arm=on", "I2C-1 (INA219؛ الدبوسان 3 و5)", False))
+            ("dtparam=uart0=on", "UART0", False))
     for key, why, critical in want:
         found = any(ln.replace(" ", "") == key for ln in lines)
         rep.add("config", key, "ok" if found else ("fail" if critical else "warn"),
                 ("موجود — " if found else "غائب — ") + why)
+    arm_on = any(ln.replace(" ", "") == "dtparam=i2c_arm=on" for ln in lines)
+    rep.add("config", "dtparam=i2c_arm", "warn" if arm_on else "ok",
+            "on — الراسبري قادر على التحكّم في ناقل اللوحة المشترك؛ يُفضَّل off"
+            if arm_on else "off/غائب — الراسبري لا يلمس ناقل اللوحة ✓")
     i2c_extra = [ln for ln in lines if ln.startswith("dtoverlay=i2c")]
     rep.add("config", "نواقل I2C إضافية", "ok" if i2c_extra else "warn",
             ", ".join(i2c_extra) if i2c_extra else
@@ -286,7 +294,7 @@ def check_board(rep, link):
 
 
 # ═══ 4) I2C ══════════════════════════════════════════════════════════
-def check_i2c(rep, full_scan):
+def check_i2c(rep, full_scan, shared_probe=False):
     print("\n[4] نواقل I2C")
     buses = sorted(int(p.rsplit("-", 1)[1]) for p in glob.glob("/dev/i2c-*")
                    if p.rsplit("-", 1)[1].isdigit())
@@ -300,6 +308,10 @@ def check_i2c(rep, full_scan):
         return
     found = {}
     for b in buses:
+        if b in SHARED_I2C_BUSES and not shared_probe:
+            rep.add("i2c", "i2c-%d" % b, "skip",
+                    "مشترك مع لوحة UGV01 — لا يُسأل (--i2c-shared-probe للإجبار)")
+            continue
         try:
             bus = SMBus(b)
         except Exception as e:
@@ -368,9 +380,9 @@ def check_i2c(rep, full_scan):
         finally:
             bus.close()
     rep.data["i2c_found"] = {str(k): v for k, v in found.items()}
-    if not any(a in INA219_ADDRS for v in found.values() for a in v):
-        rep.add("i2c", "INA219", "warn", "غير موجود ⇒ لا حماية جهد فعلية (الحاجز الزمني وحده)")
-    if not any(a in MPU_ADDRS for v in found.values() for a in v):
+    if found and not any(a in INA219_ADDRS for v in found.values() for a in v):
+        rep.add("i2c", "INA219", "warn", "غير موجود على نواقل الراسبري الخاصة")
+    if found and not any(a in MPU_ADDRS for v in found.values() for a in v):
         rep.add("i2c", "MPU", "warn", "غير موجود ⇒ مصدر الاتجاه ugv01_gyro (جايرو اللوحة)")
 
 
@@ -586,6 +598,8 @@ def main():
     ap.add_argument("--gps-seconds", type=float, default=4.0)
     ap.add_argument("--geiger-seconds", type=float, default=10.0)
     ap.add_argument("--i2c-scan", action="store_true", help="مسح كامل 0x03–0x77 لكل ناقل")
+    ap.add_argument("--i2c-shared-probe", action="store_true",
+                    help="⚠ يسأل i2c-1 المشترك مع لوحة ESP32 — قد يتصادم معها")
     ap.add_argument("--gyro-sign", action="store_true",
                     help="مرحلة تفاعلية: إشارة gz باليد بلا محركات")
     ap.add_argument("--sign-seconds", type=float, default=6.0,
@@ -611,7 +625,7 @@ def main():
                         "%s (السيرفر يعمل؟ مجموعة dialout؟)" % e)
             if link:
                 check_board(rep, link)
-        check_i2c(rep, a.i2c_scan)
+        check_i2c(rep, a.i2c_scan, a.i2c_shared_probe)
         check_camera(rep)
         check_gps(rep, a.gps_seconds)
         check_geiger(rep, a.geiger_seconds)

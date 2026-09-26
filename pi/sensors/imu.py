@@ -40,6 +40,7 @@ import time
 
 from pi.config import (
     BNO055_ADDR, BNO055_I2C_BUS, BNO055_NO_MAG_MODE, BNO055_GYRO_IN_RAD,
+    PI_I2C1_SHARED_WITH_BOARD,
 )
 
 try:
@@ -298,7 +299,11 @@ class IMUReader:
             attempts.append(("smbus2", "غير مثبّت (pip install smbus2)"))
 
         # ── 2) Adafruit على الناقل 1 (احتياطي — يُحمَّل الآن فقط) ──
-        if not self.ok:
+        # 🔴 على UGV01 الناقل 1 ملك الـESP32: مسبار BNO055 عليه **يكتب** سجلّ
+        #    الوضع لأي شيء يردّ على 0x28/0x29 — وعنوان وهمي ردّ فعلاً هناك.
+        if not self.ok and PI_I2C1_SHARED_WITH_BOARD:
+            attempts.append(("adafruit i2c-1", "مُتخطّى: الناقل مشترك مع لوحة UGV01"))
+        elif not self.ok:
             if _load_adafruit():
                 for a in (addr, 0x28 if addr != 0x28 else 0x29):
                     try:
