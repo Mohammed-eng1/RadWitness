@@ -84,7 +84,8 @@ SPIKE_JUMP_DPS = 8.0                 # قفزة gz منفردة (المقاس ±
 GRAVITY_UNITS = (((490.0, 1470.0), 100.0, "×100 (سم/ث²)"),
                  ((4.9, 14.7), 1.0, "م/ث²"),
                  ((0.5, 1.5), 1.0 / 9.80665, "g"))
-SIGN_MIN_DEG = 45.0                  # دون هذا في المرحلة اليدوية: حركة غير كافية
+SIGN_MIN_DEG = 45.0
+I2C_PASSES = 5                       # كل عنوان يُسأل 5 مرات: ناقل سليم يجيب 5/5 أو 0/5                  # دون هذا في المرحلة اليدوية: حركة غير كافية
 
 
 # ═══ السجل والنتيجة ═══════════════════════════════════════════════════
@@ -307,14 +308,30 @@ def check_i2c(rep, full_scan):
         try:
             addrs = range(0x03, 0x78) if full_scan else \
                 INA219_ADDRS + MPU_ADDRS + BNO055_ADDRS
-            hits = []
-            for a in addrs:
-                try:
-                    bus.read_byte(a)
-                    hits.append(a)
-                except Exception:
-                    pass
+            # 🔴 تكرار لا قراءة واحدة: مقاس 2026-09-26 — تشغيلان متتاليان على
+            #    i2c-1 أعطيا عناوين مختلفة (0x40/0x44/0x69/0x28 تظهر وتختفي،
+            #    وINA219 يقرأ 11.91V ثم Errno 5). عنوان يجيب أحياناً = **ناقل
+            #    متقطّع** (§0: قِس الخط)، لا جهاز. والقراءة الواحدة لا تميّزه.
+            score = {}
+            for _ in range(I2C_PASSES):
+                for a in addrs:
+                    try:
+                        bus.read_byte(a)
+                        score[a] = score.get(a, 0) + 1
+                    except Exception:
+                        pass
+            hits = sorted(a for a, n in score.items() if n == I2C_PASSES)
+            flaky = sorted(a for a, n in score.items() if 0 < n < I2C_PASSES)
             found[b] = hits
+            rep.data.setdefault("i2c_score", {})[str(b)] = {"0x%02x" % a: n
+                                                            for a, n in score.items()}
+            if flaky:
+                rep.data.setdefault("i2c_flaky", {})[str(b)] = ["0x%02x" % a for a in flaky]
+                rep.add("i2c", "i2c-%d متقطّع" % b, "fail",
+                        "عناوين تجيب أحياناً: %s ⇒ الناقل غير سليم — قِس الخط"
+                        " (SDA/SCL/GND، مقاومات الشدّ، طول السلك) قبل أي برمجية"
+                        % ", ".join("0x%02x=%d/%d" % (a, score[a], I2C_PASSES)
+                                    for a in flaky))
             for a in hits:
                 if a in INA219_ADDRS:
                     try:
@@ -338,7 +355,8 @@ def check_i2c(rep, full_scan):
                     except Exception:
                         who = None
                     rep.data.setdefault("mpu", []).append({"bus": b, "addr": a, "whoami": who})
-                    rep.add("i2c", "MPU i2c-%d @0x%02x" % (b, a), "ok",
+                    rep.add("i2c", "MPU i2c-%d @0x%02x" % (b, a),
+                            "ok" if who in MPU_WHOAMI else "warn",
                             "WHO_AM_I=%s ⇒ %s" % ("0x%02x" % who if who is not None else "?",
                                                   MPU_WHOAMI.get(who, "غير معروف")))
                 elif a in BNO055_ADDRS:
