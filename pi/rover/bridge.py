@@ -312,7 +312,8 @@ class WaveRoverBridge:
                 time.sleep(UGV01_INIT_GAP_S)
             self._ser.reset_input_buffer()      # ردود التهيئة لا تخصّ أحداً
             self._event("ugv01_init",
-                        "تهيئة UGV01: T:900 main=3 · إطفاء الصدى/التشخيص/البثّ")
+                        "تهيئة UGV01: T:900 main=3 · إطفاء الصدى/التشخيص/البثّ"
+                        " · مهلة نبضة الفيرموير 1.5ث")
         except Exception as e:                  # noqa: BLE001
             self._event("ugv01_init_fault", f"⚠ تعذّرت تهيئة UGV01: {e}")
 
