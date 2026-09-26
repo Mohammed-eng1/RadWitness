@@ -764,7 +764,8 @@ def main() -> int:
 
     # 🔴 جايرو لوحة UGV01: الإشارة غير المقاسة ترفض، والوسيط يُسقط القفزة
     from pi.sensors.heading import UGV01GyroHeading
-    s_unmeasured = make_heading_source(bridge=rb, source="ugv01_gyro")
+    # الإشارة صارت مقاسة في config (−1) — فالحارس يُفحص بإشارة None صريحة
+    s_unmeasured = UGV01GyroHeading(rb, sign=None)
     check("🔴 ugv01_gyro بإشارة غير مقاسة ⇒ ok=False وسبب يقول كيف تُقاس",
           s_unmeasured.ok is False and "--gyro-sign" in (s_unmeasured.error or ""),
           (s_unmeasured.error or "")[:50])
@@ -787,6 +788,10 @@ def main() -> int:
     out = [ug2._read_rate_dps() for _ in ramp]
     check("…والمنحدر الحقيقي يمرّ بعيّنة تأخير واحدة لا أكثر",
           out[2:] == ramp[1:-1] and ug2.median_rejects == 0, f"{out}")
+    s_measured = make_heading_source(bridge=rb, source="ugv01_gyro")
+    check("ugv01_gyro بالإشارة المقاسة في config ⇒ مصدر صالح على العتاد",
+          s_measured.ok is True and s_measured.name == "ugv01_gyro"
+          and s_measured.sign == -1, f"sign={getattr(s_measured, 'sign', None)}")
     check("وفي المحاكاة ugv01_gyro ⇒ مصدر المحاكاة (الجسر الوهمي يولّد gz)",
           make_heading_source(bridge=br2, source="ugv01_gyro").ok is True)
 
