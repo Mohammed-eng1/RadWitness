@@ -193,7 +193,10 @@ def _ang_signed(frm: float, to: float) -> float:
 
 class MissionSim:
     def __init__(self):
-        self.profile = None
+        # UGV01: المسافة من الإنكودر (ODOMETRY_SOURCE) فلا يُشترط معايرة قبل
+        #   المسح — الملف احتياط لفشل القراءة وأساس زمن المهمة. Wave Rover
+        #   بلا إنكودر: المسافة **هي** الملف ⇒ يبقى المعايرة شرطاً.
+        self.profile = ugv01_encoder_profile() if IS_UGV01 else None
         # جسر الروفر (محاكاة على ويندوز؛ يُبدَّل إلى real على الراسبري بعلم واحد)
         self.rover = WaveRoverBridge(mode=ROVER_MODE)
         self.reactive = ReactiveSafety()   # أولوية مطلقة (البند 6 مفعّل)
@@ -2166,9 +2169,9 @@ class MissionSim:
                 blockers.append("UGV01: جهة «أمام» لم تُتحقَّق — اضغط «تقدّم» في "
                                 "القيادة اليدوية منظوراً من خلف الروبوت، ثم "
                                 "UGV01_FORWARD_VERIFIED = True")
-            warnings.append("⚠ UGV01: ثوابت الحركة من الإنكودر لا المسطرة، و"
-                            "HEADING_KP غير مضبوط على حلقة PID — راقب أول مهمة، "
-                            "وعايِر السرعة بالشريط من الواجهة")
+            warnings.append("⚠ UGV01: المسافة من الإنكودر (دوران العجلة — لا "
+                            "يرى الانزلاق)، وHEADING_KP غير مضبوط على حلقة PID "
+                            "— راقب أول مهمة")
             warnings.append("⚠ UGV01: حماية الجهد من حقل v (بطيء التحديث — "
                             "قرار المشغّل 2026-09-26) + الحاجز الزمني")
 

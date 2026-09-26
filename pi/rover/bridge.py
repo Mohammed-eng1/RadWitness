@@ -587,6 +587,26 @@ class WaveRoverBridge:
             self.last_status = d
         return d
 
+    def wheel_speeds_mps(self):
+        """
+        سرعتا العجلتين **من الإنكودر** بإطار الروبوت: (يسار، يمين) م/ث،
+        موجبة = تقدّم. أو `None` حين لا يوجد إنكودر أو فشلت القراءة.
+
+        L/R في T:1001 بإطار **السلك** (أمر +0.1 ⇒ موجبان — test_encoder)،
+        فيُعكس تحويل motors() نفسه: النفي ثم التبديل. ⚠ بلا هذا العكس يصير
+        التقدّم الفعلي مسافةً سالبة على الخريطة المرآتية.
+        على Wave Rover الحقلان صدى الأمر (لا إنكودر) ⇒ None دائماً.
+        """
+        if not IS_UGV01:
+            return None
+        d = self.read_status()
+        try:
+            lw, rw = float(d["L"]), float(d["R"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        un_l, un_r = (rw, lw) if MOTOR_SWAP_LR else (lw, rw)
+        return un_l * MOTOR_INVERT, un_r * MOTOR_INVERT
+
     # ── الجهد: INA219 أولاً، ثم رسالة الروفر، ثم لا شيء ──────────
     # ⚠ المصدر **يُعلَن دائماً** في `voltage_source`: خلط مصدرَي حماية يجعل
     #    تشخيص أي حادثة مستحيلاً («هل توقّف لأن الجهد هبط أم لأن الزمن نفد؟»).

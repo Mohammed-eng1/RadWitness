@@ -31,6 +31,7 @@ from pi.config import (
     NAV_IGNORE_OBSTACLES_DEFAULT, NAV_POWER_DEFAULT, TURN_MIN_POWER,
     DRIVE_POWER_DEFAULT, DRIVE_STICTION_POWER,
     TURN_MIN_ACHIEVABLE_DEG, HEADING_STEER_PHASE_DEG,
+    ODOMETRY_SOURCE,
 )
 from pi.nav.room import CELL_SIZE_M
 from pi.nav.heading_hold import HeadingController, signed_error
@@ -177,6 +178,7 @@ class DriveExecutor:
         started = time.time()
         aborted = None
         last_decision = None
+        odo = self._odometry_new()
         crawl_power = SPEED_LADDER[-1][1]
 
         # ── 🔴 مرجع التحقق من الحركة: المسافة الأمامية **قبل** التحرّك ──
@@ -213,6 +215,9 @@ class DriveExecutor:
                                  #   تُقرأ أصلاً، وفرع الجدار المعروف يقرأها.
         ramped = 0               # عدد الدورات التي قُيّد فيها الرفع
         last_ts = time.time()
+        # ⚠ زمن المسافة يبدأ هنا لا عند إنشاء odo: انتظار استقرار المرجع
+        #   الأمامي أعلاه (ثوانٍ) كان سيُضرب في أول سرعة مقروءة.
+        odo["ts"] = last_ts
         try:
             while covered < distance_m:
                 if (time.time() - started) > MAX_CELL_TRAVEL_S:
@@ -300,10 +305,10 @@ class DriveExecutor:
                         hold_lost = getattr(src, "error", "مصدر الاتجاه توقّف")
                     self.rover.forward(power)
                 time.sleep(REACTIVE_LOOP_S)
-                # المسافة تُتكامل من السرعة **المعايرة** للقوة المطبَّقة فعلاً.
-                # ⚠ التصحيح لا يغيّرها: متوسط (يسار، يمين) = الأساس بالضبط
-                #    لأن الوزنيتين متعاكستان و±corr متعاكسان.
-                covered += self.profile.speed_for_power(power) * REACTIVE_LOOP_S
+                # المسافة: من الإنكودر حيث وُجد، وإلا من السرعة **المعايرة**
+                # للقوة المطبَّقة فعلاً. ⚠ التصحيح لا يغيّر الثانية: متوسط
+                # (يسار، يمين) = الأساس بالضبط لأن ±corr متعاكسان.
+                covered += self._odometry_increment(power, +1, odo)
         finally:
             self.rover.stop()                      # ⚠ إيقاف مضمون
             # 🔴 لحظة السكون **هي** بداية نافذة عدّ هذه الخلية. المستدعي
@@ -318,7 +323,8 @@ class DriveExecutor:
         out = {"ok": aborted is None, "covered_m": round(covered, 3),
                "aborted": aborted,
                "reason": (last_decision or {}).get("reason"),
-               "elapsed_s": round(time.time() - started, 2)}
+               "elapsed_s": round(time.time() - started, 2),
+               "odometry": self._odometry_summary(odo)}
         # ── 🔴 الحكم: هل تحرّك فعلاً بالقدر المأمور؟ ─────────────────
         # ⚠ يُحسب على `covered` (ما أُمر به فعلاً قبل أي إجهاض) لا على
         #    `distance_m`: خطوة أُجهضت بعد 0.1م ليست «حركة ناقصة» بل أمر أقصر.
@@ -348,6 +354,50 @@ class DriveExecutor:
         self.log.append(out)
         return out
 
+    # ── المسافة المقطوعة: إنكودر أولاً، والملف احتياط معدود ─────────
+    @staticmethod
+    def _odometry_new() -> dict:
+        return {"encoder": 0, "fallback": 0, "reverse": 0,
+                "ts": time.time()}
+
+    def _odometry_increment(self, power: float, direction: int, odo: dict) -> float:
+        """
+        مسافة دورة سير واحدة (م، ≥0) **باتجاه الأمر**.
+
+        ODOMETRY_SOURCE="encoder": متوسط سرعتي العجلتين (إطار الروبوت) ×
+        الزمن **المقاس** منذ الدورة السابقة — لا REACTIVE_LOOP_S: قراءات
+        الحساسات والجسر تطيل الدورة، فالزمن الاسمي يُنقص المسافة.
+        ⚠ حركة بعكس الأمر لا تُحسب تقدّماً (تُعدّ في `reverse`). ولا تكشف
+        خريطة محركات مقلوبة: إطار الإنكودر يُعاد بنفس MOTOR_INVERT/SWAP فيبقى
+        متسقاً مع الأمر أياً كانت الجهة الفيزيائية — الحكم هناك للمشغّل.
+        وفشل القراءة ⇒ الملف، معدوداً في `fallback`.
+        """
+        now = time.time()
+        dt = max(0.0, now - odo["ts"])
+        odo["ts"] = now
+        if ODOMETRY_SOURCE == "encoder":
+            ws = getattr(self.rover, "wheel_speeds_mps", None)
+            v = ws() if callable(ws) else None
+            if v is not None:
+                odo["encoder"] += 1
+                along = direction * (float(v[0]) + float(v[1])) / 2.0
+                if along < 0.0:
+                    odo["reverse"] += 1
+                    return 0.0
+                return along * dt
+            odo["fallback"] += 1
+        return self.profile.speed_for_power(power) * REACTIVE_LOOP_S
+
+    @staticmethod
+    def _odometry_summary(odo: dict) -> dict:
+        n = odo["encoder"] + odo["fallback"]
+        src = ("encoder" if odo["encoder"] and not odo["fallback"]
+               else "mixed" if odo["encoder"] else
+               "profile" if ODOMETRY_SOURCE == "profile" or n == 0 else "fallback")
+        return {"source": src, "encoder_samples": odo["encoder"],
+                "fallback_samples": odo["fallback"],
+                "reverse_samples": odo["reverse"]}
+
     # ── رجوع قصير محكوم (انسحاب / تراجع التدرّج) ─────────────────
     def backward_step(self, distance_m: float, power: float = None) -> dict:
         """
@@ -367,18 +417,20 @@ class DriveExecutor:
         witness = AccelWitness() if self.verify_motion_enabled else None
         d_start = self._settled_front_cm() if self.verify_motion_enabled else None
         covered, started = 0.0, time.time()
+        odo = self._odometry_new()
         try:
             while covered < dist and (time.time() - started) <= MAX_CELL_TRAVEL_S:
                 if witness is not None:
                     witness.add(self._read_accel())
                 self.rover.backward(p)
                 time.sleep(REACTIVE_LOOP_S)
-                covered += self.profile.speed_for_power(p) * REACTIVE_LOOP_S
+                covered += self._odometry_increment(p, -1, odo)
         finally:
             self.rover.stop()                      # ⚠ إيقاف مضمون
         out = {"ok": True, "covered_m": round(covered, 3), "aborted": None,
                "reason": "رجوع قصير (بلا إشراف خلفي)", "direction": -1,
-               "elapsed_s": round(time.time() - started, 2)}
+               "elapsed_s": round(time.time() - started, 2),
+               "odometry": self._odometry_summary(odo)}
         if self.verify_motion_enabled:
             out["motion"] = verify_motion(max(covered, 0.0), d_start,
                                           self._settled_front_cm(), witness,

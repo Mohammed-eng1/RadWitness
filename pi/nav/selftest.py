@@ -2692,6 +2692,50 @@ def main() -> int:
     check("السير المستقيم يبقى في طوره (تنعيم أثقل — والعتبة موحّدة مع التوجيه)",
           hh0.get("phase") == "drive", f"الطور={hh0.get('phase')}")
 
+    # ── 🔴 خريطة المحركات + المسافة من الإنكودر (UGV01 · 2026-09-26) ──
+    # «قدّام» كان يرجع للخلف ⇒ تبديل + نفي على المنصّتين. والسلك (L+,R−)
+    # يمين (جايرو مقاس يدوياً) ⇒ turn("R") يجب أن يبقى (L+,R−) على السلك.
+    from pi.config import MOTOR_SWAP_LR, ODOMETRY_SOURCE
+    mb = WaveRoverBridge(mode="sim")
+    w_fwd = mb.motors(0.2, 0.2)
+    mb.turn("R", 0.15)
+    w_rt = mb._cmd_lr
+    check("خريطة المحركات: تقدّم ⇒ السلك سالب · لفّ يمين ⇒ السلك (L+,R−)",
+          MOTOR_INVERT == -1 and MOTOR_SWAP_LR is True
+          and w_fwd["L"] < 0 and w_fwd["R"] < 0 and w_rt[0] > 0 > w_rt[1],
+          f"تقدّم L={w_fwd['L']} R={w_fwd['R']} · يمين {w_rt}")
+    mb.motors(0.25, 0.10)                     # يسار أسرع — يكشف التبديل
+    ws = mb.wheel_speeds_mps()
+    if _ug:
+        check("الإنكودر يُعاد لإطار الروبوت (عكس النفي والتبديل)",
+              ws is not None and abs(ws[0] - 0.25) < 1e-9 and abs(ws[1] - 0.10) < 1e-9,
+              f"(يسار، يمين)={ws}")
+    else:
+        check("Wave Rover بلا إنكودر ⇒ wheel_speeds_mps = None", ws is None)
+    mb.stop()
+
+    class HalfSpeedRover(WaveRoverBridge):
+        """عجلات تدور بنصف ما يقوله الملف (انزلاق/حمل) — الإنكودر يراه."""
+        def wheel_speeds_mps(self):
+            return (0.05, 0.05) if self._moving else (0.0, 0.0)
+    hr = HalfSpeedRover(mode="sim")
+    hr.calibrate_gyro_bias(seconds=0.3)
+    ex_odo = DriveExecutor(hr, ReactiveSafety(), open_road, default_sim_profile())
+    ex_odo.ignore_obstacles, ex_odo.drive_power = True, 0.10
+    fo = ex_odo.forward_cell(0.10)
+    odo = fo.get("odometry") or {}
+    if ODOMETRY_SOURCE == "encoder":
+        # الملف يقول 0.10 → ≥0.15 م/ث (≤0.7ث)؛ الإنكودر 0.05 م/ث ⇒ ~2ث
+        check("UGV01: forward_cell يقطع المسافة **بالإنكودر** لا بالملف",
+              odo.get("source") == "encoder" and fo["elapsed_s"] >= 1.6
+              and fo["ok"], f"{odo} · {fo['elapsed_s']}ث لـ0.10م عند 0.05 م/ث")
+    else:
+        check("Wave Rover: المسافة من الملف (لا إنكودر)",
+              odo.get("source") == "profile" and fo["elapsed_s"] < 1.0,
+              f"{odo} · {fo['elapsed_s']}ث")
+    check("UGV01: المهمة لا تشترط ملف معايرة (الإنكودر يقيس) · Wave يشترطه",
+          (_MS().profile is not None) == bool(_ug))
+
     # ── «مهلة اللفّ» تُسمّى: هل تعثّر بعد 70° أم لم يدر أصلاً؟ ──────
     class StuckBridge(WaveRoverBridge):
         """روبوت تصل إليه الأوامر ولا يدور (بطارية منهكة / عجلة عالقة)."""
