@@ -35,7 +35,7 @@ from pi.web.recorder import MissionRecorder, list_sessions
 from pi.web.stream import mjpeg_frames, resolution_options
 from pi.platform_detect import banner as platform_banner
 from pi.ai.risk import classify
-from pi.nav.mission import MissionSim, default_sim_profile, legacy_low_battery_profile
+from pi.nav.mission import MissionSim, default_profile, legacy_low_battery_profile
 from pi.nav.calibration import CalibrationStore, compute_speed_mps
 
 # الحساسات الحقيقية (استيرادها آمن على ويندوز — كل مكتبات العتاد محمية داخلها)
@@ -524,7 +524,8 @@ async def api_calib_new_sim():
     legacy = legacy_low_battery_profile()
     if legacy.name not in calib_store.list_names():
         calib_store.save(legacy)
-    prof = default_sim_profile(battery_v=mission.rover.voltage() or 0.0)
+    # المنصّة الفعلية تختار الملف: على UGV01 قيم Wave Rover تكذب كل مسافة
+    prof = default_profile(battery_v=mission.rover.voltage() or 0.0)
     calib_store.save(prof)
     mission.set_calibration(prof)
     _active_calib["name"] = prof.name

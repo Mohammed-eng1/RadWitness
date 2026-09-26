@@ -48,7 +48,7 @@ from pi.config import (
     TURN_RATE_FADE_WARN,
     ESP32_BOOT_WAIT_S, ESP32_STUCK_ZERO_BYTES, ESP32_STUCK_RETRY_S,
     ESP32_STUCK_RETRIES,
-    IS_UGV01, UGV01_INIT_CMDS, UGV01_INIT_GAP_S,
+    IS_UGV01, UGV01_INIT_CMDS, UGV01_INIT_GAP_S, UGV01_TURN_RATE_DPS,
 )
 # مصدر الاتجاه صار **خلف واجهة واحدة** (البند 1): الجسر لا يعرف أي حسّاس
 # يقف خلفه، ولا يحتوي معادلة تكامل. `robust_bias` مُعاد تصديره للتوافق.
@@ -522,7 +522,14 @@ class WaveRoverBridge:
             # النية بعكس التحويل كاملاً (النفي ثم التبديل)
             un_l, un_r = (rc, lc) if MOTOR_SWAP_LR else (lc, rc)
             eff_l, eff_r = un_l * MOTOR_INVERT, un_r * MOTOR_INVERT
-            self._sim_turn_rate = (eff_l - eff_r) * TURN_RATE_DPS
+            if IS_UGV01:
+                # UGV01: الأمر سرعة م/ث ⇒ المعدل من المقاس فعلاً: ~88°/ث عند
+                # فرق 2×TURN_POWER (test_drive)، خطياً بالفرق (انزلاق منتظم k
+                # ثابت عبر 0.1–0.3 في test_slip).
+                self._sim_turn_rate = ((eff_l - eff_r) / (2.0 * TURN_POWER)
+                                       * UGV01_TURN_RATE_DPS)
+            else:
+                self._sim_turn_rate = (eff_l - eff_r) * TURN_RATE_DPS
         return {"L": lc, "R": rc, "clamped": (lc != lw or rc != rw)}
 
     # اسم قديم — كل المسارات تمرّ عبر motors()

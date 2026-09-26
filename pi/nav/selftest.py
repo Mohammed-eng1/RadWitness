@@ -270,6 +270,27 @@ def main() -> int:
     check("المعايرة الجديدة (بطارية ممتلئة) تُحمَّل وتُستخدم",
           newp.speed_for_power(0.4) == 0.590 and newp.speed_for_power(50) == 0.750,
           f"0.4→{newp.speed_for_power(0.4)} م/ث")
+    # 🔴 الملف الافتراضي يتبع المنصّة (زرّ «معايرة افتراضية» في الواجهة)
+    from pi.nav.mission import default_profile, MissionSim as _MS
+    from pi.config import IS_UGV01 as _ug, UGV01_FORWARD_VERIFIED as _fwd
+    dp = default_profile(battery_v=11.6)
+    if _ug:
+        check("UGV01: الملف الافتراضي من الإنكودر (م/ث) لا جدول Wave Rover",
+              dp.name.startswith("UGV01") and dp.speed_for_power(0.2) == 0.196
+              and dp.speed_for_power(0.5) == 0.297 and dp.speed_for_power(0.05) == 0.099,
+              f"0.2→{dp.speed_for_power(0.2)} · 0.5→{dp.speed_for_power(0.5)} (تثبيت لا استقراء)")
+    else:
+        check("Wave Rover: الملف الافتراضي هو جدول السيراميك",
+              dp.speed_for_power(0.4) == 0.590, dp.name)
+    _msr = _MS()
+    _msr.rover.mode = "real"                    # سياسة العتاد بلا منفذ فعلي
+    _rd = _msr.mission_readiness()
+    _msr.rover.mode = "sim"
+    _fwd_block = any("جهة «أمام»" in b for b in _rd["blockers"])
+    check("UGV01 على العتاد: جهة «أمام» غير المتحقَّقة حاجب — ولا قفل شامل بعد الآن",
+          _fwd_block == (_ug and not _fwd)
+          and not any("مقفل على UGV01" in b for b in _rd["blockers"]),
+          f"حاجب الأمام={_fwd_block}")
     check("استيفاء خطي بين النقاط المقاسة",
           abs(newp.speed_for_power(30) - 0.420) < 1e-6,
           f"30% → {newp.speed_for_power(30):.3f} م/ث (بين 0.250 و0.590)")
@@ -2014,9 +2035,10 @@ def main() -> int:
           and _mo.nav_ignore_obstacles is False)
     _mo.state = IDLE
     check("ويُقبل وهي متوقفة، والقوة خارج المدى تُرفض بسبب مقروء",
-          _mo.set_nav_override(ignore_obstacles=True, power=0.40)["ok"] is True
+          # القيم من خيارات المنصّة (UGV01: 0.10–0.30 م/ث · Wave Rover: 0.25–0.50)
+          _mo.set_nav_override(ignore_obstacles=True, power=_NPC[-2])["ok"] is True
           and _mo.set_nav_override(power=max(_NPC) + 0.1)["ok"] is False
-          and _mo.nav_power == 0.40)
+          and _mo.nav_power == _NPC[-2])
 
     # ⚠ الوصول الفعلي إلى المنفّذ — الدرس السابع في البند 8: الاستدعاء
     #    وحده لا يكفي، والمنفّذ يُعاد بناؤه مع الغرفة فتضيع القيم بصمت.
@@ -2024,13 +2046,13 @@ def main() -> int:
     _mr.configure_room(1.0, 0.5)
     _mr.set_calibration(newp)
     _mr.drive_motors = True                 # المنفّذ لا يُبنى بدونها
-    _mr.set_nav_override(ignore_obstacles=True, power=0.50)
+    _mr.set_nav_override(ignore_obstacles=True, power=_NPC[-1])
     _mr.configure_room(1.5, 0.5)            # إعادة بناء بعد ضبط الخيار
     _mr.start()
     check("🔴 والخياران يصلان المنفّذ فعلاً بعد إعادة بناء الغرفة",
           _mr.executor.ignore_obstacles is True
-          and _mr.executor.drive_power == 0.50
-          and _mr.executor.turn_power == 0.50,
+          and _mr.executor.drive_power == _NPC[-1]
+          and _mr.executor.turn_power == _NPC[-1],
           f"ignore={_mr.executor.ignore_obstacles} · "
           f"drive={_mr.executor.drive_power} · turn={_mr.executor.turn_power}")
     _mr.estop()

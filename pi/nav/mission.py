@@ -29,7 +29,7 @@ from pi.config import (
     CELL_DWELL_S, MAX_REPLANS_PER_TARGET, DRIFT_PER_METER,
     DRIVE_POWER_DEFAULT, MEASURED_SPEEDS, MEASURED_SPEEDS_LOW_BATT, LOW_BATT_CALIB_V,
     ROVER_MODE, IR_RANGE_CM, WALL_ALIGN_TOL_DEG, ROVER_TURN_TIMEOUT_S,
-    IS_UGV01,
+    IS_UGV01, UGV01_ENCODER_SPEEDS, UGV01_TURN_RATE_DPS, UGV01_FORWARD_VERIFIED,
     GEIGER_WINDOW_S,
     BATTERY_MONITOR_ENABLED, MISSION_TIME_WARN_S, MISSION_TIME_LIMIT_S,
     MISSION_HARD_LIMIT_S, BATT_SHUTDOWN_V, BATT_SHUTDOWN_CONSECUTIVE,
@@ -115,6 +115,25 @@ def default_sim_profile(battery_v: float = 0.0) -> CalibrationProfile:
         turn_rate_dps=70.0, date=time.strftime("%Y-%m-%d %H:%M"),
         note="مقاسة على العتاد ببطارية ممتلئة (السرعة ≈ 1.5 × القوة، صالحة 0.1–0.5)",
         battery_v=float(battery_v or 0.0))
+
+
+def ugv01_encoder_profile(battery_v: float = 0.0) -> CalibrationProfile:
+    """
+    ملف UGV01 المبدئي: سرعة العجلة **من الإنكودر** لكل أمر T:1 (م/ث) —
+    0.10→0.099 (سير مستقيم على الأرض) · 0.20→0.196 · 0.30→0.297 (لفّ بالمكان).
+    ⚠ ليس مسطرة: معايرة الشريط من الواجهة تستبدله. خارج 0.10–0.30 تثبيت.
+    """
+    return CalibrationProfile(
+        name="UGV01 - إنكودر (مبدئي)", speeds=dict(UGV01_ENCODER_SPEEDS),
+        turn_rate_dps=UGV01_TURN_RATE_DPS, date=time.strftime("%Y-%m-%d %H:%M"),
+        note="⚠ من الإنكودر لا المسطرة (2026-09-23/26) — عايِر بالشريط قبل الاعتماد",
+        battery_v=float(battery_v or 0.0))
+
+
+def default_profile(battery_v: float = 0.0) -> CalibrationProfile:
+    """الملف الافتراضي **للمنصّة الفعلية** — زرّ «معايرة افتراضية» في الواجهة.
+    على UGV01 قيم Wave Rover (قوة ≈ 1.5×) تجعل كل مسافة خاطئة بصمت."""
+    return ugv01_encoder_profile(battery_v) if IS_UGV01 else default_sim_profile(battery_v)
 
 
 def legacy_low_battery_profile() -> CalibrationProfile:
@@ -2138,14 +2157,20 @@ class MissionSim:
         """
         blockers, warnings = [], []
 
-        # ⓪ 🔴 UGV01 على العتاد: قيادة يدوية فقط حتى تُهاجَر نماذج الحركة.
-        #    T:1 هناك **سرعة م/ث بحلقة مغلقة** لا قوة، وكل ثوابت المسح (القوة
-        #    ↔ السرعة، اللفّ، القصور، التحقق من الحركة) مقاسة على Wave Rover.
-        #    تشغيلها على UGV01 = مسافات ولفّات محسوبة على دلالة خاطئة بصمت.
-        #    المحاكاة غير متأثرة (لا عتاد يُساء قيادته).
+        # ⓪ UGV01 على العتاد (2026-09-26): الثوابت هُوجرت إلى دلالة م/ث داخل
+        #    المدى المقاس (config)، فالحاجب الباقي واحد: **جهة الأمام**. اللفّ
+        #    مؤكَّد بجايرو مقاس يدوياً، لكن التقدّم لم يُشاهَد — ومسح بلا حسّاس
+        #    أمامي يرجع للخلف أعمى. والمحاكاة غير متأثرة.
         if IS_UGV01 and getattr(self.rover, "mode", "sim") == "real":
-            blockers.append("المسح الذاتي مقفل على UGV01 — القيادة اليدوية فقط "
-                            "حتى تُهاجَر نماذج الحركة (T:1 سرعة م/ث لا قوة)")
+            if not UGV01_FORWARD_VERIFIED:
+                blockers.append("UGV01: جهة «أمام» لم تُتحقَّق — اضغط «تقدّم» في "
+                                "القيادة اليدوية منظوراً من خلف الروبوت، ثم "
+                                "UGV01_FORWARD_VERIFIED = True")
+            warnings.append("⚠ UGV01: ثوابت الحركة من الإنكودر لا المسطرة، و"
+                            "HEADING_KP غير مضبوط على حلقة PID — راقب أول مهمة، "
+                            "وعايِر السرعة بالشريط من الواجهة")
+            warnings.append("⚠ UGV01: حماية الجهد من حقل v (بطيء التحديث — "
+                            "قرار المشغّل 2026-09-26) + الحاجز الزمني")
 
         # ① مصدر اتجاه صالح — بلا اتجاه لا ملاحة أصلاً
         src = getattr(self.rover, "heading_source", None)
