@@ -459,7 +459,9 @@ def main() -> int:
           not BNO055FusionHeading(FakeIMU(mag_used=True)).ok)
 
     # المصنع: تبديل معلن السبب لا سقوط صامت
-    fb = make_heading_source(bridge=br2, imu=FakeIMU(ok=False))
+    # المصدر صريح: الافتراضي صار "ugv01_gyro" على UGV01 (لا IMU فيه) —
+    # والمفحوص هنا سقوط **قارئ IMU غير متاح** إلى بديل معلَن.
+    fb = make_heading_source(bridge=br2, imu=FakeIMU(ok=False), source="mpu6050")
     check("مصدر غير متاح → بديل + سبب معلن",
           fb.ok and fb.fallback_reason and "البديل" in fb.fallback_reason,
           fb.fallback_reason)
@@ -581,9 +583,13 @@ def main() -> int:
     # ⚠ كان يشترط `HEADING_SOURCE == "bno055_gyro"` — والشريحة **تلفت**
     #   (5.40V على حدّ 3.6V) واستُبدلت بـMPU-6050. الحارس الباقي هو نفسه:
     #   خطأ الوحدات يعطي ≈57 (راديان قُرئت درجات) أو ≈0.017 (العكس).
-    check("معامل MPU-6050 داخل النطاق المعقول (حارس خطأ وحدات)",
-          0.2 < MPU6050_GYRO_SCALE < 5.0 and HEADING_SOURCE == "mpu6050",
-          f"scale={MPU6050_GYRO_SCALE} · المصدر={HEADING_SOURCE}")
+    # ⚠ على UGV01 صار الافتراضي "ugv01_gyro" (جايرو اللوحة، 2026-09-26) —
+    #   فالحارس يشمل معاملَي المصدرين، والمصدر الافتراضي يتبع المنصّة.
+    from pi.config import UGV01_GYRO_SCALE, IS_UGV01
+    check("معاملا الجايرو (MPU · لوحة UGV01) داخل النطاق المعقول (حارس خطأ وحدات)",
+          0.2 < MPU6050_GYRO_SCALE < 5.0 and 0.2 < UGV01_GYRO_SCALE < 5.0
+          and HEADING_SOURCE == ("ugv01_gyro" if IS_UGV01 else "mpu6050"),
+          f"MPU={MPU6050_GYRO_SCALE} · UGV01={UGV01_GYRO_SCALE} · المصدر={HEADING_SOURCE}")
 
     # ── MPU-6050: نفس عقد المصدر تماماً ──────────────────────────
     from pi.sensors.heading import MPU6050GyroHeading
@@ -755,6 +761,34 @@ def main() -> int:
               (s_dead.error or "")[:58])
     check("وفي المحاكاة يبقى البديل الوهمي مشروعاً ومعلَناً",
           make_heading_source(bridge=br2, source="bno055_gyro").ok is True)
+
+    # 🔴 جايرو لوحة UGV01: الإشارة غير المقاسة ترفض، والوسيط يُسقط القفزة
+    from pi.sensors.heading import UGV01GyroHeading
+    s_unmeasured = make_heading_source(bridge=rb, source="ugv01_gyro")
+    check("🔴 ugv01_gyro بإشارة غير مقاسة ⇒ ok=False وسبب يقول كيف تُقاس",
+          s_unmeasured.ok is False and "--gyro-sign" in (s_unmeasured.error or ""),
+          (s_unmeasured.error or "")[:50])
+
+    class SpikeBridge:
+        """gz ساكن بقفزة منفردة ±15.9 — بصمة لوحة UGV01 المقاسة."""
+        def __init__(self, seq):
+            self.seq = list(seq)
+        def read_imu(self):
+            return {"gz": self.seq.pop(0)} if self.seq else {}
+
+    seq = [-0.26] * 10 + [15.64] + [-0.26] * 10 + [-16.14] + [-0.26] * 10
+    ug = UGV01GyroHeading(SpikeBridge(seq), sign=-1)
+    vals = [ug._read_rate_dps() for _ in range(len(seq))]
+    check("وسيط ug01: القفزتان المنفردتان ±15.9 لا تصلان إلى التكامل",
+          max(abs(v) for v in vals) < 1.0 and ug.median_rejects == 2,
+          f"أقصى |قيمة|={max(abs(v) for v in vals):.2f} · مرفوضة={ug.median_rejects}")
+    ramp = [0, 10, 20, 30, 40, 50, 60]
+    ug2 = UGV01GyroHeading(SpikeBridge(ramp), sign=1)
+    out = [ug2._read_rate_dps() for _ in ramp]
+    check("…والمنحدر الحقيقي يمرّ بعيّنة تأخير واحدة لا أكثر",
+          out[2:] == ramp[1:-1] and ug2.median_rejects == 0, f"{out}")
+    check("وفي المحاكاة ugv01_gyro ⇒ مصدر المحاكاة (الجسر الوهمي يولّد gz)",
+          make_heading_source(bridge=br2, source="ugv01_gyro").ok is True)
 
     # ═══ (ك) الحدّ الزمني بديلاً عن حماية الجهد المعطّلة (القسم 9) ══
     print("\nك) الحدّ الزمني (مراقبة الجهد معطّلة):")
@@ -1302,9 +1336,12 @@ def main() -> int:
         WALL_ALIGN_TOL_DEG as W_ALIGN_TOL,
     )
 
-    check("✅ العلم مفعّل بعد اكتمال بوابة القياس (2026-08-07: σ 0.26–0.55سم "
-          "+ جهة مثبتة + جولتا سير حقيقيتان)",
-          SIDE_ULTRASONIC_ENABLED is True)
+    # ⚠ Wave Rover: مفعّل بعد اكتمال بوابة القياس. UGV01: **معطّل عمداً** —
+    #   لا ألترا سونيك على الهيكل الجديد (قرار 2026-09-26).
+    from pi.config import IS_UGV01 as _ugv
+    check("✅ العلم مفعّل على Wave Rover بعد اكتمال بوابة القياس (2026-08-07: σ "
+          "0.26–0.55سم + جهة مثبتة + جولتا سير حقيقيتان) ومعطّل على UGV01",
+          SIDE_ULTRASONIC_ENABLED is (not _ugv))
     check("ميل التركيب يُحوَّل إلى مسافة عمودية (لا تُستعمل القراءة خاماً)",
           abs(perpendicular_cm(100.0, 0.0) - 100.0) < 1e-9
           and perpendicular_cm(100.0, US_SIDE_TILT_DEG) < 100.0,

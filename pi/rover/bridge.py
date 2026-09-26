@@ -186,6 +186,13 @@ class WaveRoverBridge:
         # 🔴 يحجز كل مُرسِل حتى تنتهي نافذة الإقلاع **والتهيئة** معاً — انظر
         #    `_wait_esp32_boot`.
         self._boot_lock = threading.Lock()
+        # 🔴 طلب/ردّ بقفل: `_read_until` يرمي كل سطر لا يطابق — فاستعلام
+        #    T:130 (البطارية، حلقة السيرفر) واستعلام T:126 (مصدر الاتجاه،
+        #    خيط المهمة) بالتوازي يسرق كلٌّ ردّ الآخر فيفشل الاثنان بمهلة.
+        #    مقاس على لوحة وهمية (2026-09-26، 20 استعلاماً لكلٍّ بالتوازي):
+        #    بلا قفل imu 4/20 · status 1/20 في 16.9ث مهلات؛ بالقفل 20/20 و20/20.
+        #    أوامر الحركة لا تمرّ به (كتابة بلا ردّ) فلا يؤخّرها استعلام.
+        self._rr_lock = threading.Lock()
         # ذروة معدل الدوران لأول لفّة — مرجع كشف إنهاك البطارية سلوكياً
         # ⚠ يبقى **طبقة ثانية** بعد عودة INA219: يكشف الإنهاك سلوكياً بلا
         #   فولتميتر (الدوران بالمكان أول ما يسقط)، والحارسان لا يتعارضان.
@@ -545,8 +552,9 @@ class WaveRoverBridge:
     def read_imu(self) -> dict:
         """T=126 → T:1002. في المحاكاة يولّد gz متسقاً مع أمر الدوران."""
         if self.mode == "real":
-            self._send({"T": 126})
-            d = self._read_until(1002, 126)
+            with self._rr_lock:
+                self._send({"T": 126})
+                d = self._read_until(1002, 126)
             return d or {}
         now = time.time()
         self._last_sim_ts = now
@@ -559,8 +567,9 @@ class WaveRoverBridge:
     def read_status(self) -> dict:
         """T=130 → T:1001 (يتضمّن جهد البطارية v)."""
         if self.mode == "real":
-            self._send({"T": 130})
-            d = self._read_until(1001, 130) or {}
+            with self._rr_lock:
+                self._send({"T": 130})
+                d = self._read_until(1001, 130) or {}
         else:
             if self._moving:                # استهلاك وهمي بسيط
                 self._sim_v = max(9.5, self._sim_v - 0.0004)

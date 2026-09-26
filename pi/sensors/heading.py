@@ -18,6 +18,7 @@ heading.py — **مصدر الاتجاه خلف واجهة واحدة** (الب�
 | `bno055_gyro`   | BNO055 gz | 🔴 **تالفة** (5.40V على حدّ 3.6V) |
 | `bno055_fusion` | BNO055 yaw | 🔴 نفس السبب |
 | `rover_gyro`    | T=126 gz (سيريال) | 🔴 **ميت** — I2C الروفر الداخلي معطّل |
+| `ugv01_gyro`    | T=126 gz من لوحة UGV01 | ✅ حيّ — بوسيط ثلاثي؛ الإشارة تُقاس باليد أولاً |
 | `sim`           | جسر المحاكاة | تكامل من أمر الدوران الوهمي |
 
 🔴 **لا مصدر ميت يُقبل بديلاً**: كان فشل BNO055 يُسقط النظام إلى `rover_gyro`
@@ -53,6 +54,7 @@ from pi.config import (
     HEADING_LPF_ALPHA_DRIVE, HEADING_LPF_ALPHA_TURN, HEADING_LPF_ALPHA_STEER,
     BNO055_READ_PERIOD_S, MPU6050_GYRO_SCALE, MPU6050_GYRO_Z_SIGN,
     BNO055_DEAD, ROVER_GYRO_DEAD,
+    UGV01_GYRO_Z_SIGN, UGV01_GYRO_SCALE, UGV01_GYRO_SPIKE_JUMP_DPS,
     HEADING_RECOVERY_ATTEMPTS, HEADING_RECOVERY_COOLDOWN_S,
 )
 
@@ -543,6 +545,67 @@ class RoverGyroHeading(HeadingSource):
             return None
 
 
+# ═══ 3ب) جايرو لوحة UGV01 عبر T=126 ══════════════════════════════
+class UGV01GyroHeading(HeadingSource):
+    """
+    gz من IMU لوحة UGV01 (مقاس حيّاً 2026-09-23: ضجيج σ≈0.23°/ث ساكناً).
+
+    🔴 **وسيط ثلاثي قبل أي تنقية**: قفزات منفردة ±15.9°/ث (~2٪ من العيّنات)
+       تمرّ من عتبة القفزة (120°/ث في السير) فيحوّلها التنعيم تكاملاً وهمياً
+       حتى والروبوت ساكن. الوسيط يُسقط القيمة المنفردة ويُمرّر المنحدر
+       الحقيقي (العيّنة الوسطى فيه هي الوسيط أصلاً). ⚠ الثمن: عيّنة تأخير
+       ثابتة (~25–55ms) — يتعلّمها τ القصور الذاتي في اللفّ كما يتعلّم غيرها.
+    🔴 **الإشارة غير المقاسة تُعلن `ok=False`** برسالة تقول كيف تُقاس —
+       لا رقم مفترض (§2: خطأ إشارة مقرون بخطأ محركات يُلغي نفسه في الحارس).
+    """
+    name = "ugv01_gyro"
+    kind = "rate"
+
+    def __init__(self, bridge, sign=UGV01_GYRO_Z_SIGN, scale: float = UGV01_GYRO_SCALE):
+        super().__init__(scale=scale, max_bias_std=GYRO_BIAS_MAX_STD)
+        self.bridge = bridge
+        self._win = []                  # آخر ثلاث قراءات خام
+        self.median_rejects = 0         # قفزات أسقطها الوسيط (فوق العتبة)
+        if sign is None:
+            self.sign = None
+            self.ok = False
+            self.error = ("إشارة gz لوحة UGV01 **غير مقاسة** — تُقاس باليد بلا "
+                          "محركات: python3 -m pi.tests.ugv01.check_setup "
+                          "--gyro-sign ثم تُكتب في UGV01_GYRO_Z_SIGN")
+        else:
+            self.sign = -1 if int(sign) < 0 else 1
+
+    def _read_rate_dps(self):
+        d = self.bridge.read_imu()
+        if not isinstance(d, dict) or "gz" not in d:
+            return None
+        try:
+            raw = float(d["gz"])
+        except (TypeError, ValueError):
+            return None
+        self._win.append(raw)
+        if len(self._win) > 3:
+            self._win.pop(0)
+        if len(self._win) < 3:
+            val = raw                   # بداية السلسلة: لا جارتين بعد
+        else:
+            val = sorted(self._win)[1]
+            if abs(self._win[1] - val) > UGV01_GYRO_SPIKE_JUMP_DPS:
+                self.median_rejects += 1
+        return (self.sign or 1) * val
+
+    def reset(self, value: float = 0.0) -> None:
+        super().reset(value)
+        self._win = []
+
+    def state(self) -> dict:
+        st = super().state()
+        st["z_sign"] = self.sign
+        st["median_rejects"] = self.median_rejects
+        st["calibrated"] = False        # المقياس 1.0 حيادي — لم يُعاير
+        return st
+
+
 # ═══ 4) مصدر المحاكاة (ويندوز/بلا عتاد) ══════════════════════════
 class SimHeading(RoverGyroHeading):
     """gz الوهمي من جسر المحاكاة — يجعل كل منطق اللفّ قابلاً للاختبار بلا عتاد."""
@@ -590,6 +653,13 @@ def make_heading_source(bridge=None, imu=None, source: str = None) -> HeadingSou
             src.fallback_reason = None
             return src
         return _no_source(bridge, real, src.error)
+
+    # ── جايرو لوحة UGV01: حيّ، بإشارة تُقاس باليد ────────────────
+    if req == "ugv01_gyro":
+        if not real:
+            # جسر المحاكاة يولّد gz نفسه — وهذا بالضبط مصدر المحاكاة
+            return SimHeading(bridge)
+        return UGV01GyroHeading(bridge)
 
     # ── جايرو الروفر: ميت عتادياً ────────────────────────────────
     if req == "rover_gyro":
