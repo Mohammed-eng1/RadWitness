@@ -323,7 +323,7 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff;fo
       <h2>🛰 قيادة ذاتية بالليدار</h2>
       <div class="slider">
         <span class="muted" style="white-space:nowrap">السرعة القصوى م/ث</span>
-        <input type="number" id="ldSpeed" min="0.05" max="0.15" step="0.01" value="0.10"
+        <input type="number" id="ldSpeed" min="0.10" max="0.20" step="0.01" value="0.20"
                style="width:80px">
         <label style="cursor:pointer;white-space:nowrap">
           <input type="checkbox" id="ldDry"> تجربة بلا حركة</label>
@@ -1745,7 +1745,7 @@ connect();
 /* ═══ قيادة ذاتية بالليدار ═══ */
 $("#ldStart").onclick = async () => {
   const r = await api("/api/lidar_drive/start",
-    {max_speed: parseFloat($("#ldSpeed").value) || 0.10, dry_run: $("#ldDry").checked});
+    {max_speed: parseFloat($("#ldSpeed").value) || 0.20, dry_run: $("#ldDry").checked});
   if (!r.ok) $("#ldState").textContent = "⚠ " + (r.error || "تعذّر البدء");
   ldPoll();
 };
