@@ -3460,7 +3460,8 @@ def main() -> int:
     for _d in ("pi/ai", "pi/nav"):
         for _f in sorted((_pi_dir.parent / _d).glob("*.py")):
             _rp = _f.relative_to(_pi_dir.parent).as_posix()
-            if _f.name in ("__init__.py", "selftest.py", "sim_world.py"):
+            # ⚠ ملفات الاختبار (…selftest.py) ليست إنتاجية فلا تُفحص هنا
+            if _f.name in ("__init__.py", "sim_world.py") or _rp not in _prod:
                 continue
             for _fn in _public_funcs(_ast.parse(_prod[_rp])):
                 _key = f"{_rp}::{_fn.name}"
