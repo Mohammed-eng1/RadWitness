@@ -168,7 +168,8 @@ class LidarDriver:
             self._prepare()
             while not self._stop.is_set():
                 t0 = time.time()
-                if self._tick() == "trapped":
+                act = self._tick()
+                if act == "trapped":
                     if self.dry_run:
                         # بلا حركة لا يتغيّر المشهد فالمحاولات تُستهلك في ثوانٍ:
                         # يُعلن ويكمل (والقيادة الفعلية تتوقف كما طُلب)
@@ -179,6 +180,10 @@ class LidarDriver:
                     self.outcome = "trapped"
                     break
                 took = time.time() - t0
+                # اللفّ والرجوع حلقات داخلية تجدّد أمرها كل ~20–100ms بنفسها
+                # (مقاس: لفّة 46° = 3.4ث بلا خطر) — فلا تُقاس هنا ولا تُنذر
+                if act in ("spin", "backup"):
+                    continue
                 self._loop_win.append(took)
                 if took > LIDAR_LOOP_WARN_S:
                     self.warn(f"⚠ دورة استغرقت {took * 1000:.0f}ms (> "
