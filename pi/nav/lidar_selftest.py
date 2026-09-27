@@ -147,6 +147,17 @@ def main() -> int:
     check("عائق يلامس طرف الممرّ (زاوية صغيرة) ⇒ قوس يساراً لا لفّ بالمكان",
           d["action"] == "arc" and d["r"] > d["l"], d["reason"])
 
+    # مقاس 2026-09-27: فتحة زاويتها ~0 قلبت «سير/قوس» كل نصف ثانية ⇒ ارتجاف.
+    #   داخل منطقة التفادي: قوس دائماً وبأدنى زاوية، ولا «سير» نحو العائق.
+    from pi.config import LIDAR_ARC_MIN_DEG
+    acts = set()
+    for yy in (-0.14, -0.12, -0.10, -0.08):
+        d, _ = decide([(front_edge + 0.50, front_edge + 0.60, -0.40, yy)])
+        acts.add(d["action"])
+        ok_side = d["action"] != "arc" or d["r"] - d["l"] > 0.02
+    check(f"عائق على طرف الممرّ ⇒ قوس ثابت (≥{LIDAR_ARC_MIN_DEG:.0f}°) لا تذبذب مع «سير»",
+          "go" not in acts and ok_side, f"الأفعال={sorted(acts)}")
+
     # محصور: صندوق ضيق حول الروبوت (10سم من كل حافة)
     av = LidarAvoider(set(), LIDAR_MAX_SPEED)
     acts = []
@@ -227,6 +238,17 @@ def main() -> int:
     check("ليدار متجمّد أثناء المشي ⇒ T:1 صفر، وعودته ⇒ يكمل",
           moving[0] > 0 and stopped == (0.0, 0.0) and fb.cmds[-1][0] > 0,
           f"{moving} → {stopped} → {fb.cmds[-1]}")
+    fb.cmds.clear()
+    for _ in range(6):
+        drv._tick()
+    ls = [c[0] for c in fb.cmds]
+    check("رفع السرعة متدرّج (≤0.03 م/ث لكل دورة) والسقف يُبلغ",
+          all(b - a <= 0.03 + 1e-9 for a, b in zip(ls, ls[1:]))
+          and abs(ls[-1] - LIDAR_MAX_SPEED) < 1e-9, " → ".join(f"{v:.2f}" for v in ls))
+    fl.ok = False
+    drv._tick()
+    check("والتوقف فوري (صفر مباشرة من السقف)", fb.cmds[-1] == (0.0, 0.0))
+    fl.ok = True
     drv._shutdown()
     check("الخروج يرسل صفراً", fb.cmds[-1] == (0.0, 0.0))
 

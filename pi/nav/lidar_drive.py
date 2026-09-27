@@ -29,6 +29,7 @@ from pi.config import (
     LIDAR_MASK_PATH, LIDAR_MAX_SPEED, LIDAR_STALE_S, LIDAR_DRIVE_LOOP_S,
     LIDAR_FW_HEARTBEAT_MS, LIDAR_FW_HEARTBEAT_RESTORE_MS, LIDAR_BACKUP_M,
     LIDAR_BACKUP_SPEED, LIDAR_BACKUP_ABORT_M, LIDAR_LOG_EVERY_S,
+    LIDAR_RAMP_UP_MPS_PER_LOOP,
     LIDAR_ANGLE_SIGN, LIDAR_YAW_OFFSET_DEG, LIDAR_X_M, LIDAR_Y_M,
     ROBOT_LENGTH_M, ROBOT_WIDTH_M, TURN_POWER, UGV01_TURN_RATE_DPS,
     UGV01_FORWARD_VERIFIED, IS_UGV01,
@@ -88,6 +89,7 @@ class LidarDriver:
         self._last_log = (None, 0.0)
         self._last_echo = (None, 0.0)    # (الفعل، الوقت) — سطر للشاشة لكل تغيّر فعل أو كل ثانية
         self._inside_warned = False
+        self._cmd = (0.0, 0.0)           # آخر أمر مُرسل (أساس تنعيم الرفع)
         os.makedirs(log_dir, exist_ok=True)
         self.log_path = os.path.join(
             log_dir, time.strftime("lidar_drive_%Y%m%d_%H%M%S.jsonl"))
@@ -122,11 +124,22 @@ class LidarDriver:
 
     # ── الحركة (dry-run لا يرسل شيئاً) ────────────────────────────
     def _motors(self, l: float, r: float) -> None:
+        # تنعيم الرفع فقط (نفس الإشارة وأكبر مقداراً)؛ الخفض والعكس والصفر فورية
+        pl, pr = self._cmd
+
+        def ramp(new, old):
+            if new * old >= 0 and abs(new) > abs(old):
+                step = LIDAR_RAMP_UP_MPS_PER_LOOP
+                return old + max(-step, min(step, new - old))
+            return new
+        l, r = ramp(l, pl), ramp(r, pr)
+        self._cmd = (l, r)
         self.moving = bool(l or r)
         if not self.dry_run:
             self.bridge.motors(l, r)
 
     def _halt(self) -> None:
+        self._cmd = (0.0, 0.0)
         self.moving = False
         if not self.dry_run:
             self.bridge.motors(0.0, 0.0)

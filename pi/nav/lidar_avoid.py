@@ -30,7 +30,7 @@ from pi.config import (
     LIDAR_BACK_FROM_DEG, LIDAR_MAX_SPEED, LIDAR_MIN_SPEED, LIDAR_AVOID_START_M,
     LIDAR_GAP_RANGE_DEG, LIDAR_GAP_BIN_DEG, LIDAR_GAP_FREE_M, LIDAR_GAP_MIN_BINS,
     LIDAR_ARC_MAX_DEG, LIDAR_ARC_GAIN, LIDAR_BACK_CLEAR_M, LIDAR_ESCAPE_RESET_S,
-    LIDAR_BLOCK_CONFIRM_SCANS,
+    LIDAR_BLOCK_CONFIRM_SCANS, LIDAR_ARC_MIN_DEG,
     SPEED_LADDER, STOP_CM, ESCAPE_MAX_ATTEMPTS, TURN_MIN_ACHIEVABLE_DEG,
 )
 
@@ -265,15 +265,18 @@ class LidarAvoider:
             self._free_since = None
             gap = widest_gap(pts)
             if gap is not None and abs(gap["angle"]) <= LIDAR_ARC_MAX_DEG:
-                if abs(gap["angle"]) < LIDAR_GAP_BIN_DEG:
-                    return dict(base, action="go", l=v, r=v, speed=v, gap=gap,
-                                reason=f"عائق {front:.2f}م والفتحة أمامنا — إبطاء")
-                d = LIDAR_ARC_GAIN * math.radians(gap["angle"])
-                l = max(0.0, min(self.max_speed, v - d))
-                r = max(0.0, min(self.max_speed, v + d))
+                # جهة الفتحة: زاوية الهدف، وإن كانت ~0 فمركز الفتحة
+                side = gap["angle"] if abs(gap["angle"]) > 1e-6 else gap["center"]
+                side = 1.0 if side >= 0 else -1.0
+                ang = side * max(abs(gap["angle"]), LIDAR_ARC_MIN_DEG)
+                d = LIDAR_ARC_GAIN * math.radians(ang)
+                l, r = v - d, v + d
+                # إزاحة الاثنين معاً تحت السقف: القصّ من طرف واحد يُضعف اللفّ
+                shift = max(0.0, max(l, r) - self.max_speed)
+                l, r = max(0.0, l - shift), max(0.0, r - shift)
                 return dict(base, action="arc", l=l, r=r, speed=v, gap=gap,
-                            reason=f"عائق {front:.2f}م ⇒ قوس نحو فتحة "
-                                   f"{gap['angle']:+.0f}° (عرض {gap['width_deg']:.0f}°)")
+                            reason=f"عائق {front:.2f}م ⇒ قوس {ang:+.0f}° نحو فتحة "
+                                   f"(عرض {gap['width_deg']:.0f}°)")
             if gap is not None:
                 return dict(base, action="spin", deg=gap["angle"], gap=gap,
                             reason=f"عائق {front:.2f}م ⇒ لفّ بالمكان نحو فتحة "
