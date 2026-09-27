@@ -30,6 +30,7 @@ from pi.config import (
     LIDAR_BACK_FROM_DEG, LIDAR_MAX_SPEED, LIDAR_MIN_SPEED, LIDAR_AVOID_START_M,
     LIDAR_GAP_RANGE_DEG, LIDAR_GAP_BIN_DEG, LIDAR_GAP_FREE_M, LIDAR_GAP_MIN_BINS,
     LIDAR_ARC_MAX_DEG, LIDAR_ARC_GAIN, LIDAR_BACK_CLEAR_M, LIDAR_ESCAPE_RESET_S,
+    LIDAR_BLOCK_CONFIRM_SCANS,
     SPEED_LADDER, STOP_CM, ESCAPE_MAX_ATTEMPTS, TURN_MIN_ACHIEVABLE_DEG,
 )
 
@@ -230,8 +231,10 @@ class LidarAvoider:
         self.attempts = 0
         self._free_since = None
         self._just_backed = False
+        self._blocked_run = 0
 
     def reset(self) -> None:
+        self._blocked_run = 0
         self.attempts = 0
         self._free_since = None
         self._just_backed = False
@@ -245,12 +248,14 @@ class LidarAvoider:
         sectors = sector_clearance(pts)
         front = corridor_clearance(pts, forward=True)
         rear = corridor_clearance(pts, forward=False)
-        base = {"stats": stats, "sectors": sectors, "front_m": front,
+        inside = [(round(p["a"], 1), round(p["d"], 3)) for p in pts if p["c"] <= 0.0][:6]
+        base = {"stats": stats, "sectors": sectors, "front_m": front, "inside_pts": inside,
                 "rear_m": rear, "attempts": self.attempts}
         stop_m = STOP_CM / 100.0
 
         # ── طريق مفتوح أو عائق بعيد: سِر (وقوس نحو فتحة إن اقترب) ──
         if front is None or front >= stop_m:
+            self._blocked_run = 0
             v = ladder_speed(front, self.max_speed)
             if front is None or front >= LIDAR_AVOID_START_M:
                 self._note_free(now)
@@ -279,6 +284,11 @@ class LidarAvoider:
 
         # ── الأمام مسدود ──
         self._free_since = None
+        self._blocked_run += 1
+        if self._blocked_run < LIDAR_BLOCK_CONFIRM_SCANS and not self._just_backed:
+            # توقف فوري، والمحاولة تُحتسب فقط إن تكرّر الانسداد (لا نقطة عابرة)
+            return dict(base, action="stop",
+                        reason=f"الأمام مسدود ({front:.2f}م) — توقف للتأكيد")
         gap = widest_gap(pts)
         if self._just_backed:
             self._just_backed = False

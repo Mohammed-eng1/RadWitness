@@ -107,6 +107,10 @@ def main() -> int:
         mid = (lo + hi) / 2.0
         side = "يسار" if mid > 0 else "يمين"
         print(f"  قطاع {lo:+4d}° .. {hi:+4d}°  ({side})")
+    weak = {k: v for k, v in freq.items() if v < LIDAR_MASK_MIN_FRACTION}
+    if weak:
+        print(f"زوايا قريبة **دون** العتبة ({LIDAR_MASK_MIN_FRACTION:.0%}) — لم تُحجب: "
+              + " ".join(f"{k:+d}°:{v:.0%}" for k, v in sorted(weak.items())))
     front = mask_front_overlap(set(blocked))
     if front:
         print(f"⚠ القناع يغطي الأمام: {front} — عائق هناك لن يُرى! "

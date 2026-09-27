@@ -144,6 +144,13 @@ class LidarDriver:
             while not self._stop.is_set():
                 t0 = time.time()
                 if self._tick() == "trapped":
+                    if self.dry_run:
+                        # بلا حركة لا يتغيّر المشهد فالمحاولات تُستهلك في ثوانٍ:
+                        # يُعلن ويكمل (والقيادة الفعلية تتوقف كما طُلب)
+                        self.echo("(dry-run: يكمل بعد «محصور» — المحاولات صُفّرت)")
+                        self.avoider.reset()
+                        self._stop.wait(2.0)
+                        continue
                     self.outcome = "trapped"
                     break
                 dt = LIDAR_DRIVE_LOOP_S - (time.time() - t0)
@@ -297,7 +304,8 @@ class LidarDriver:
     def _record(self, d: dict) -> None:
         if d["stats"].get("inside") and not self._inside_warned:
             self._inside_warned = True
-            self.warn(f"⚠ {d['stats']['inside']} نقطة داخل مستطيل الروبوت (ROBOT_LENGTH_M×"
+            self.warn(f"⚠ {d['stats']['inside']} نقطة داخل مستطيل الروبوت "
+                      f"(زاوية°، بُعد م: {d.get('inside_pts')}) (ROBOT_LENGTH_M×"
                       f"ROBOT_WIDTH_M حول LIDAR_X_M/Y_M) — تُعامل **عوائق ملاصقة**. "
                       f"إن كانت جزءاً من الروبوت: أعد calibrate_lidar_mask أو صحّح "
                       f"الأبعاد/موضع الليدار في config")
@@ -313,6 +321,7 @@ class LidarDriver:
                    "rear_m": rnd(d.get("rear_m")),
                    "sectors": {k: rnd(v) for k, v in d["sectors"].items()},
                    "stats": d["stats"], "attempts": d.get("attempts"),
+                   "inside_pts": d.get("inside_pts"),
                    "lidar_age_s": rnd(self.lidar.age_s()), "reason": d.get("reason")})
         # الشاشة: تغيّر **الفعل** أو مرور ثانية — لا كل تذبذب 1سم في السبب
         if d["action"] != self._last_echo[0] or now - self._last_echo[1] >= LIDAR_LOG_EVERY_S:

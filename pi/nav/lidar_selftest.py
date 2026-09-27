@@ -16,7 +16,7 @@ import time
 
 from pi.config import (
     LIDAR_ANGLE_SIGN, LIDAR_YAW_OFFSET_DEG, LIDAR_X_M, LIDAR_Y_M,
-    LIDAR_MAX_SPEED, ESCAPE_MAX_ATTEMPTS, ROBOT_LENGTH_M,
+    LIDAR_MAX_SPEED, ESCAPE_MAX_ATTEMPTS, ROBOT_LENGTH_M, LIDAR_BLOCK_CONFIRM_SCANS,
 )
 from pi.nav.lidar_avoid import LidarAvoider, mask_front_overlap, filter_points
 from pi.sensors.lidar_c1 import NodeParser, to_robot_frame
@@ -72,6 +72,9 @@ def scene_raw(boxes, room=3.0, step_deg=0.72):
 def decide(boxes, avoider=None, extra_raw=(), room=3.0):
     av = avoider or LidarAvoider(set(), LIDAR_MAX_SPEED)
     pts = to_robot_frame(scene_raw(boxes, room) + list(extra_raw))
+    # لفّتان متتاليتان لنفس المشهد: «مسدود» يُؤكَّد بـLIDAR_BLOCK_CONFIRM_SCANS
+    for _ in range(LIDAR_BLOCK_CONFIRM_SCANS - 1):
+        av.decide(pts, time.time())
     return av.decide(pts, time.time()), av
 
 
@@ -105,7 +108,7 @@ def main() -> int:
     d, av = decide(wall)
     check("جدار أمام (20سم) والخلف فاضٍ ⇒ رجوع", d["action"] == "backup", d["reason"])
     av.note_backed_up()
-    d2, _ = decide(wall, av)
+    d2 = av.decide(to_robot_frame(scene_raw(wall)), time.time())   # اللفّة التالية مباشرة
     check("بعده ⇒ لفّ بالمكان بزاوية كبيرة", d2["action"] == "spin"
           and abs(d2["deg"]) >= 45, d2["reason"])
 
@@ -127,6 +130,17 @@ def main() -> int:
            (d["action"] == "spin" and d["deg"] > 0)
     check("صندوق أمام-يمين ⇒ انعطاف يساراً", left,
           f"{d['action']} {d.get('deg', '')} L={d.get('l')} R={d.get('r')} — {d['reason']}")
+
+    # نقطة ملاصقة **عابرة** (كابل يُصاب متقطعاً — مقاس 2026-09-27) لا تستهلك
+    # محاولات التحرر: توقف فوري، ولا محاولة ما لم يتكرّر الانسداد
+    av = LidarAvoider(set(), LIDAR_MAX_SPEED)
+    blip = to_robot_frame(scene_raw([]) + [(0.0, 0.10), (0.5, 0.10)])
+    clear = to_robot_frame(scene_raw([]))
+    seq = []
+    for pts_ in (blip, clear, blip, clear, blip, clear):
+        seq.append(av.decide(pts_, time.time())["action"])
+    check("انسداد عابر لفّة واحدة ⇒ توقف فوري بلا استهلاك محاولات",
+          seq == ["stop", "go"] * 3 and av.attempts == 0, " → ".join(seq))
 
     nudge = [(front_edge + 0.50, front_edge + 0.60, -0.20, 0.05)]
     d, _ = decide(nudge)
