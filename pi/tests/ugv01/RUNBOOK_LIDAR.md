@@ -59,6 +59,6 @@ python3 -m pi.nav.lidar_drive --sim --dry-run
 ```
 
 ## القيم المؤقتة (كلها في `pi/config.py`، كتلة «ليدار RPLIDAR C1»)
-`ROBOT_LENGTH_M` 0.30 · `ROBOT_WIDTH_M` 0.25 · `LIDAR_X_M`/`LIDAR_Y_M` 0 ·
+`LIDAR_X_M`/`LIDAR_Y_M` 0 ·
 `LIDAR_YAW_OFFSET_DEG` 0 · `LIDAR_AVOID_START_M` 0.80 · `LIDAR_GAP_FREE_M` 0.60 ·
 `LIDAR_ARC_MAX_DEG` 25 · `LIDAR_BACK_CLEAR_M` 0.30 · `LIDAR_BACKUP_M` 0.15.

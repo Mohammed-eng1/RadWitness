@@ -17,6 +17,7 @@ import time
 from pi.config import (
     LIDAR_ANGLE_SIGN, LIDAR_YAW_OFFSET_DEG, LIDAR_X_M, LIDAR_Y_M,
     LIDAR_MAX_SPEED, ESCAPE_MAX_ATTEMPTS, ROBOT_LENGTH_M, LIDAR_BLOCK_CONFIRM_SCANS,
+    LIDAR_ARC_MAX_DEG,
 )
 from pi.nav.lidar_avoid import LidarAvoider, mask_front_overlap, filter_points
 from pi.sensors.lidar_c1 import NodeParser, to_robot_frame
@@ -110,12 +111,12 @@ def main() -> int:
     av.note_backed_up()
     d2 = av.decide(to_robot_frame(scene_raw(wall)), time.time())   # اللفّة التالية مباشرة
     check("بعده ⇒ لفّ بالمكان بزاوية كبيرة", d2["action"] == "spin"
-          and abs(d2["deg"]) >= 45, d2["reason"])
+          and abs(d2["deg"]) > LIDAR_ARC_MAX_DEG, d2["reason"])
 
     wall_far = [(front_edge + 0.55, front_edge + 0.65, -2.5, 2.5)]
     d, _ = decide(wall_far)
     check("جدار أمام (55سم، منطقة التفادي) ⇒ إبطاء + لفّ نحو فتحة جانبية",
-          d["action"] == "spin" and abs(d["deg"]) >= 45, d["reason"])
+          d["action"] == "spin" and abs(d["deg"]) > LIDAR_ARC_MAX_DEG, d["reason"])
 
     box_left = [(front_edge + 0.35, front_edge + 0.65, 0.0, 0.45)]
     d, _ = decide(box_left)
