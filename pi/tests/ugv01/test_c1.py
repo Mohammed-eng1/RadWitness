@@ -94,6 +94,7 @@ def main() -> int:
             return 1
         buf = buf[k + 7:]
         revs, cur, counts, resync = 0, [], [], 0
+        rev_ts = []                        # وقت كل لفّة (فصل تسارع المحرك عن الثابت)
         nearest = None
         t0 = time.time()
         while time.time() - t0 < a.seconds:
@@ -109,6 +110,7 @@ def main() -> int:
                 dist = (buf[i + 3] | buf[i + 4] << 8) / 4000.0
                 if (b0 & 1) and cur:
                     revs += 1
+                    rev_ts.append(time.time() - t0)
                     counts.append(len(cur))
                     cur = []
                 if dist >= 0.05:
@@ -118,8 +120,13 @@ def main() -> int:
                 i += 5
             del buf[:i]
         dt = time.time() - t0
-        print(f"لفّات: {revs} في {dt:.1f}ث = {revs / dt:.1f} لفّة/ث "
-              f"(مقاس سابقاً ~10.3)")
+        print(f"لفّات: {revs} في {dt:.1f}ث = {revs / dt:.1f} لفّة/ث (يشمل تسارع المحرك)")
+        per_s = [sum(1 for t in rev_ts if k <= t < k + 1) for k in range(int(dt))]
+        print(f"لكل ثانية: {per_s}")
+        steady = [t for t in rev_ts if t >= 2.0]
+        if len(steady) >= 2:
+            print(f"الثابت (بعد 2ث): {(len(steady) - 1) / (steady[-1] - steady[0]):.1f} "
+                  f"لفّة/ث (مقاس سابقاً ~10.3)")
         if counts:
             print(f"نقاط/لفّة (≥5سم): وسيط {sorted(counts)[len(counts) // 2]} "
                   f"(مقاس سابقاً ~500) · إعادة تزامن {resync}")
