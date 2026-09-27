@@ -114,6 +114,20 @@ class LoRaLink:
             return self.state()
         if self._thread is not None and self._thread.is_alive():
             return self.state()
+        # 🔴 الليدار C1 (CP210x) يظهر غالباً ttyUSB0 = منفذ الراديو الافتراضي:
+        #    فتحه هنا يسرق الليدار من القيادة الذاتية ويبثّ عليه أوامر راديو.
+        try:
+            import os as _o
+            from pi.sensors.lidar_c1 import find_port as _lidar_port
+            lp = _lidar_port()
+            if lp and _o.path.realpath(lp) == _o.path.realpath(self.port):
+                self.ok = False
+                self.error = (f"{self.port} هو الليدار (CP210x) لا الراديو — "
+                              f"لم يُفتح. حدّد منفذ الراديو في LORA_PORT")
+                self._log("lora", f"⚠ {self.error}")
+                return self.state()
+        except Exception:                            # noqa: BLE001
+            pass
         try:
             # ⚠ نافذة القراءة قصيرة عمداً: `read(64)` يحجب حتى تمتلئ 64 بايتاً
             #    أو تنتهي المهلة، وإطارنا 20 بايتاً فلا يملؤها أبداً ⇒ كل

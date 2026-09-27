@@ -371,6 +371,10 @@ async def lifespan(_app: FastAPI):
     except Exception:          # noqa: BLE001
         pass
     lora.stop()                # ⚠ يوقف المحركات إن كان الراديو آمرها
+    if _lidar["driver"] is not None:
+        _lidar["driver"].request_stop(); _lidar["driver"].join(3.0)
+    if _lidar["sensor"] is not None:
+        _lidar["sensor"].stop()    # 🔴 STOP لمحرك الليدار (لا يقف بغيره)
     manual.set_enabled(False)  # ولا تُترك عجلة تدور عند إغلاق السيرفر
     geiger.close(); gps.close(); camera.close()
     ultrasonic.close(); ir_sensors.close()
@@ -847,6 +851,61 @@ async def api_manual_ignore(req: Request):
     d = await req.json()
     manual.ignore_sensors = bool(d.get("on", False))
     return {"ok": True, "ignore_sensors": manual.ignore_sensors}
+
+
+# ═══ قيادة ذاتية بالليدار (نسخة اختبار — pi/nav/lidar_drive.py) ════════
+# 🔴 لا تُمنع أبداً (قرار المشغّل): كل مشكلة تحذير في الحالة. آمر واحد على
+#    السيريال: البدء يغلق اليدوية ويوقف المسح مؤقتاً إن كان جارياً.
+_lidar = {"sensor": None, "driver": None, "log": []}
+
+
+def _lidar_echo(msg: str) -> None:
+    _lidar["log"] = (_lidar["log"] + [f"{time.strftime('%H:%M:%S')} {msg}"])[-30:]
+
+
+class LidarDriveReq(BaseModel):
+    max_speed: float = None
+    dry_run: bool = False
+
+
+@app.post("/api/lidar_drive/start")
+def api_lidar_drive_start(body: LidarDriveReq):
+    from pi.config import LIDAR_MAX_SPEED
+    from pi.nav.lidar_drive import LidarDriver
+    from pi.sensors.lidar_c1 import LidarC1
+    drv = _lidar["driver"]
+    if drv is not None and drv.running:
+        return {"ok": True, "already": True, "state": drv.state()}
+    manual.set_enabled(False)
+    if mission.state in ("running", "returning"):
+        mission.pause()
+        _lidar_echo("⚠ المسح الجاري أُوقف مؤقتاً (آمر واحد على السيريال)")
+    if _lidar["sensor"] is None:
+        _lidar["sensor"] = LidarC1().start()
+    drv = LidarDriver(mission.rover, _lidar["sensor"],
+                      body.max_speed or LIDAR_MAX_SPEED,
+                      dry_run=bool(body.dry_run), echo=_lidar_echo)
+    _lidar["driver"] = drv
+    drv.start_thread()
+    return {"ok": True, "state": drv.state()}
+
+
+@app.post("/api/lidar_drive/stop")
+def api_lidar_drive_stop():
+    drv = _lidar["driver"]
+    if drv is not None:
+        drv.request_stop()
+        drv.join(3.0)
+    mission.rover.stop()                 # ⚠ صفر مضمون حتى لو علق الخيط
+    return {"ok": True, "state": drv.state() if drv else None}
+
+
+@app.get("/api/lidar_drive/status")
+def api_lidar_drive_status():
+    drv = _lidar["driver"]
+    sen = _lidar["sensor"]
+    return {"state": drv.state() if drv else None,
+            "lidar": sen.state() if sen else None, "log": _lidar["log"][-12:]}
 
 
 @app.get("/api/manual/status")

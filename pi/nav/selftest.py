@@ -2736,6 +2736,13 @@ def main() -> int:
     check("UGV01: المهمة لا تشترط ملف معايرة (الإنكودر يقيس) · Wave يشترطه",
           (_MS().profile is not None) == bool(_ug))
 
+    # ── قرار الليدار (lidar_drive): السيناريوهات كاملة في lidar_selftest ──
+    from pi.nav import lidar_selftest as _ls
+    _n0 = len(_ls._results)
+    _lrc = _ls.main()
+    check("سيناريوهات الليدار (جدار/صندوقان/محصور/منفردة/قناع/تجمّد) كلها تنجح",
+          _lrc == 0, f"{sum(_ls._results[_n0:])}/{len(_ls._results) - _n0}")
+
     # ── «مهلة اللفّ» تُسمّى: هل تعثّر بعد 70° أم لم يدر أصلاً؟ ──────
     class StuckBridge(WaveRoverBridge):
         """روبوت تصل إليه الأوامر ولا يدور (بطارية منهكة / عجلة عالقة)."""

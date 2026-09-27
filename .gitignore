@@ -45,3 +45,7 @@ firmware/controller_display/test_protocol.exe
 # ملفات الطباعة ثلاثية الأبعاد (نواتج تصميم لا كود — تُحفظ خارج المستودع)
 *.3mf
 *.gcode
+
+# ═══ الليدار ومخرجات محلية ═══
+pi/data/lidar_mask.json
+Claude outputs/
