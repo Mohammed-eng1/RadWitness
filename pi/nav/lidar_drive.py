@@ -29,7 +29,7 @@ from pi.config import (
     LIDAR_MASK_PATH, LIDAR_MAX_SPEED, LIDAR_STALE_S, LIDAR_DRIVE_LOOP_S,
     LIDAR_FW_HEARTBEAT_MS, LIDAR_FW_HEARTBEAT_RESTORE_MS, LIDAR_BACKUP_M,
     LIDAR_BACKUP_SPEED, LIDAR_BACKUP_ABORT_M, LIDAR_LOG_EVERY_S,
-    LIDAR_RAMP_UP_MPS_PER_LOOP,
+    LIDAR_RAMP_UP_MPS_PER_LOOP, LIDAR_RESEND_S, LIDAR_LOOP_WARN_S,
     LIDAR_ANGLE_SIGN, LIDAR_YAW_OFFSET_DEG, LIDAR_X_M, LIDAR_Y_M,
     ROBOT_LENGTH_M, ROBOT_WIDTH_M, TURN_POWER, UGV01_TURN_RATE_DPS,
     UGV01_FORWARD_VERIFIED, IS_UGV01,
@@ -71,7 +71,8 @@ class LidarDriver:
     """الحلقة. تُستعمل من السطر (`main`) ومن الواجهة (`start_thread`/`request_stop`)."""
 
     def __init__(self, bridge, lidar, max_speed: float = LIDAR_MAX_SPEED,
-                 dry_run: bool = False, log_dir: str = LOG_DIR, echo=print):
+                 dry_run: bool = False, log_dir: str = LOG_DIR, echo=print,
+                 resend_s: float = LIDAR_RESEND_S):
         self.bridge = bridge
         self.lidar = lidar
         self.dry_run = dry_run or bridge is None
@@ -90,6 +91,12 @@ class LidarDriver:
         self._last_echo = (None, 0.0)    # (الفعل، الوقت) — سطر للشاشة لكل تغيّر فعل أو كل ثانية
         self._inside_warned = False
         self._cmd = (0.0, 0.0)           # آخر أمر مُرسل (أساس تنعيم الرفع)
+        # إعادة الإرسال: الأمر نفسه لا يُعاد قبل resend_s (≤ نصف مهلة الفيرموير)
+        self.resend_s = min(max(0.0, float(resend_s)), LIDAR_FW_HEARTBEAT_MS / 2000.0)
+        self._sent = (None, 0.0)         # (آخر أمر أُرسل فعلاً، وقته)
+        # توقيت الحلقة: أقصى دورة ومتوسطها في نافذة الثانية (للسجل والتحذير)
+        self._loop_win = []
+        self.loop_max_s = 0.0
         os.makedirs(log_dir, exist_ok=True)
         self.log_path = os.path.join(
             log_dir, time.strftime("lidar_drive_%Y%m%d_%H%M%S.jsonl"))
@@ -136,13 +143,18 @@ class LidarDriver:
         self._cmd = (l, r)
         self.moving = bool(l or r)
         if not self.dry_run:
-            self.bridge.motors(l, r)
+            now = time.time()
+            key = (round(l, 3), round(r, 3))
+            if key != self._sent[0] or now - self._sent[1] >= self.resend_s:
+                self.bridge.motors(l, r)
+                self._sent = (key, now)
 
     def _halt(self) -> None:
         self._cmd = (0.0, 0.0)
         self.moving = False
         if not self.dry_run:
-            self.bridge.motors(0.0, 0.0)
+            self.bridge.motors(0.0, 0.0)          # الصفر يُرسل دائماً بلا تأجيل
+            self._sent = ((0.0, 0.0), time.time())
 
     def _fw(self, obj: dict) -> None:
         if not self.dry_run and getattr(self.bridge, "mode", "") == "real":
@@ -166,7 +178,13 @@ class LidarDriver:
                         continue
                     self.outcome = "trapped"
                     break
-                dt = LIDAR_DRIVE_LOOP_S - (time.time() - t0)
+                took = time.time() - t0
+                self._loop_win.append(took)
+                if took > LIDAR_LOOP_WARN_S:
+                    self.warn(f"⚠ دورة استغرقت {took * 1000:.0f}ms (> "
+                              f"{LIDAR_LOOP_WARN_S * 1000:.0f}) — قرب مهلة الفيرموير "
+                              f"{LIDAR_FW_HEARTBEAT_MS}ms: قد يتوقف المحرك لحظياً")
+                dt = LIDAR_DRIVE_LOOP_S - took
                 if dt > 0:
                     self._stop.wait(dt)
             if self.outcome is None:
@@ -314,6 +332,14 @@ class LidarDriver:
         except Exception:                        # noqa: BLE001
             pass
 
+    def _loop_stats(self):
+        """(متوسط، أقصى) زمن الدورة بالمللي‌ثانية منذ آخر سطر سجل، ثم تصفير النافذة."""
+        w, self._loop_win = self._loop_win, []
+        if not w:
+            return None
+        self.loop_max_s = max(self.loop_max_s, max(w))
+        return [round(sum(w) / len(w) * 1000, 1), round(max(w) * 1000, 1)]
+
     def _record(self, d: dict) -> None:
         if d["stats"].get("inside") and not self._inside_warned:
             self._inside_warned = True
@@ -334,7 +360,7 @@ class LidarDriver:
                    "rear_m": rnd(d.get("rear_m")),
                    "sectors": {k: rnd(v) for k, v in d["sectors"].items()},
                    "stats": d["stats"], "attempts": d.get("attempts"),
-                   "inside_pts": d.get("inside_pts"),
+                   "inside_pts": d.get("inside_pts"), "loop_ms": self._loop_stats(),
                    "lidar_age_s": rnd(self.lidar.age_s()), "reason": d.get("reason")})
         # الشاشة: تغيّر **الفعل** أو مرور ثانية — لا كل تذبذب 1سم في السبب
         if d["action"] != self._last_echo[0] or now - self._last_echo[1] >= LIDAR_LOG_EVERY_S:
@@ -352,6 +378,9 @@ def main(argv=None) -> int:
                     help="قرارات فقط بلا أوامر حركة (الروبوت مرفوع)")
     ap.add_argument("--sim", action="store_true", help="ليدار وهمي (غرفة) بلا عتاد")
     ap.add_argument("--port", default=None, help="منفذ الليدار (وإلا VID/PID)")
+    ap.add_argument("--resend-s", type=float, default=LIDAR_RESEND_S,
+                    help="إعادة إرسال **نفس** أمر الحركة كل (ث) — تشخيص الارتجاف "
+                         "(الأمر المتغيّر يُرسل فوراً، والسقف 0.25)")
     a = ap.parse_args(argv)
     if a.max_speed > LIDAR_MAX_SPEED:
         print(f"⚠ --max-speed {a.max_speed} فوق السقف ⇒ {LIDAR_MAX_SPEED}")
@@ -361,11 +390,14 @@ def main(argv=None) -> int:
     if not a.dry_run:
         from pi.rover.bridge import WaveRoverBridge
         bridge = WaveRoverBridge(mode="sim" if a.sim else "real")
-    drv = LidarDriver(bridge, lidar, a.max_speed, dry_run=a.dry_run)
+    drv = LidarDriver(bridge, lidar, a.max_speed, dry_run=a.dry_run,
+                      resend_s=a.resend_s)
     print(f"القيادة بالليدار · سقف {drv.max_speed} م/ث · "
           f"{'dry-run (بلا حركة)' if drv.dry_run else 'حركة فعلية'} · Ctrl+C للإيقاف")
     try:
         outcome = drv.run()
+        print(f"أطول دورة: {drv.loop_max_s * 1000:.0f}ms · إعادة الإرسال كل "
+              f"{drv.resend_s:.2f}ث")
     finally:
         lidar.stop()                              # 🔴 STOP للمحرك
         if bridge is not None:
