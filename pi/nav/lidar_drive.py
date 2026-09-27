@@ -86,6 +86,8 @@ class LidarDriver:
         self.moving = False
         self._stale_announced = False
         self._last_log = (None, 0.0)
+        self._last_echo = (None, 0.0)    # (الفعل، الوقت) — سطر للشاشة لكل تغيّر فعل أو كل ثانية
+        self._inside_warned = False
         os.makedirs(log_dir, exist_ok=True)
         self.log_path = os.path.join(
             log_dir, time.strftime("lidar_drive_%Y%m%d_%H%M%S.jsonl"))
@@ -293,11 +295,16 @@ class LidarDriver:
             pass
 
     def _record(self, d: dict) -> None:
+        if d["stats"].get("inside") and not self._inside_warned:
+            self._inside_warned = True
+            self.warn(f"⚠ {d['stats']['inside']} نقطة داخل مستطيل الروبوت (ROBOT_LENGTH_M×"
+                      f"ROBOT_WIDTH_M حول LIDAR_X_M/Y_M) — تُعامل **عوائق ملاصقة**. "
+                      f"إن كانت جزءاً من الروبوت: أعد calibrate_lidar_mask أو صحّح "
+                      f"الأبعاد/موضع الليدار في config")
         key = (d["action"], d.get("reason"))
         now = time.time()
         if key == self._last_log[0] and now - self._last_log[1] < LIDAR_LOG_EVERY_S:
             return
-        changed = key != self._last_log[0]
         self._last_log = (key, now)
         rnd = lambda v: None if v is None else round(v, 3)   # noqa: E731
         self._log({"event": "decision", "action": d["action"],
@@ -307,7 +314,9 @@ class LidarDriver:
                    "sectors": {k: rnd(v) for k, v in d["sectors"].items()},
                    "stats": d["stats"], "attempts": d.get("attempts"),
                    "lidar_age_s": rnd(self.lidar.age_s()), "reason": d.get("reason")})
-        if changed:
+        # الشاشة: تغيّر **الفعل** أو مرور ثانية — لا كل تذبذب 1سم في السبب
+        if d["action"] != self._last_echo[0] or now - self._last_echo[1] >= LIDAR_LOG_EVERY_S:
+            self._last_echo = (d["action"], now)
             extra = (f" L={d['l']:.2f} R={d['r']:.2f}" if "l" in d else
                      f" {d['deg']:+.0f}°" if "deg" in d else "")
             self.echo(f"[{time.strftime('%H:%M:%S')}] {d['action']}{extra} — {d.get('reason')}")

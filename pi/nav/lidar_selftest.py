@@ -165,7 +165,14 @@ def main() -> int:
           and mask_front_overlap(blocked) == [])
     inside = to_robot_frame([(0.0, 0.08), (0.8, 0.08)])
     kept, st = filter_points(inside, set())
-    check("نقاط داخل مستطيل الروبوت تُهمل وتُعدّ", st["inside"] == 2 and not kept, str(st))
+    check("نقاط داخل مستطيل الروبوت = عوائق ملاصقة (خلوص 0) وتُعدّ",
+          st["inside"] == 2 and len(kept) == 2 and all(p["c"] == 0.0 for p in kept), str(st))
+    # 🔴 المقاس 2026-09-27: كوب قريب داخل المستطيل المفترض يحجب جداراً خلفه —
+    #    كان يُحذف فيطبع «الممرّ خالٍ» والكوب أمامه
+    fe = front_edge
+    d, _ = decide([(fe + 0.55, fe + 0.65, -1.0, 1.0), (0.08, 0.14, -0.04, 0.04)])
+    check("كوب ملاصق أمام الليدار يحجب جداراً ⇒ لا «سير»", d["action"] != "go"
+          and d["front_m"] == 0.0, f"{d['action']} — {d['reason']}")
 
     print("\nد) السلامة في الحلقة:")
     from pi.nav.lidar_drive import LidarDriver

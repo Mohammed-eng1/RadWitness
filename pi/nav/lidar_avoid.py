@@ -6,9 +6,9 @@ lidar_avoid.py — قرار التفادي من لفّة ليدار واحدة (
 x أمام، y يسار). المخرج: قرار واحد (dict) لحلقة `lidar_drive`.
 
 الترتيب:
-1. **تصفية**: القناع (أجزاء الروبوت) · داخل مستطيل الروبوت (مستحيل فيزيائياً
-   ⇒ جزء منه لم يُقنَّع — يُعدّ ويُحذَّر) · النقطة المنفردة (لا جارة خلال
-   2° و5سم = ضجيج).
+1. **تصفية**: القناع (أجزاء الروبوت) · النقطة المنفردة (لا جارة خلال 2° و5سم
+   = ضجيج). ما يقع **داخل** مستطيل الروبوت ولم يحجبه القناع = عائق ملاصق
+   (خلوص 0) لا يُحذف — ويُعدّ في `inside` للتحذير.
 2. **الخلوص من حافة الروبوت** (مستطيل ROBOT_LENGTH_M × ROBOT_WIDTH_M) لا من
    الليدار: جسم على الجانب يبعد عن الليدار 20سم قد يلامس الجنزير.
 3. **الأمام = ممرّ السير** (عرض الروبوت + هامش) لا مخروط ±30°: مخروط ±30°
@@ -101,7 +101,7 @@ def drop_isolated(points: list, nb_deg: float = LIDAR_NEIGHBOR_DEG,
 
 
 def filter_points(points: list, blocked: set) -> tuple[list, dict]:
-    """القناع ثم داخل-الروبوت ثم المنفردة. يُعيد (النقاط، العدّادات)."""
+    """القناع ثم المنفردة؛ داخل-الروبوت يبقى بخلوص 0. ⇒ (النقاط، العدّادات)."""
     stats = {"raw": len(points), "masked": 0, "inside": 0, "isolated": 0}
     kept = []
     for p in points:
@@ -110,8 +110,12 @@ def filter_points(points: list, blocked: set) -> tuple[list, dict]:
             continue
         c = edge_clearance(p["x"], p["y"])
         if c <= 0.0:
-            stats["inside"] += 1          # جزء من الروبوت لم يُقنَّع
-            continue
+            # 🔴 **عائق لا جزء من الروبوت**: مقاس 2026-09-27 — كوب أمام
+            #    الليدار بـ~10سم وقع داخل المستطيل المفترض (الليدار ليس في
+            #    المركز) فأُسقط، وحجب الجدار خلفه ⇒ «الممرّ خالٍ» والكوب
+            #    أمامه. أجزاء الروبوت يحجبها **القناع** المعاير؛ ما بقي داخل
+            #    المستطيل يُعامل ملاصقاً (خلوص 0) ويُعدّ للتحذير.
+            stats["inside"] += 1
         kept.append(dict(p, c=c))
     kept, stats["isolated"] = drop_isolated(kept)
     stats["used"] = len(kept)
@@ -137,8 +141,9 @@ def corridor_clearance(points: list, length: float = ROBOT_LENGTH_M,
     best = None
     for p in points:
         x = p["x"] if forward else -p["x"]
-        if x > length / 2.0 and abs(p["y"]) <= half_w:
-            d = x - length / 2.0
+        # ⚠ من المركز لا من الحافة: نقطة داخل المستطيل في هذا النصف = 0
+        if x >= 0.0 and abs(p["y"]) <= half_w:
+            d = max(0.0, x - length / 2.0)
             if best is None or d < best:
                 best = d
     return best
