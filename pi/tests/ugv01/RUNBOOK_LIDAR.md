@@ -62,3 +62,10 @@ python3 -m pi.nav.lidar_drive --sim --dry-run
 `LIDAR_X_M`/`LIDAR_Y_M` 0 ·
 `LIDAR_YAW_OFFSET_DEG` 0 · `LIDAR_AVOID_START_M` 0.80 · `LIDAR_GAP_FREE_M` 0.60 ·
 `LIDAR_ARC_MAX_DEG` 25 · `LIDAR_BACK_CLEAR_M` 0.30 · `LIDAR_BACKUP_M` 0.15.
+
+## تحكم يدوي + عرض الليدار (للتصوير)
+```bash
+python3 -m pi.tools.teleop          # يطبع http://IP:8080 — افتحه من الجوال/اللابتوب
+python3 -m pi.tools.teleop --sim    # بلا عتاد
+```
+⚠ برنامج واحد فقط على منفذ القاعدة: أوقف lidar_drive وسيرفر الواجهة قبله.
