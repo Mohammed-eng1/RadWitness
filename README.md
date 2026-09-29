@@ -90,8 +90,11 @@ All numbers below were measured on the real hardware or by running the real soft
 |---|---|
 | [`verifier/`](verifier/) | `radwitness.py` — build, seal and verify a mission log from the command line |
 | [`robot/`](robot/) | `test_c1.py` — LiDAR check · `lidar_teleop.py` — live LiDAR view + driving from a browser |
+| [`pi/`](pi/) | Robot software (Raspberry Pi): navigation, sensors, safety layer and web interface |
 
 The offline web verifier page is being added.
+
+The radiation source-localization layer is not included in this public version; its modules are placeholders.
 
 ## Safety
 
