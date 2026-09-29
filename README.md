@@ -1,134 +1,118 @@
-# RMS Rover v2 — روفر فحص إشعاعي ذاتي بقيادة راسبري باي
+# RadWitness
 
-النسخة الثانية من روفر فحص إشعاعي ذاتي: **راسبري باي 4 دماغاً مركزياً** تتصل به كل
-الحساسات مباشرة (جيجر، GPS، BNO055، كاميرا، لورا)، على هيكل Wave Rover من Waveshare.
-يرث منطق الجيجر المعاير مخبرياً والبروتوكولات الموثقة من المشروع السابق في `legacy/`.
+**A low-cost radiation inspection robot that goes in instead of a person — and keeps a record that cannot be quietly changed.**
 
-> الحالة: **M0 مكتمل** (تهيئة المستودع + شجرة المشروع + سكربتات اختبار الحساسات
-> المنفردة). هيكل Wave Rover لم يصل — كل شيء يُبنى ويُختبر مكتبياً بمحاكاته.
-> خارطة المراحل الكاملة في [`docs/BRIEF_FINAL_RMS_V2.md`](docs/BRIEF_FINAL_RMS_V2.md).
+> Prototype · Security & Innovation Fair (SAIF) 2026 · Team: Mohammed M. Al-Sharif, Mohammed A. Al-Rashed
 
-## المعمارية
+---
 
-```
-[شاشة CYD: بوابة ميدانية AP + لمس] ←لورا 433MHz← ┐
-[متصفح المستخدم] ←WiFi← [راسبري باي 4: كل الحساسات + AI + ويب + تسجيل]
-                                  ↕ UART (بروتوكول Waveshare JSON)
-                    [ESP32 مدمج في Wave Rover: محركات + IMU مدمج + سونار/IR]
-```
+## The problem
 
-**قاعدة الأمان الصلبة:** منطق النجاة الفوري لا يسكن الراسبري — مهلة توقف المحركات في
-ESP32 الروفر، وفقدان heartbeat الراسبري > 1.5ث يوقف المحركات. النظام يفشل آمناً بدون
-الراسبري.
+Radioactive sources are used every day in industry, medicine and research. When control over a source is lost, it becomes an *orphan source* and can end up in scrap metal or inside a shipping container. The IAEA incident database lists 4,626 incidents since 1993.
 
-## شجرة المجلدات
+Two problems show up every time someone has to check for radiation:
 
-```
-RMS-Rover-v2/
-├── README.md              هذا الملف
-├── requirements.txt       متطلبات بايثون (الراسبري)
-├── setup_pi.sh            إعداد الراسبري كامل غير تفاعلي
-├── secrets.example.py     قالب أسرار بايثون (انسخه إلى secrets.py)
-├── secrets.example.h      قالب أسرار فيرموير الشاشة (انسخه إلى secrets.h)
-├── .gitignore
-├── docs/
-│   ├── BRIEF_FINAL_RMS_V2.md   المهمة الكاملة والمراحل
-│   └── wiring.md              جدول التوصيلات والتحذيرات الحرجة
-├── pi/                    طبقة بايثون على الراسبري
-│   ├── tests/             ✅ سكربتات اختبار الحساسات المنفردة (M0)
-│   ├── sensors/           الحساسات المدمجة (M2+)
-│   ├── ai/                طبقة الذكاء: شذوذ/خطر/محدد مصدر/مهمة (M2, M5)
-│   └── web/               سيرفر FastAPI + الواجهة (M1)
-├── firmware/
-│   └── controller_display/    فيرموير شاشة CYD (M4)
-├── missions/             مكتبة خطط المهمات وسجلات CSV (تشغيلية)
-├── logs/                 سجلات التشغيل (تشغيلية)
-├── captures/             لقطات الكاميرا الموسومة (تشغيلية)
-└── legacy/               المشروع السابق (مرجع — انهل منه)
+1. **A person has to stand close** to a possible source with a handheld meter.
+2. **The readings end up in records that can be edited afterwards.**
+
+## Where RadWitness is used
+
+- Routine inspection of facilities that use radioactive materials
+- Emergency response
+- Searching scrap piles and containers for lost sources
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Tracked robot<br/>drives in] --> B[Geiger counter reading<br/>+ time + position]
+    B --> C[Each entry is chained<br/>to the one before it<br/>SHA-256]
+    C --> D[Mission end:<br/>log is sealed<br/>Ed25519 signature]
+    D --> E[Receiver checks it<br/>in an offline web page]
+    E --> F{Intact?}
+    F -->|yes| G[✅ Record accepted]
+    F -->|no| H[⛔ Shows the exact<br/>entry that changed]
 ```
 
-## التشغيل على الراسبري
+1. **Access** — a tracked chassis for uneven ground. A 360° LiDAR lets the robot drive itself and avoid obstacles all around it, even in the dark. It can also be driven remotely.
+2. **Measure** — a Geiger–Müller counter takes the readings.
+3. **Locate** — every reading is saved with its time and the robot's position. Heading comes from the gyroscope, because tracks slip when turning.
+4. **Record & seal** — every reading becomes a log entry linked to the one before it. At the end of the mission the whole log is digitally signed.
+5. **Verify** — the receiver opens one web page that works offline, picks the robot (its public key is registered in advance) and drops in the log and its seal. The page recomputes every fingerprint and checks the signature. The file never leaves the receiver's device.
 
-```bash
-git clone <repo> && cd RMS-Rover-v2
-chmod +x setup_pi.sh && ./setup_pi.sh      # تحديث + UART/I2C + lgpio + venv + المتطلبات
-cp secrets.example.py secrets.py           # واملأه (secrets.py مستثنى من git)
-sudo reboot                                # لتفعيل UART/I2C
+### What the record proves — and what it does not
 
-# ثم اختبر كل حساس منفرداً (بعد توصيله):
-source venv/bin/activate
-python3 pi/tests/test_geiger.py            # التفاصيل في pi/tests/README.md
-```
+| Proves | Does not prove |
+|---|---|
+| The log was not changed after it was sealed | That the sensor itself read correctly |
+| Exactly which entry changed, if one did | That the key holder did not build a new log — unless the chain head is sent to the receiver at sealing time (planned) |
+| That it was sealed with this robot's key | |
 
-تفاصيل تشغيل كل سكربت اختبار في [`pi/tests/README.md`](pi/tests/README.md)، والتوصيلات
-في [`docs/wiring.md`](docs/wiring.md).
+This is **not a blockchain**. It is a chain of fingerprints sealed with a digital signature, on a single device, with no network needed.
 
-## تشغيل السيرفر والواجهة الحية (M1)
+## Hardware
 
-بعد تأكيد الحساسات، شغّل السيرفر الموحّد (FastAPI + WebSocket على المنفذ 8000):
+| Part | Role |
+|---|---|
+| Waveshare UGV01 tracked chassis (ESP32 driver board) | Movement, wheel encoders, IMU |
+| Raspberry Pi | Main computer: logging, sealing, control |
+| RPLIDAR C1 (360°) | Obstacle detection and autonomous driving |
+| Geiger–Müller counter (J305 tube) | Radiation readings |
+| Camera | Visual confirmation |
 
-```bash
-./run_server.sh
-# أو يدوياً:
-source venv/bin/activate
-python -m pi.web.server        # أو: uvicorn pi.web.server:app --host 0.0.0.0 --port 8000
-```
+## Measured results
 
-ثم افتح من اللابتوب/الجوال: **`http://therover:8000`** (محلياً أو عبر Tailscale).
-الواجهة تعرض القراءات الثلاث الحية (جيجر/GPS/BNO055) + خريطة محلية + قيادة روفر sim.
+All numbers below were measured on the real hardware or by running the real software.
 
-- بنية الوحدات: `pi/config.py` (كل الثوابت)، `pi/sensors/{geiger,gps,imu,camera}.py`،
-  `pi/rover/bridge.py` (جسر real/sim)، `pi/ai/risk.py`، `pi/web/server.py` + `static/`.
-- الصفحة الرئيسية `/` = **محاكاة المسح الداخلي**، و`/sensors` = واجهة الحساسات هذه.
+**Robot platform**
 
-## التشغيل على ويندوز (محاكاة كاملة — بلا راسبري وبلا عتاد)
+| Test | Result |
+|---|---|
+| 360° LiDAR | 10.29 scans per second, ~500 points per scan (one every 0.72°), health "Good" |
+| Turning repeatability | 5 turns, spread 0.55° |
+| Track slip | gyro-to-track ratio 0.708–0.715 at 3 speeds (steady, so heading is taken from the gyroscope) |
+| Robot–computer link | 10 of 10 replies |
+| Autonomous driving | LiDAR-based obstacle avoidance running on the robot |
 
-الصفحة الرئيسية واجهة محاكاة المسح الداخلي، تعمل بالكامل على ويندوز. أوامر PowerShell:
+**Record integrity**
 
-```powershell
-# 1) استنساخ المشروع والدخول إليه
-git clone git@github.com:Mohammed-eng1/RMS-Rover-v2.git
-cd RMS-Rover-v2
+| Test | Result |
+|---|---|
+| Random edits detected (3 sealed logs × 1,000 edits) | 2,996 of 3,000 — every detected edit traced to the correct entry |
+| The 4 undetected edits | only turned a space between fields into a tab or line break; no value changed |
+| False alarms on untouched logs | 0 of 100 |
+| Browser verifier vs. Python tool | 156 of 156 identical results |
+| Network requests during verification | 0 |
 
-# 2) بيئة افتراضية + متطلبات التطوير فقط (بلا أي مكتبة عتاد)
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
+## What is in this repository
 
-# 3) تشغيل السيرفر
-python -m pi.web.server
+| Folder | Contents |
+|---|---|
+| [`verifier/`](verifier/) | `radwitness.py` — build, seal and verify a mission log from the command line |
+| [`robot/`](robot/) | `test_c1.py` — LiDAR check · `lidar_teleop.py` — live LiDAR view + driving from a browser |
 
-# 4) افتح المتصفح على:
-#    http://localhost:8000
-```
+The offline web verifier page is being added.
 
-ستظهر لافتة **«وضع المحاكاة — لا يوجد عتاد متصل»**. عرّف الغرفة (طول×عرض+ركن)، اضغط
-«معايرة جديدة (محاكاة)» ثم «إنشاء الغرفة» ثم «بدء مسح» — وشاهد الروبوت يمسح الشبكة.
-انقر أي خلية لوضع عائق ومشاهدة إعادة التخطيط، واستخدم مضاعف السرعة ×20 للإنهاء بثوانٍ.
+## Safety
 
-## رفع فيرموير الشاشة (M4)
+- The robot moves only while a command keeps arriving; if the link drops it stops by itself.
+- No radioactive source is handled in the demonstrations. Calibration work is done only in licensed facilities by licensed staff.
 
-فيرموير بوابة الشاشة الميدانية في `firmware/controller_display/` (اللوحة الافتراضية
-ESP32-3248S035R). خطوات الرفع (تُستكمل في M4):
+## Roadmap
 
-1. انسخ `secrets.example.h` إلى `firmware/controller_display/secrets.h` واملأ كلمة
-   مرور شبكة `RMS-CONTROL`.
-2. افتح السكتش في Arduino IDE (لكل سكتش مجلد بنفس اسم ملف `.ino`).
-3. اختر لوحة ESP32 المناسبة وارفع.
+- Test with radioactive sources other than Cs-137
+- Larger and more cluttered field tests
+- Keep the signing key on the robot and send the chain head to the receiver at sealing time
+- Add the offline web verifier to this repository
 
-## الأسرار
+---
 
-- **لا سر حقيقي يُرفع إلى git إطلاقاً.** الملفات الحقيقية (`secrets.py`, `secrets.h`,
-  `.env`) مستثناة في `.gitignore`؛ تُرفع القوالب (`secrets.example.*`) فقط.
-- انسخ القالب إلى الاسم الحقيقي واملأه:
-  `cp secrets.example.py secrets.py` (وبالمثل لـ`.h`).
-- ⚠ **مفتاح Anthropic API لا يلمس الراسبري** — نداء "الكابتن" من متصفح المستخدم فقط.
-- ⚠ ملفات `secrets.h` القديمة داخل `legacy/` تحوي بيانات اعتماد حقيقية؛ نمط `.gitignore`
-  يستثنيها من التتبّع، لكن راجِعها قبل أول `git add` واحذف أي سر لم يعد مستخدماً.
+## نبذة بالعربي
 
-## قواعد ثابتة
+**RadWitness** روبوت مجنزر منخفض التكلفة يدخل أماكن الإشعاع بدل الإنسان: في تفتيش المنشآت، وحالات الطوارئ، والبحث عن المصادر المشعة الضائعة في الخردة والحاويات. يقود نفسه بليدار 360° حتى في الظلام، ويقيس بعداد جايجر.
 
-- ثوابت معايرة الجيجر **K=111 CPM/(µSv/h)** و**τ=200µs** مثبتة مخبرياً ضد Cs-137
-  مرجعي — لا تُغيَّر، ومصدرها مذكور في تعليقات الكود.
-- التعليقات بالعربية، أسماء المتغيرات/الدوال بالإنجليزية.
-- بعد كل مرحلة: توقف، ملخص، وخطوات اختبار على العتاد قبل التالية.
+كل قراءة تُحفظ مع وقتها وموقع الروبوت، وتُربط بالقراءة التي قبلها، وفي نهاية المهمة يُختم السجل رقمياً. والمستلم يتحقق منه بصفحة تعمل بدون إنترنت: إذا تغيّرت أي قيمة بعد الختم، تنكشف ويظهر السطر الذي تغيّر بالضبط.
+
+---
+
+© 2026 the authors. All rights reserved.
