@@ -1,0 +1,15 @@
+# signing keys - never commit
+keys/
+*.key
+
+# local data and builds
+logs/
+dist/
+*.jsonl
+*.seal
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
